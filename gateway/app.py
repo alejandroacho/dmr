@@ -239,12 +239,23 @@ async def chat_completions(request: AgentRequest):
     # 3. Check if swap is needed
     current_profile = orchestrator.active_profile or ""
     target_key = orchestrator._profile_key(decision.profile)
+    model_ready = orchestrator.is_model_ready(decision.target_model.container_name)
 
-    if current_profile != target_key:
+    if current_profile != target_key or not model_ready:
         decision.requires_swap = True
 
+        if current_profile == target_key and not model_ready:
+            # Profile matches but container is not READY (crashed, restarting, etc.)
+            # Force the swap to bring it back up.
+            logger.warning(
+                "Model '%s' is not ready (state=%s). Forcing restart.",
+                decision.target_model.container_name,
+                orchestrator.container_states.get(decision.target_model.container_name),
+            )
+
         # Obtain or create a swap task (never duplicate)
-        swap_task = _get_or_create_swap_task(decision.profile, target_key)
+        force_swap = current_profile == target_key and not model_ready
+        swap_task = _get_or_create_swap_task(decision.profile, target_key, force=force_swap)
 
         if LONG_POLLING_ENABLED:
             # Wait for swap to complete (Long Polling).
@@ -324,15 +335,23 @@ async def generate_image(request: ImageGenerationRequest):
 
     current = orchestrator.active_profile or ""
     target_key = orchestrator._profile_key(PROFILE_CREATIVE_IMAGE)
+    model_ready = orchestrator.is_model_ready(FLUX2_PRO.container_name)
 
-    if current != target_key:
+    if current != target_key or not model_ready:
+        if not model_ready and current == target_key:
+            logger.warning(
+                "Model '%s' is not ready (state=%s). Forcing restart.",
+                FLUX2_PRO.container_name,
+                orchestrator.container_states.get(FLUX2_PRO.container_name),
+            )
         if orchestrator.is_swapping:
             raise HTTPException(
                 status_code=503,
                 detail="Swap in progress",
                 headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
             )
-        success = await orchestrator.switch_profile(PROFILE_CREATIVE_IMAGE)
+        force_swap = current == target_key and not model_ready
+        success = await orchestrator.switch_profile(PROFILE_CREATIVE_IMAGE, force=force_swap)
         if not success:
             raise HTTPException(status_code=503, detail="Could not activate creative mode")
 
@@ -361,15 +380,23 @@ async def generate_video(request: VideoGenerationRequest):
 
     current = orchestrator.active_profile or ""
     target_key = orchestrator._profile_key(PROFILE_CREATIVE_VIDEO)
+    model_ready = orchestrator.is_model_ready(LTX_VIDEO_2.container_name)
 
-    if current != target_key:
+    if current != target_key or not model_ready:
+        if not model_ready and current == target_key:
+            logger.warning(
+                "Model '%s' is not ready (state=%s). Forcing restart.",
+                LTX_VIDEO_2.container_name,
+                orchestrator.container_states.get(LTX_VIDEO_2.container_name),
+            )
         if orchestrator.is_swapping:
             raise HTTPException(
                 status_code=503,
                 detail="Swap in progress",
                 headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
             )
-        success = await orchestrator.switch_profile(PROFILE_CREATIVE_VIDEO)
+        force_swap = current == target_key and not model_ready
+        success = await orchestrator.switch_profile(PROFILE_CREATIVE_VIDEO, force=force_swap)
         if not success:
             raise HTTPException(status_code=503, detail="Could not activate creative video mode")
 
@@ -466,19 +493,23 @@ async def list_models():
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _get_or_create_swap_task(profile, target_key: str) -> asyncio.Task:
+def _get_or_create_swap_task(profile, target_key: str, force: bool = False) -> asyncio.Task:
     """
     Returns the active swap task if it targets the same profile,
     otherwise creates a new one.  Prevents duplicate swaps.
 
     The task is wrapped in `_execute_swap_and_drain` so it automatically
     drains buffered requests on success or rejects them on failure.
+
+    Pass force=True to re-run the swap even if the profile key matches
+    (e.g. when a container crashed and needs to be restarted).
     """
     global _active_swap_task, _active_swap_target
 
-    # Reuse an existing swap to the SAME target
+    # Reuse an existing swap to the SAME target (only when not forced)
     if (
-        _active_swap_task is not None
+        not force
+        and _active_swap_task is not None
         and not _active_swap_task.done()
         and _active_swap_target == target_key
     ):
@@ -489,12 +520,12 @@ def _get_or_create_swap_task(profile, target_key: str) -> asyncio.Task:
 
     _active_swap_target = target_key
     _active_swap_task = asyncio.create_task(
-        _execute_swap_and_drain(profile)
+        _execute_swap_and_drain(profile, force=force)
     )
     return _active_swap_task
 
 
-async def _execute_swap_and_drain(profile) -> bool:
+async def _execute_swap_and_drain(profile, force: bool = False) -> bool:
     """
     Executes the swap and handles buffer drain/reject.
     This runs as a long-lived task that is never cancelled.
@@ -502,7 +533,7 @@ async def _execute_swap_and_drain(profile) -> bool:
     global _active_swap_task, _active_swap_target
 
     try:
-        success = await orchestrator.switch_profile(profile)
+        success = await orchestrator.switch_profile(profile, force=force)
         if success:
             asyncio.create_task(_drain_buffered_requests())
         else:

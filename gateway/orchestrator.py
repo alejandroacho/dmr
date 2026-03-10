@@ -71,6 +71,10 @@ class ContainerOrchestrator:
     def container_states(self) -> dict[str, ContainerState]:
         return dict(self._container_states)
 
+    def is_model_ready(self, container_name: str) -> bool:
+        """Returns True only if the container is in READY state."""
+        return self._container_states.get(container_name) == ContainerState.READY
+
     # ────────────── Startup Cleanup ────────────────
 
     async def cleanup_orphaned_containers(self) -> None:

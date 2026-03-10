@@ -74,6 +74,7 @@ services:
       - LONG_POLLING_TIMEOUT_S=600
       - MAX_QUEUE_SIZE=200
       - RETRY_AFTER_SECONDS=5
+      - RETRY_LOG_INTERVAL_S=10
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/nvme_data/models:/mnt/nvme_data/models:ro
