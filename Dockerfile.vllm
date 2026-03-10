@@ -1,32 +1,18 @@
-# Custom vLLM image that adds native sm_121 (GB10 Blackwell) support.
+# Custom vLLM image for GB10 Blackwell (sm_121).
 #
-# The official vllm/vllm-openai:cu130-nightly ships PyTorch compiled up to
-# sm_120. GB10 is sm_121, so PyTorch falls back to PTX JIT (compute_120),
-# which recompiles Triton kernels on every cold start.
+# NOTE: Swapping PyTorch on top of a pre-built vLLM breaks ABI compatibility
+# (_C.abi3.so is compiled against the bundled PyTorch version).
+# The only correct way to get native sm_121 support is to build vLLM from
+# source against a PyTorch that includes sm_121 in its arch list.
 #
-# This image installs the latest PyTorch nightly wheel compiled with sm_121,
-# eliminating the "cuda capability 12.1 is not supported" warning and making
-# the first-inference latency equivalent to any other arch.
+# Currently no public PyTorch wheel (nightly or stable) includes sm_121.
+# Until one is available, this file simply re-tags the upstream image.
+# GB10 falls back to PTX JIT via compute_120, which is cached after the
+# first inference and has negligible steady-state overhead.
 #
 # Build:
-#   docker build -f Dockerfile.vllm -t vllm-blackwell:latest .
-# Use in docker-compose: replace `image: vllm/vllm-openai:cu130-nightly`
-#                        with    `image: vllm-blackwell:latest`
+#   docker build -f Dockerfile.vllm -t blackwell-vllm:latest .
+# Equivalent shortcut (no build needed):
+#   docker tag vllm/vllm-openai:cu130-nightly blackwell-vllm:latest
 
 FROM vllm/vllm-openai:cu130-nightly
-
-# Install PyTorch nightly wheel with Blackwell (sm_121) support.
-# The nightly index for cu130 includes sm_121 starting from 2025-12-01 builds.
-RUN pip install --no-cache-dir --pre \
-      torch \
-      --index-url https://download.pytorch.org/whl/nightly/cu130
-
-# Verify sm_121 is in the compiled arch list (build-time sanity check).
-RUN python3 -c "
-import torch
-archs = torch.cuda.get_arch_list()
-print('Compiled archs:', archs)
-assert 'sm_121' in archs or 'compute_121' in archs, \
-    f'sm_121 not found in {archs}. Use a newer nightly build.'
-print('OK: sm_121 supported natively.')
-"

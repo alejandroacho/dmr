@@ -22,8 +22,8 @@ from gateway.schemas import (
 GATEWAY_HOST: str = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT: int = int(os.getenv("GATEWAY_PORT", "8000"))
 
-# Local path where model weights reside (NVMe)
-MODELS_PATH: str = os.getenv("MODELS_PATH", "/mnt/nvme_data/models")
+# Local path where model weights reside
+MODELS_PATH: str = os.getenv("MODELS_PATH", "/home/alejandroacho/Models")
 
 # Total system RAM; determines swap strategy
 SYSTEM_RAM_GB: int = int(os.getenv("SYSTEM_RAM_GB", "512"))
@@ -182,15 +182,18 @@ QWEN3_CODER_NEXT_80B = ModelDefinition(
     name="qwen3-coder-next-80b",
     container_image="blackwell-vllm:latest",
     container_name="vllm-qwen3-coder-next-80b",
-    vram_required_mb=95_000,        # ~93 GB GPTQ-8bit MoE
+    vram_required_mb=85_000,        # FP8 ~80 GB
     port=8002,
-    quantization="auto",            # Auto-detect from config.json (gptq)
+    quantization="fp8",
     tensor_parallel_size=1,
-    max_model_len=32768,            # Model's max_position_embeddings
+    max_model_len=32768,
     kv_cache_dtype="fp8",
-    model_path="qwen3-coder-next-80b-q8",
+    model_path="qwen3-coder-next-80b-fp8",
     engine="vllm",
-    extra_args={"--gpu-memory-utilization": "0.92", "--enforce-eager": True},
+    extra_args={
+        "--gpu-memory-utilization": "0.80",
+        "--load-format": "fastsafetensors",
+    },
 )
 
 QWEN3_CODER_BASE = ModelDefinition(
@@ -205,7 +208,7 @@ QWEN3_CODER_BASE = ModelDefinition(
     kv_cache_dtype="fp8",
     model_path="qwen3-coder-q8",
     engine="vllm",
-    extra_args={"--gpu-memory-utilization": "0.92", "--enforce-eager": True},
+    extra_args={"--gpu-memory-utilization": "0.92"},
 )
 
 FLUX2_PRO = ModelDefinition(
@@ -261,8 +264,8 @@ PROFILE_FOCUS = VRAMProfile(
 
 PROFILE_FOCUS_CODE = VRAMProfile(
     mode=ProfileMode.FOCUS,
-    description="Code Mode: Qwen3 Coder Next 80B MoE (single-GPU, ~95 GB)",
-    primary_models=[QWEN3_CODER_NEXT_80B],
+    description="Code Mode: GPT-OSS 120B (single-GPU, ~84 GB, MXFP4 CUTLASS sm_121)",
+    primary_models=[GPT_OSS_120B],
 )
 
 PROFILE_CREATIVE_IMAGE = VRAMProfile(

@@ -164,10 +164,14 @@ class InferenceProxy:
                     elapsed = (time.time() - stream_start) * 1000
                     if last_usage:
                         completion_tokens = last_usage.get("completion_tokens", 0)
-                        tps = completion_tokens / (elapsed / 1000) if elapsed > 0 else 0
+                        # Use vLLM's TTFT if available to separate prefill from decode
+                        ttft_ms = last_usage.get("time_to_first_token_ms", 0)
+                        decode_ms = (elapsed - ttft_ms) if ttft_ms else elapsed
+                        tps = completion_tokens / (decode_ms / 1000) if decode_ms > 0 else 0
+                        ttft_info = f" | TTFT={ttft_ms:.0f}ms" if ttft_ms else ""
                         logger.info(
-                            "Stream completion %.1fms — prompt=%d | completion=%d | total=%d tokens | %.1f tok/s",
-                            elapsed,
+                            "Stream completion %.1fms%s — prompt=%d | completion=%d | total=%d tokens | %.1f tok/s (decode)",
+                            elapsed, ttft_info,
                             last_usage.get("prompt_tokens", 0),
                             completion_tokens,
                             last_usage.get("total_tokens", 0),

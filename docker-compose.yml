@@ -38,7 +38,7 @@ x-gpu-common: &gpu-common
     - blackwell_net
 
 x-model-volumes: &model-volumes
-  - /mnt/nvme_data/models:/mnt/nvme_data/models:ro
+  - /home/alejandroacho/Models:/home/alejandroacho/Models:ro
   - triton_cache:/root/.triton
 
 services:
@@ -63,7 +63,7 @@ services:
     environment:
       - GATEWAY_HOST=0.0.0.0
       - GATEWAY_PORT=8000
-      - MODELS_PATH=/mnt/nvme_data/models
+      - MODELS_PATH=/home/alejandroacho/Models
       - SYSTEM_RAM_GB=218
       - SWAP_TIMEOUT_S=600
       - VRAM_POLL_INTERVAL_S=2.0
@@ -77,7 +77,7 @@ services:
       - RETRY_LOG_INTERVAL_S=10
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/nvme_data/models:/mnt/nvme_data/models:ro
+      - /home/alejandroacho/Models:/home/alejandroacho/Models:ro
     networks:
       - blackwell_net
     healthcheck:
@@ -107,7 +107,7 @@ services:
       - TRITON_CACHE_DIR=/root/.triton
     command: >
       python -m vllm.entrypoints.openai.api_server
-      --model /mnt/nvme_data/models/gpt-oss-120b-q8
+      --model /home/alejandroacho/Models/gpt-oss-120b-q8
       --port 8001
       --tensor-parallel-size 2
       --max-model-len 128000
@@ -134,7 +134,7 @@ services:
       - TRITON_CACHE_DIR=/root/.triton
     command: >
       python -m vllm.entrypoints.openai.api_server
-      --model /mnt/nvme_data/models/qwen3-coder-next-80b-q8
+      --model /home/alejandroacho/Models/qwen3-coder-next-80b-q8
       --port 8002
       --tensor-parallel-size 2
       --max-model-len 128000
@@ -165,7 +165,7 @@ services:
       - TRITON_CACHE_DIR=/root/.triton
     command: >
       python -m vllm.entrypoints.openai.api_server
-      --model /mnt/nvme_data/models/qwen3-coder-q8
+      --model /home/alejandroacho/Models/qwen3-coder-q8
       --port 8003
       --tensor-parallel-size 2
       --max-model-len 128000
