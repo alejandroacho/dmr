@@ -47,6 +47,9 @@ DOCKER_NETWORK: str = os.getenv("DOCKER_NETWORK", "blackwell_net")
 # Retry-After header for 503 during swaps (seconds)
 RETRY_AFTER_SECONDS: int = int(os.getenv("RETRY_AFTER_SECONDS", "5"))
 
+# How often to emit retry/wait log lines (seconds); avoids log spam during long swaps
+RETRY_LOG_INTERVAL_S: int = int(os.getenv("RETRY_LOG_INTERVAL_S", "10"))
+
 # Maximum queued requests during a swap
 MAX_QUEUE_SIZE: int = int(os.getenv("MAX_QUEUE_SIZE", "200"))
 
@@ -177,7 +180,7 @@ GPT_OSS_120B = ModelDefinition(
 
 QWEN3_CODER_NEXT_80B = ModelDefinition(
     name="qwen3-coder-next-80b",
-    container_image="vllm/vllm-openai:cu130-nightly",
+    container_image="blackwell-vllm:latest",
     container_name="vllm-qwen3-coder-next-80b",
     vram_required_mb=95_000,        # ~93 GB GPTQ-8bit MoE
     port=8002,
@@ -192,7 +195,7 @@ QWEN3_CODER_NEXT_80B = ModelDefinition(
 
 QWEN3_CODER_BASE = ModelDefinition(
     name="qwen3-coder",
-    container_image="vllm/vllm-openai:cu130-nightly",
+    container_image="blackwell-vllm:latest",
     container_name="vllm-qwen3-coder",
     vram_required_mb=35_000,        # ~35 GB: 30B-A3B MoE at Q8 (3B active params)
     port=8003,

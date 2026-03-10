@@ -20,6 +20,7 @@ from gateway.config import (
     DOCKER_NETWORK,
     MODELS_PATH,
     SWAP_TIMEOUT_S,
+    RETRY_LOG_INTERVAL_S,
     ALL_MODELS,
     PROFILES,
     ModelDefinition,
@@ -341,6 +342,16 @@ class ContainerOrchestrator:
 
         cmd = self._build_cmd(model)
 
+        # Override the image's built-in HEALTHCHECK to use the correct port.
+        # vLLM images default to localhost:8000 but each model uses its own port.
+        healthcheck = docker.types.Healthcheck(
+            test=["CMD-SHELL", f"curl -f http://localhost:{model.port}/health || exit 1"],
+            interval=30_000_000_000,    # 30s in nanoseconds
+            timeout=10_000_000_000,     # 10s
+            start_period=300_000_000_000,  # 5min — model loading takes time
+            retries=3,
+        )
+
         try:
             container = await loop.run_in_executor(
                 None,
@@ -362,6 +373,7 @@ class ContainerOrchestrator:
                     ],
                     restart_policy={"Name": "unless-stopped"},
                     shm_size="16g",
+                    healthcheck=healthcheck,
                 ),
             )
             logger.info("Container '%s' created and started.", model.container_name)
@@ -425,6 +437,7 @@ class ContainerOrchestrator:
         for model in models:
             name = model.container_name
             attempt = 0
+            last_log: float = 0.0
             while True:
                 elapsed = time.time() - start
                 if elapsed > timeout:
@@ -433,6 +446,8 @@ class ContainerOrchestrator:
                     )
 
                 attempt += 1
+                now = time.time()
+                should_log = (now - last_log) >= RETRY_LOG_INTERVAL_S
                 try:
                     container = await loop.run_in_executor(
                         None, lambda n=name: self._client.containers.get(n)
@@ -448,27 +463,27 @@ class ContainerOrchestrator:
 
                         if healthy:
                             self._container_states[name] = ContainerState.READY
-                            logger.info("Container '%s' READY.", name)
+                            logger.info("Container '%s' READY (%.0fs).", name, elapsed)
                             break
-                        else:
+                        elif should_log:
                             logger.info(
-                                "Waiting for '%s' healthcheck... "
-                                "(attempt %d, %.0fs elapsed)",
-                                name, attempt, elapsed,
+                                "Waiting for '%s' healthcheck... (%.0fs elapsed)",
+                                name, elapsed,
                             )
-                    else:
+                    elif should_log:
                         logger.info(
-                            "Waiting for '%s' to start (status=%s, "
-                            "attempt %d, %.0fs elapsed)",
-                            name, container.status, attempt, elapsed,
+                            "Waiting for '%s' to start (status=%s, %.0fs elapsed)",
+                            name, container.status, elapsed,
                         )
                 except (NotFound, APIError):
-                    logger.info(
-                        "Waiting for '%s' container to appear... "
-                        "(attempt %d, %.0fs elapsed)",
-                        name, attempt, elapsed,
-                    )
+                    if should_log:
+                        logger.info(
+                            "Waiting for '%s' container to appear... (%.0fs elapsed)",
+                            name, elapsed,
+                        )
 
+                if should_log:
+                    last_log = now
                 await asyncio.sleep(1)
 
     async def _check_vllm_health(self, container_name: str, port: int) -> bool:

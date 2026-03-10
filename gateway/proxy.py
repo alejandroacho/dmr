@@ -12,7 +12,7 @@ from typing import Any, AsyncIterator
 
 import aiohttp
 
-from gateway.config import ModelDefinition
+from gateway.config import ModelDefinition, RETRY_LOG_INTERVAL_S
 
 logger = logging.getLogger("gateway.proxy")
 
@@ -61,6 +61,7 @@ class InferenceProxy:
             return self._stream_response(url, payload)
 
         last_exc: Exception | None = None
+        last_log: float = 0.0
         for attempt in range(1, self.CONNECT_RETRIES + 1):
             start = time.time()
             try:
@@ -78,17 +79,28 @@ class InferenceProxy:
                         }
                     result = await resp.json()
                     elapsed = (time.time() - start) * 1000
-                    logger.debug("Chat completion in %.1fms (model=%s)", elapsed, model.name)
+                    usage = result.get("usage") or {}
+                    logger.info(
+                        "Chat completion in %.1fms — model=%s | "
+                        "prompt=%d tokens | completion=%d tokens | total=%d tokens",
+                        elapsed, model.name,
+                        usage.get("prompt_tokens", 0),
+                        usage.get("completion_tokens", 0),
+                        usage.get("total_tokens", 0),
+                    )
                     return result
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 last_exc = exc
+                now = time.time()
                 if attempt < self.CONNECT_RETRIES:
-                    logger.warning(
-                        "Connection to %s failed (attempt %d/%d): %s. "
-                        "Retrying in %ds...",
-                        model.container_name, attempt, self.CONNECT_RETRIES,
-                        exc, self.CONNECT_RETRY_DELAY,
-                    )
+                    if now - last_log >= RETRY_LOG_INTERVAL_S:
+                        logger.warning(
+                            "Connection to %s not ready yet (attempt %d/%d): %s. "
+                            "Retrying every %ds...",
+                            model.container_name, attempt, self.CONNECT_RETRIES,
+                            exc, self.CONNECT_RETRY_DELAY,
+                        )
+                        last_log = now
                     await asyncio.sleep(self.CONNECT_RETRY_DELAY)
 
         logger.error(
@@ -112,6 +124,7 @@ class InferenceProxy:
 
         payload["stream"] = True
         last_exc: Exception | None = None
+        last_log: float = 0.0
 
         for attempt in range(1, self.CONNECT_RETRIES + 1):
             try:
@@ -126,13 +139,16 @@ class InferenceProxy:
                     return  # Success — exit retry loop
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 last_exc = exc
+                now = time.time()
                 if attempt < self.CONNECT_RETRIES:
-                    logger.warning(
-                        "Streaming connection to %s failed (attempt %d/%d): %s. "
-                        "Retrying in %ds...",
-                        url, attempt, self.CONNECT_RETRIES,
-                        exc, self.CONNECT_RETRY_DELAY,
-                    )
+                    if now - last_log >= RETRY_LOG_INTERVAL_S:
+                        logger.warning(
+                            "Streaming connection to %s not ready yet (attempt %d/%d): %s. "
+                            "Retrying every %ds...",
+                            url, attempt, self.CONNECT_RETRIES,
+                            exc, self.CONNECT_RETRY_DELAY,
+                        )
+                        last_log = now
                     await asyncio.sleep(self.CONNECT_RETRY_DELAY)
 
         logger.error("Streaming connection error after %d retries: %s", self.CONNECT_RETRIES, last_exc)
@@ -140,6 +156,8 @@ class InferenceProxy:
         yield f"data: {error_event}\n\n".encode()
 
     # ──────────── Image (ComfyUI / Diffusers) ────────
+
+    IMAGE_TIMEOUT_S = 300   # 5 min — FLUX generation is fast on Blackwell
 
     async def generate_image(
         self,
@@ -150,10 +168,11 @@ class InferenceProxy:
         Sends an image generation request to the ComfyUI/Diffusers container.
         """
         url = f"http://{model.container_name}:{model.port}/generate"
+        timeout = aiohttp.ClientTimeout(total=self.IMAGE_TIMEOUT_S, connect=10)
 
         start = time.time()
         try:
-            async with self._session.post(url, json=payload) as resp:
+            async with self._session.post(url, json=payload, timeout=timeout) as resp:
                 if resp.status != 200:
                     error_body = await resp.text()
                     logger.error(
@@ -170,6 +189,8 @@ class InferenceProxy:
 
     # ──────────── Video (LTX-Video / Diffusers) ──────
 
+    VIDEO_TIMEOUT_S = 1800  # 30 min — video generation can be slow at high frame counts
+
     async def generate_video(
         self,
         model: ModelDefinition,
@@ -179,10 +200,11 @@ class InferenceProxy:
         Sends a video generation request to the LTX-Video container.
         """
         url = f"http://{model.container_name}:{model.port}/generate"
+        timeout = aiohttp.ClientTimeout(total=self.VIDEO_TIMEOUT_S, connect=10)
 
         start = time.time()
         try:
-            async with self._session.post(url, json=payload) as resp:
+            async with self._session.post(url, json=payload, timeout=timeout) as resp:
                 if resp.status != 200:
                     error_body = await resp.text()
                     logger.error(
