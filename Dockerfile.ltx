@@ -1,0 +1,40 @@
+# LTX-Video inference server
+# Builds the 'ltx-video:latest' image used by the creative_video profile.
+# Compatible with NVIDIA GB10 Blackwell (sm_121).
+#
+# Build:
+#   docker build -f Dockerfile.ltx -t ltx-video:latest .
+#
+# Run standalone (for testing):
+#   docker run --rm --gpus all -p 8005:8005 \
+#     -v /mnt/nvme_data/models/ltx-video-2-q8:/models:ro \
+#     ltx-video:latest
+
+FROM nvcr.io/nvidia/pytorch:26.01-py3
+
+WORKDIR /app
+
+# Install Python deps (imageio[ffmpeg] pulls ffmpeg binaries automatically)
+RUN pip install --no-cache-dir \
+    diffusers>=0.31.0 \
+    transformers>=4.45.0 \
+    accelerate>=0.33.0 \
+    sentencepiece \
+    protobuf \
+    fastapi \
+    uvicorn[standard] \
+    pydantic>=2.0 \
+    imageio[ffmpeg] \
+    numpy
+
+COPY inference/ltx_server.py /app/server.py
+
+ENV PORT=8005
+ENV MODEL_PATH=/models
+
+EXPOSE 8005
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8005/health')"
+
+CMD ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8005"]

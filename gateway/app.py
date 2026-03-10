@@ -1,0 +1,618 @@
+"""
+Blackwell Orchestrator & Smart Gateway
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Main FastAPI application.
+Manages intelligent routing, Docker container lifecycle,
+and dynamic model swapping on an ASUS GX10 with ~120 GB unified VRAM.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from gateway import __version__
+from gateway.config import (
+    GATEWAY_HOST,
+    GATEWAY_PORT,
+    LONG_POLLING_ENABLED,
+    LONG_POLLING_TIMEOUT_S,
+    PROFILES,
+    PROFILE_FOCUS,
+    PROFILE_FOCUS_CODE,
+    RETRY_AFTER_SECONDS,
+)
+from gateway.orchestrator import ContainerOrchestrator
+from gateway.proxy import InferenceProxy
+from gateway.request_buffer import (
+    BufferOverflowError,
+    RadixPrefixCache,
+    RequestBuffer,
+)
+from gateway.router import SmartRouter
+from gateway.schemas import (
+    AgentRequest,
+    ContainerState,
+    GatewayResponse,
+    HealthResponse,
+    ImageGenerationRequest,
+    MediaType,
+    ProfileMode,
+    ProfileStatusResponse,
+    SwapStatusResponse,
+    VideoGenerationRequest,
+    VRAMReport,
+)
+from gateway.vram_monitor import VRAMMonitor
+
+# ──────────────────── Swap Task Tracking ───────────────
+# Prevents duplicate swaps and shields from cancellation.
+
+_active_swap_task: asyncio.Task | None = None
+_active_swap_target: str | None = None
+
+# ──────────────────── Logging ──────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(name)-28s │ %(levelname)-7s │ %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("gateway.app")
+
+# ──────────────────── Singletons ───────────────────────
+
+vram_monitor = VRAMMonitor()
+orchestrator = ContainerOrchestrator(vram_monitor)
+router_engine = SmartRouter()
+request_buffer = RequestBuffer()
+prefix_cache = RadixPrefixCache()
+inference_proxy = InferenceProxy()
+
+_start_time: float = 0.0
+
+
+# ──────────────────── Lifecycle ────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _start_time
+    _start_time = time.time()
+
+    logger.info("━━━ Blackwell Smart Gateway v%s starting ━━━", __version__)
+
+    # Start subsystems
+    await vram_monitor.start()
+    await inference_proxy.startup()
+
+    # Try to reuse whatever profile was already running (avoids a 7-min model reload)
+    adopted = await orchestrator.detect_and_adopt_running_profile()
+    if adopted:
+        logger.info("Autodetect: resumed profile '%s' without restarting containers.", adopted)
+    else:
+        # No usable containers found — clean up orphans and load the default
+        await orchestrator.cleanup_orphaned_containers()
+        logger.info("Loading default profile: FOCUS_CODE (Qwen3 Coder Next 80B)")
+        success = await orchestrator.switch_profile(PROFILE_FOCUS_CODE)
+        if not success:
+            logger.warning("Could not load the default FOCUS_CODE profile.")
+
+    logger.info("━━━ Gateway READY en %s:%d ━━━", GATEWAY_HOST, GATEWAY_PORT)
+
+    yield  # App running
+
+    # Shutdown
+    logger.info("━━━ Shutting down Smart Gateway ━━━")
+    await vram_monitor.stop()
+    await inference_proxy.shutdown()
+    logger.info("━━━ Gateway shut down successfully ━━━")
+
+
+# ──────────────────── App ──────────────────────────────
+
+app = FastAPI(
+    title="Blackwell Orchestrator & Smart Gateway",
+    description=(
+        "Middleware layer for autonomous VRAM management (~120 GB), "
+        "dynamic model swapping, and intelligent routing on an "
+        "ASUS GX10 with a single NVIDIA GB10 Blackwell GPU."
+    ),
+    version=__version__,
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  MAIN ENDPOINTS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+# ──────────── Health & Status ─────────────────────────
+
+@app.get("/health", response_model=HealthResponse, tags=["System"])
+async def health():
+    """Gateway health check and overall cluster status."""
+    report = vram_monitor.latest
+    profile_name = orchestrator.active_profile
+    mode = None
+    if profile_name:
+        mode = ProfileMode.FOCUS if "focus" in profile_name else ProfileMode.CREATIVE
+
+    return HealthResponse(
+        status="ok" if report.healthy else "degraded",
+        version=__version__,
+        active_profile=mode,
+        vram=report,
+        containers=orchestrator.container_states,
+        uptime_seconds=time.time() - _start_time,
+    )
+
+
+@app.get("/status/vram", response_model=VRAMReport, tags=["System"])
+async def vram_status():
+    """Detailed VRAM report for the cluster."""
+    return await vram_monitor.query_gpus()
+
+
+@app.get("/status/swap", response_model=SwapStatusResponse, tags=["System"])
+async def swap_status():
+    """Current model swap status (if in progress)."""
+    return SwapStatusResponse(
+        swapping=orchestrator.is_swapping,
+        elapsed_seconds=orchestrator.swap_elapsed,
+        estimated_remaining_seconds=max(0, 5.0 - orchestrator.swap_elapsed),
+        queued_requests=request_buffer.queue_size,
+    )
+
+
+@app.get("/status/profile", response_model=ProfileStatusResponse, tags=["System"])
+async def profile_status():
+    """Detailed status of the active profile and loaded models."""
+    profile_key = orchestrator.active_profile or "focus"
+    mode = ProfileMode.FOCUS if "focus" in profile_key else ProfileMode.CREATIVE
+
+    # Get slots for the active profile
+    models = []
+    for name, state in orchestrator.container_states.items():
+        from gateway.config import (
+            GPT_OSS_120B, QWEN3_CODER_NEXT_80B, QWEN3_CODER_BASE,
+            FLUX2_PRO, LTX_VIDEO_2,
+        )
+        model_map = {
+            GPT_OSS_120B.container_name: GPT_OSS_120B,
+            QWEN3_CODER_NEXT_80B.container_name: QWEN3_CODER_NEXT_80B,
+            QWEN3_CODER_BASE.container_name: QWEN3_CODER_BASE,
+            FLUX2_PRO.container_name: FLUX2_PRO,
+            LTX_VIDEO_2.container_name: LTX_VIDEO_2,
+        }
+        if name in model_map:
+            models.append(model_map[name].to_slot(state))
+
+    return ProfileStatusResponse(
+        active_profile=mode,
+        models=models,
+        vram=vram_monitor.latest,
+    )
+
+
+@app.get("/status/cache", tags=["System"])
+async def cache_status():
+    """Radix Prefix Cache statistics."""
+    return prefix_cache.get_stats()
+
+
+# ──────────── Unified Inference Endpoint ────────
+
+@app.post("/v1/chat/completions", tags=["Inference"])
+async def chat_completions(request: AgentRequest):
+    """
+    Unified endpoint compatible with OpenAI Chat Completions.
+    The Gateway automatically detects whether the request is for text,
+    image, or video and routes to the corresponding backend.
+    """
+    start_time = time.time()
+
+    # 1. Routing
+    decision = router_engine.route(request)
+
+    # 2. Compute prefix if there are system messages
+    if request.messages:
+        prefix_cache.get_prefix_hash(request.messages)
+
+    # 3. Check if swap is needed
+    current_profile = orchestrator.active_profile or ""
+    target_key = orchestrator._profile_key(decision.profile)
+
+    if current_profile != target_key:
+        decision.requires_swap = True
+
+        # Obtain or create a swap task (never duplicate)
+        swap_task = _get_or_create_swap_task(decision.profile, target_key)
+
+        if LONG_POLLING_ENABLED:
+            # Wait for swap to complete (Long Polling).
+            # Use asyncio.shield so the swap continues even if this
+            # request times out — prevents the "death loop".
+            try:
+                success = await asyncio.wait_for(
+                    asyncio.shield(swap_task), timeout=LONG_POLLING_TIMEOUT_S
+                )
+                if not success:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Model swap failed",
+                        headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+                    )
+            except asyncio.TimeoutError:
+                # The swap is still running — tell the client to retry.
+                # Do NOT reject buffered requests (the swap will finish).
+                raise HTTPException(
+                    status_code=503,
+                    detail="Swap still in progress, please retry",
+                    headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+                )
+        else:
+            # Immediate 503
+            raise HTTPException(
+                status_code=503,
+                detail="Profile switch in progress",
+                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            )
+
+    # 4. Proxy to inference backend
+    try:
+        result = await _dispatch_to_backend(decision, request)
+    except Exception as exc:
+        logger.error("Inference error: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    # Check if the proxy returned an error dict
+    if isinstance(result, dict) and "error" in result:
+        err = result["error"]
+        code = err.get("code", 502)
+        raise HTTPException(status_code=code, detail=err.get("message", "Backend error"))
+
+    elapsed = (time.time() - start_time) * 1000
+
+    # 5. If streaming, return SSE
+    if request.stream and decision.media_type == MediaType.TEXT:
+        return StreamingResponse(
+            result,
+            media_type="text/event-stream",
+            headers={"X-Processing-Time-Ms": f"{elapsed:.1f}"},
+        )
+
+    # 6. Normal response
+    return GatewayResponse(
+        success=True,
+        data=result,
+        profile=decision.profile.mode,
+        processing_time_ms=elapsed,
+        model_used=decision.target_model.name,
+    )
+
+
+# ──────────── Specific Multimedia Endpoints ────────
+
+@app.post("/v1/images/generate", tags=["Multimedia"])
+async def generate_image(request: ImageGenerationRequest):
+    """
+    Generates an image with FLUX.2 Pro.
+    Automatically triggers the switch to Creative Mode if needed.
+    """
+    start_time = time.time()
+
+    # Force creative image profile
+    from gateway.config import PROFILE_CREATIVE_IMAGE, FLUX2_PRO
+
+    current = orchestrator.active_profile or ""
+    target_key = orchestrator._profile_key(PROFILE_CREATIVE_IMAGE)
+
+    if current != target_key:
+        if orchestrator.is_swapping:
+            raise HTTPException(
+                status_code=503,
+                detail="Swap in progress",
+                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            )
+        success = await orchestrator.switch_profile(PROFILE_CREATIVE_IMAGE)
+        if not success:
+            raise HTTPException(status_code=503, detail="Could not activate creative mode")
+
+    payload = request.model_dump()
+    result = await inference_proxy.generate_image(FLUX2_PRO, payload)
+    elapsed = (time.time() - start_time) * 1000
+
+    return GatewayResponse(
+        success="error" not in result,
+        data=result,
+        profile=ProfileMode.CREATIVE,
+        processing_time_ms=elapsed,
+        model_used="flux2-pro",
+    )
+
+
+@app.post("/v1/videos/generate", tags=["Multimedia"])
+async def generate_video(request: VideoGenerationRequest):
+    """
+    Generates a video with LTX-Video 2.
+    Automatically triggers the switch to Creative Mode if needed.
+    """
+    start_time = time.time()
+
+    from gateway.config import PROFILE_CREATIVE_VIDEO, LTX_VIDEO_2
+
+    current = orchestrator.active_profile or ""
+    target_key = orchestrator._profile_key(PROFILE_CREATIVE_VIDEO)
+
+    if current != target_key:
+        if orchestrator.is_swapping:
+            raise HTTPException(
+                status_code=503,
+                detail="Swap in progress",
+                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            )
+        success = await orchestrator.switch_profile(PROFILE_CREATIVE_VIDEO)
+        if not success:
+            raise HTTPException(status_code=503, detail="Could not activate creative video mode")
+
+    payload = request.model_dump()
+    result = await inference_proxy.generate_video(LTX_VIDEO_2, payload)
+    elapsed = (time.time() - start_time) * 1000
+
+    return GatewayResponse(
+        success="error" not in result,
+        data=result,
+        profile=ProfileMode.CREATIVE,
+        processing_time_ms=elapsed,
+        model_used="ltx-video-2",
+    )
+
+
+# ──────────── Manual Profile Management ────────────
+
+@app.post("/admin/profile/{profile_name}", tags=["Administration"])
+async def set_profile(profile_name: str, force: bool = False):
+    """
+    Manually switches the VRAM profile.
+    Valid values: focus, creative_image, creative_video
+    """
+    if profile_name not in PROFILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Profile '{profile_name}' not valid. "
+                   f"Options: {list(PROFILES.keys())}",
+        )
+
+    if orchestrator.is_swapping:
+        raise HTTPException(
+            status_code=409,
+            detail="A swap is already in progress",
+        )
+
+    profile = PROFILES[profile_name]
+    success = await orchestrator.switch_profile(profile, force=force)
+
+    if not success:
+        raise HTTPException(status_code=500, detail="Swap failed")
+
+    return GatewayResponse(
+        success=True,
+        data={"message": f"Profile switched to '{profile_name}'"},
+        profile=profile.mode,
+    )
+
+
+@app.post("/admin/container/{container_name}/stop", tags=["Administration"])
+async def stop_container(container_name: str):
+    """Manually stops an inference container."""
+    await orchestrator.stop_container(container_name)
+    return {"status": "stopped", "container": container_name}
+
+
+@app.post("/admin/container/{container_name}/remove", tags=["Administration"])
+async def remove_container(container_name: str):
+    """Manually removes an inference container."""
+    await orchestrator.remove_container(container_name)
+    return {"status": "removed", "container": container_name}
+
+
+# ──────────── Model Listing (OpenAI compat) ──────
+
+@app.get("/v1/models", tags=["Inference"])
+async def list_models():
+    """Lists available models (OpenAI format)."""
+    from gateway.config import (
+        GPT_OSS_120B, QWEN3_CODER_NEXT_80B, QWEN3_CODER_BASE,
+        FLUX2_PRO, LTX_VIDEO_2,
+    )
+    all_models = [GPT_OSS_120B, QWEN3_CODER_NEXT_80B, QWEN3_CODER_BASE, FLUX2_PRO, LTX_VIDEO_2]
+
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": m.name,
+                "object": "model",
+                "owned_by": "blackwell-gateway",
+                "engine": m.engine,
+                "vram_mb": m.vram_required_mb,
+                "quantization": m.quantization,
+            }
+            for m in all_models
+        ],
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  INTERNAL HELPERS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _get_or_create_swap_task(profile, target_key: str) -> asyncio.Task:
+    """
+    Returns the active swap task if it targets the same profile,
+    otherwise creates a new one.  Prevents duplicate swaps.
+
+    The task is wrapped in `_execute_swap_and_drain` so it automatically
+    drains buffered requests on success or rejects them on failure.
+    """
+    global _active_swap_task, _active_swap_target
+
+    # Reuse an existing swap to the SAME target
+    if (
+        _active_swap_task is not None
+        and not _active_swap_task.done()
+        and _active_swap_target == target_key
+    ):
+        logger.debug("Reusing existing swap task → '%s'", target_key)
+        return _active_swap_task
+
+    logger.info("Swap required: '%s' → '%s'", orchestrator.active_profile or "", target_key)
+
+    _active_swap_target = target_key
+    _active_swap_task = asyncio.create_task(
+        _execute_swap_and_drain(profile)
+    )
+    return _active_swap_task
+
+
+async def _execute_swap_and_drain(profile) -> bool:
+    """
+    Executes the swap and handles buffer drain/reject.
+    This runs as a long-lived task that is never cancelled.
+    """
+    global _active_swap_task, _active_swap_target
+
+    try:
+        success = await orchestrator.switch_profile(profile)
+        if success:
+            asyncio.create_task(_drain_buffered_requests())
+        else:
+            await request_buffer.reject_all("Swap failed")
+        return success
+    except Exception as exc:
+        logger.error("Swap task error: %s", exc)
+        await request_buffer.reject_all(f"Swap error: {exc}")
+        return False
+    finally:
+        _active_swap_task = None
+        _active_swap_target = None
+
+
+async def _handle_during_swap(request: AgentRequest):
+    """Handles a request when a swap is in progress."""
+    if LONG_POLLING_ENABLED:
+        try:
+            future = await request_buffer.enqueue(request)
+            result = await asyncio.wait_for(future, timeout=LONG_POLLING_TIMEOUT_S)
+            if isinstance(result, dict) and "error" in result:
+                err = result["error"]
+                code = err.get("code", 502)
+                raise HTTPException(status_code=code, detail=err.get("message", "Backend error"))
+            return GatewayResponse(success=True, data=result)
+        except BufferOverflowError:
+            raise HTTPException(
+                status_code=503,
+                detail="Queue full — swap in progress",
+                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=503,
+                detail="Long polling timeout",
+                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            )
+    else:
+        raise HTTPException(
+            status_code=503,
+            detail="Model swap in progress",
+            headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+        )
+
+
+async def _drain_buffered_requests() -> None:
+    """Drains and dispatches all buffered requests after a successful swap."""
+    try:
+        drained = await request_buffer.drain_all()
+        for buffered in drained:
+            try:
+                decision = router_engine.route(buffered.request)
+                result = await _dispatch_to_backend(decision, buffered.request)
+                await request_buffer.resolve(buffered, result)
+            except Exception as exc:
+                logger.error("Error dispatching buffered request: %s", exc)
+                if not buffered.future.done():
+                    buffered.future.set_exception(exc)
+    except Exception as exc:
+        logger.error("Error draining request buffer: %s", exc)
+
+
+async def _dispatch_to_backend(decision, request: AgentRequest) -> Any:
+    """Dispatches the request to the correct inference backend."""
+    model = decision.target_model
+
+    if decision.media_type == MediaType.TEXT:
+        payload = {
+            "messages": request.messages,
+            "temperature": request.temperature,
+            "max_tokens": request.max_tokens,
+            "stream": request.stream,
+        }
+        if request.tools:
+            payload["tools"] = request.tools
+        if request.tool_choice:
+            payload["tool_choice"] = request.tool_choice
+
+        return await inference_proxy.chat_completion(
+            model, payload, stream=request.stream
+        )
+
+    elif decision.media_type == MediaType.IMAGE:
+        payload = request.media_params or {}
+        # Extract prompt from last message if not in media_params
+        if "prompt" not in payload and request.messages:
+            last_msg = request.messages[-1]
+            payload["prompt"] = last_msg.get("content", "")
+        return await inference_proxy.generate_image(model, payload)
+
+    elif decision.media_type == MediaType.VIDEO:
+        payload = request.media_params or {}
+        if "prompt" not in payload and request.messages:
+            last_msg = request.messages[-1]
+            payload["prompt"] = last_msg.get("content", "")
+        return await inference_proxy.generate_video(model, payload)
+
+    raise ValueError(f"Unknown MediaType: {decision.media_type}")
+
+
+# ──────────── Direct entry point ────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "gateway.app:app",
+        host=GATEWAY_HOST,
+        port=GATEWAY_PORT,
+        log_level="info",
+        workers=1,  # Single worker for shared state
+        access_log=True,
+    )

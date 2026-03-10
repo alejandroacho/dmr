@@ -1,0 +1,38 @@
+# FLUX.1-dev inference server
+# Builds the 'comfyui-flux:latest' image used by the creative_image profile.
+# Compatible with NVIDIA GB10 Blackwell (sm_121).
+#
+# Build:
+#   docker build -f Dockerfile.comfyui -t comfyui-flux:latest .
+#
+# Run standalone (for testing):
+#   docker run --rm --gpus all -p 8004:8004 \
+#     -v /mnt/nvme_data/models/flux2-pro-fp16:/models:ro \
+#     comfyui-flux:latest
+
+FROM nvcr.io/nvidia/pytorch:26.01-py3
+
+WORKDIR /app
+
+# Install Python deps
+RUN pip install --no-cache-dir \
+    diffusers>=0.31.0 \
+    transformers>=4.45.0 \
+    accelerate>=0.33.0 \
+    sentencepiece \
+    protobuf \
+    fastapi \
+    uvicorn[standard] \
+    pydantic>=2.0
+
+COPY inference/flux_server.py /app/server.py
+
+ENV PORT=8004
+ENV MODEL_PATH=/models
+
+EXPOSE 8004
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"
+
+CMD ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8004"]
