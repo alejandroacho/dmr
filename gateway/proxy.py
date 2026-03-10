@@ -80,13 +80,16 @@ class InferenceProxy:
                     result = await resp.json()
                     elapsed = (time.time() - start) * 1000
                     usage = result.get("usage") or {}
+                    completion_tokens = usage.get("completion_tokens", 0)
+                    tps = completion_tokens / (elapsed / 1000) if elapsed > 0 else 0
                     logger.info(
-                        "Chat completion in %.1fms — model=%s | "
-                        "prompt=%d tokens | completion=%d tokens | total=%d tokens",
+                        "Chat completion %.1fms — model=%s | "
+                        "prompt=%d | completion=%d | total=%d tokens | %.1f tok/s",
                         elapsed, model.name,
                         usage.get("prompt_tokens", 0),
-                        usage.get("completion_tokens", 0),
+                        completion_tokens,
                         usage.get("total_tokens", 0),
+                        tps,
                     )
                     return result
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
@@ -119,24 +122,61 @@ class InferenceProxy:
         url: str,
         payload: dict[str, Any],
     ) -> AsyncIterator[bytes]:
-        """Generates SSE chunks from the vLLM backend with retries."""
+        """Generates SSE chunks from the vLLM backend with retries.
+
+        Requests vLLM to include a final usage chunk (stream_options.include_usage)
+        so we can log tokens/sec after the stream completes.
+        """
         import json as _json
 
         payload["stream"] = True
+        # Ask vLLM for a final usage chunk — zero overhead, same stream format
+        payload.setdefault("stream_options", {"include_usage": True})
         last_exc: Exception | None = None
         last_log: float = 0.0
 
         for attempt in range(1, self.CONNECT_RETRIES + 1):
             try:
+                stream_start = time.time()
+                last_usage: dict = {}
+
                 async with self._session.post(url, json=payload) as resp:
                     if resp.status != 200:
                         error_body = await resp.text()
                         error_event = _json.dumps({"error": {"message": error_body, "code": resp.status}})
                         yield f"data: {error_event}\n\n".encode()
                         return
+
                     async for chunk in resp.content.iter_any():
+                        # Scan for the usage chunk without modifying the stream
+                        if b'"usage"' in chunk:
+                            try:
+                                for line in chunk.split(b"\n"):
+                                    line = line.strip()
+                                    if line.startswith(b"data: ") and b'"usage"' in line:
+                                        data = _json.loads(line[6:])
+                                        if data.get("usage"):
+                                            last_usage = data["usage"]
+                            except Exception:
+                                pass
                         yield chunk
+
+                    elapsed = (time.time() - stream_start) * 1000
+                    if last_usage:
+                        completion_tokens = last_usage.get("completion_tokens", 0)
+                        tps = completion_tokens / (elapsed / 1000) if elapsed > 0 else 0
+                        logger.info(
+                            "Stream completion %.1fms — prompt=%d | completion=%d | total=%d tokens | %.1f tok/s",
+                            elapsed,
+                            last_usage.get("prompt_tokens", 0),
+                            completion_tokens,
+                            last_usage.get("total_tokens", 0),
+                            tps,
+                        )
+                    else:
+                        logger.info("Stream completion %.1fms (no usage data)", elapsed)
                     return  # Success — exit retry loop
+
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 last_exc = exc
                 now = time.time()
@@ -181,7 +221,12 @@ class InferenceProxy:
                     return {"error": {"message": error_body, "code": resp.status}}
                 result = await resp.json()
                 elapsed = (time.time() - start) * 1000
-                logger.info("Image generated in %.1fms", elapsed)
+                logger.info(
+                    "Image generated %.1fms — model=%s | %dx%d | seed=%s",
+                    elapsed, model.name,
+                    result.get("width", 0), result.get("height", 0),
+                    result.get("seed", "?"),
+                )
                 return result
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error("Connection error to %s: %s", model.container_name, exc)
@@ -213,7 +258,16 @@ class InferenceProxy:
                     return {"error": {"message": error_body, "code": resp.status}}
                 result = await resp.json()
                 elapsed = (time.time() - start) * 1000
-                logger.info("Video generated in %.1fms", elapsed)
+                num_frames = result.get("num_frames", 0)
+                fps = result.get("fps", 0)
+                duration_s = num_frames / fps if fps else 0
+                logger.info(
+                    "Video generated %.1fms — model=%s | %dx%d | %d frames @ %dfps (%.1fs) | seed=%s",
+                    elapsed, model.name,
+                    result.get("width", 0), result.get("height", 0),
+                    num_frames, fps, duration_s,
+                    result.get("seed", "?"),
+                )
                 return result
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error("Connection error to %s: %s", model.container_name, exc)

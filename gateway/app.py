@@ -302,12 +302,22 @@ async def chat_completions(request: AgentRequest):
 
     elapsed = (time.time() - start_time) * 1000
 
-    # 5. If streaming, return SSE
+    # 5. If streaming, return SSE (VRAM log skipped — generator hasn't run yet)
     if request.stream and decision.media_type == MediaType.TEXT:
         return StreamingResponse(
             result,
             media_type="text/event-stream",
             headers={"X-Processing-Time-Ms": f"{elapsed:.1f}"},
+        )
+
+    # Log VRAM only for non-streaming requests (generator is complete at this point)
+    vram = vram_monitor.latest
+    if vram.healthy and vram.gpus:
+        gpu = vram.gpus[0]
+        logger.info(
+            "VRAM — used=%d MB / %d MB (free=%d MB) | GPU util=%d%% | temp=%d°C",
+            vram.total_used_mb, vram.total_vram_mb, vram.total_free_mb,
+            gpu.utilization_pct, gpu.temperature_c,
         )
 
     # 6. Normal response
