@@ -108,7 +108,8 @@ class ModelDefinition:
     tensor_parallel_size: int = 2
     max_model_len: int = 128000
     kv_cache_dtype: str = "fp8"
-    model_path: str = ""           # Path within MODELS_PATH
+    model_path: str = ""           # Path within MODELS_PATH (local)
+    hf_model_id: str = ""          # HuggingFace model ID (overrides model_path)
     engine: str = "vllm"           # vllm | comfyui | diffusers
     extra_args: dict[str, Any] = field(default_factory=dict)
     # Prefix injected before model path in the container command.
@@ -182,17 +183,19 @@ QWEN3_CODER_NEXT_80B = ModelDefinition(
     name="qwen3-coder-next-80b",
     container_image="blackwell-vllm:latest",
     container_name="vllm-qwen3-coder-next-80b",
-    vram_required_mb=85_000,        # FP8 ~80 GB
+    vram_required_mb=95_000,        # FP8 ~90 GB weights + KV cache
     port=8002,
-    quantization="fp8",
+    quantization="auto",            # FP8 auto-detected from model config
     tensor_parallel_size=1,
-    max_model_len=32768,
+    max_model_len=131072,           # 128K context
     kv_cache_dtype="fp8",
-    model_path="qwen3-coder-next-80b-fp8",
+    hf_model_id="Qwen/Qwen3-Coder-Next-FP8",
     engine="vllm",
     extra_args={
-        "--gpu-memory-utilization": "0.80",
-        "--load-format": "fastsafetensors",
+        "--gpu-memory-utilization": "0.85",
+        "--attention-backend": "flashinfer",
+        "--enable-auto-tool-choice": True,
+        "--tool-call-parser": "qwen3_coder",
     },
 )
 
@@ -264,8 +267,8 @@ PROFILE_FOCUS = VRAMProfile(
 
 PROFILE_FOCUS_CODE = VRAMProfile(
     mode=ProfileMode.FOCUS,
-    description="Code Mode: GPT-OSS 120B (single-GPU, ~84 GB, MXFP4 CUTLASS sm_121)",
-    primary_models=[GPT_OSS_120B],
+    description="Code Mode: Qwen3-Coder-Next 80B MoE FP8 (~95 GB, FlashInfer sm_121)",
+    primary_models=[QWEN3_CODER_NEXT_80B],
 )
 
 PROFILE_CREATIVE_IMAGE = VRAMProfile(

@@ -336,13 +336,12 @@ class ContainerOrchestrator:
         loop = asyncio.get_event_loop()
 
         env_vars = self._build_env(model)
-        volumes = {
-            f"{MODELS_PATH}/{model.model_path}": {
+        volumes = {**model.extra_volumes}
+        if not model.hf_model_id:
+            volumes[f"{MODELS_PATH}/{model.model_path}"] = {
                 "bind": "/models",
                 "mode": "ro",
-            },
-            **model.extra_volumes,
-        }
+            }
 
         cmd = self._build_cmd(model)
 
@@ -597,9 +596,10 @@ class ContainerOrchestrator:
             # so the model path is the first positional arg.
             # Custom images whose ENTRYPOINT is a generic shell script (exec "$@")
             # must set cmd_prefix=["vllm", "serve"] in their ModelDefinition.
+            model_arg = model.hf_model_id if model.hf_model_id else "/models"
             cmd_parts = [
                 *model.cmd_prefix,
-                "/models",
+                model_arg,
                 "--port", str(model.port),
                 "--served-model-name", model.name,
                 "--tensor-parallel-size", str(model.tensor_parallel_size),
