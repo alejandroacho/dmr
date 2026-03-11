@@ -47,7 +47,7 @@ Intelligent middleware layer for autonomous VRAM management (~120 GB), dynamic m
 | **`creative_image`** | Qwen3 Coder 30B + FLUX.2 Pro (FP16) | ~77 GB | Text + image generation |
 | **`creative_video`** | Qwen3 Coder 30B + LTX-Video 2 (Q8) | ~77 GB | Text + video generation |
 
-> **Note:** `focus` (GPT-OSS 120B) requires a custom vLLM image with CUTLASS MXFP4 kernels compiled for sm_121. Build it first: `docker build -t vllm-mxfp4-spark .` from [github.com/christopherowen/spark-vllm-mxfp4-docker](https://github.com/christopherowen/spark-vllm-mxfp4-docker) (~30 min). Expected throughput: 57–60 tok/s on single GB10.
+> **Note:** `focus` (GPT-OSS 120B) requires a custom vLLM image with CUTLASS MXFP4 kernels compiled for sm_121. Build it first: `just build-spark` from [github.com/alejandroacho/gb10-vllm-mxfp4-docker](https://github.com/alejandroacho/gb10-vllm-mxfp4-docker) (~30 min). Expected throughput: 57–60 tok/s on single GB10.
 
 > **Note:** `focus_code` (Qwen3-Coder-Next FP8) uses `blackwell-vllm:latest` (same as `vllm/vllm-openai:cu130-nightly`) with two runtime patches applied at container startup. Expected throughput: ~43–48 tok/s on single GB10. The model is downloaded automatically from HuggingFace on first run (~95 GB).
 
@@ -61,7 +61,7 @@ Two custom Docker images are required. Here is what each one is and why.
 
 ### `vllm-mxfp4-spark:latest` — GPT-OSS 120B only
 
-Built from [github.com/christopherowen/spark-vllm-mxfp4-docker](https://github.com/christopherowen/spark-vllm-mxfp4-docker). This is a **fork of vLLM** that NVIDIA published as the reference implementation for DGX Spark / GB10. It contains:
+Built from [github.com/alejandroacho/gb10-vllm-mxfp4-docker](https://github.com/alejandroacho/gb10-vllm-mxfp4-docker). This is a **fork of vLLM** that NVIDIA published as the reference implementation for DGX Spark / GB10. It contains:
 
 - **CUTLASS MXFP4 MoE kernels** compiled for SM121 — the first open implementation of block-scaled MXFP4 GEMM on GB10
 - Automatic tile selection: 64×128 PingPong for decode (small batches), 128×128 Cooperative for prefill (large batches)
@@ -72,10 +72,9 @@ Built from [github.com/christopherowen/spark-vllm-mxfp4-docker](https://github.c
 Without this image, GPT-OSS runs 40–50% slower (SGLang and llama.cpp both beat a stock vLLM install). With it: **57–60 tok/s single node, 72 tok/s TP=2 with RDMA**.
 
 ```bash
-# Build once (~30 min, uses BuildKit cache for fast rebuilds)
-git clone https://github.com/christopherowen/spark-vllm-mxfp4-docker
-cd spark-vllm-mxfp4-docker
-docker build -t vllm-mxfp4-spark .
+# Clone your fork and build (~30 min, uses BuildKit cache for fast rebuilds)
+git clone https://github.com/alejandroacho/gb10-vllm-mxfp4-docker ~/gb10-vllm-mxfp4-docker
+just build-spark
 ```
 
 This image is **not compatible with Qwen3-Coder-Next**. It has a custom `vllm.envs` that is missing `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER`, which Qwen3-Next's initialization code requires. Do not attempt to serve Qwen3-Next on this image.
@@ -93,24 +92,14 @@ docker tag vllm/vllm-openai:cu130-nightly blackwell-vllm:latest
 
 It is a stock vLLM nightly build against CUDA 13.0. It runs on GB10 in SM120 fallback mode (PyTorch warns about SM121 not being supported up to 12.0, but inference still works correctly).
 
-**Two runtime patches** are applied automatically by the Gateway orchestrator at container startup, sourced from [eugr/spark-vllm-docker/mods/fix-qwen3-coder-next](https://github.com/eugr/spark-vllm-docker/tree/main/mods/fix-qwen3-coder-next):
+**Two patches** are baked into the image at build time (see `models/qwen3-coder-next/`):
 
 | Patch | What it fixes |
 |---|---|
 | Revert PR #34279 | That vLLM PR added `tl.int64` type annotations to Triton MoE kernel strides that cause severe slowness on GB10. The revert is a no-op if the nightly already has it reverted. |
 | `_triton_alloc_setup.py` | Patches `triton.runtime._allocation.NullAllocator.__call__` to use `torch.cuda.caching_allocator_alloc`. Without this, Triton crashes with "Kernel requires a runtime memory allocation, but no allocator was set" on the first inference call. |
 
-The patch files are stored at `/tmp/qwen3-patches/` on the host and mounted into the container. To pre-download them:
-
-```bash
-mkdir -p /tmp/qwen3-patches
-curl -sL https://raw.githubusercontent.com/eugr/spark-vllm-docker/main/mods/fix-qwen3-coder-next/fix_slowness.diff \
-  -o /tmp/qwen3-patches/fix_slowness.diff
-curl -sL https://raw.githubusercontent.com/eugr/spark-vllm-docker/main/mods/fix-qwen3-coder-next/_triton_alloc_setup.py \
-  -o /tmp/qwen3-patches/_triton_alloc_setup.py
-curl -sL https://raw.githubusercontent.com/eugr/spark-vllm-docker/main/mods/fix-qwen3-coder-next/_triton_alloc_setup.pth \
-  -o /tmp/qwen3-patches/_triton_alloc_setup.pth
-```
+The patch files live in `models/qwen3-coder-next/` and are baked into the image at build time via `models/qwen3-coder-next/Dockerfile`. No runtime mounts needed — just `just build-qwen3`.
 
 Expected throughput for Qwen3-Coder-Next FP8 on GB10: **43–48 tok/s** (decode), **~3000 tok/s** (prefill), up to 262K token context with FlashInfer backend.
 
@@ -131,140 +120,58 @@ Expected throughput for Qwen3-Coder-Next FP8 on GB10: **43–48 tok/s** (decode)
 
 ---
 
-## Quick Start (Docker — Recommended)
+## Quick Start (fresh machine)
 
-### 1. Clone and navigate
+### 1. Prerequisites
 
 ```bash
+# Install Docker Engine + NVIDIA Container Toolkit
+# https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+
+# Install just
+cargo install just   # or: brew install just / apt install just
+
+# Install the hf CLI and log in (needed to download gated models like gpt-oss-120b)
+pip install -U huggingface_hub
+hf login
+```
+
+### 2. Clone the repos
+
+```bash
+git clone https://github.com/alejandroacho/Server ~/Server
+git clone https://github.com/alejandroacho/gb10-vllm-mxfp4-docker ~/gb10-vllm-mxfp4-docker
 cd ~/Server
 ```
 
-### 2. Download model weights
-
-Install the Hugging Face CLI if you don't have it:
+### 3. Build Docker images
 
 ```bash
-pip install -U huggingface_hub
-huggingface-cli login   # You need a Hugging Face account (https://huggingface.co)
+# Build everything: spark (~30 min), qwen3 (~2 min), gateway (~1 min)
+just build
 ```
 
-Create the model directories and download each model:
+### 4. Download model weights
 
 ```bash
-# Create all model directories
-sudo mkdir -p /mnt/nvme_data/models/{gpt-oss-120b-q8,qwen3-coder-next-80b-q8,qwen3-coder-q8,flux2-pro-fp16,ltx-video-2-q8}
+just download-gpt-oss    # openai/gpt-oss-120b  → ~/Models/gpt-oss-120b-q8  (~240 GB)
+just download-qwen3      # Qwen/Qwen3-Coder-Next-FP8 → HF cache             (~95 GB)
 ```
 
-#### Focus Profile models
-
-```bash
-# GPT-OSS 120B (primary reasoning model)
-# Repo: openai/gpt-oss-120b — MXFP4 quantized by OpenAI for GB10
-sudo huggingface-cli download openai/gpt-oss-120b \
-  --local-dir /home/alejandroacho/Models/gpt-oss-120b-q8
-
-# Qwen3-Coder-Next FP8 (primary coding model)
-# Downloads automatically from HuggingFace on first container start (~95 GB).
-# To pre-download manually:
-sudo huggingface-cli download Qwen/Qwen3-Coder-Next-FP8
-# (cached to ~/.cache/huggingface/hub automatically)
-```
-
-#### Creative Profile models
-
-```bash
-# Qwen3 Coder 30B (lighter coder for creative mode)
-# Repo: Qwen/Qwen3-Coder-30B-A3B-Instruct  (30B total, 3B activated — MoE)
-sudo huggingface-cli download Qwen/Qwen3-Coder-30B-A3B-Instruct \
-  --local-dir /mnt/nvme_data/models/qwen3-coder-q8
-
-# FLUX.1 Dev (image generation — open-weight FLUX model)
-# Repo: black-forest-labs/FLUX.1-dev
-sudo huggingface-cli download black-forest-labs/FLUX.1-dev \
-  --local-dir /mnt/nvme_data/models/flux2-pro-fp16
-
-# LTX-Video (video generation)
-# Repo: Lightricks/LTX-Video
-sudo huggingface-cli download Lightricks/LTX-Video \
-  --local-dir /mnt/nvme_data/models/ltx-video-2-q8
-```
-
-> **Note:** These downloads are large (50-150 GB each). Ensure your NVMe has enough space. Use `--resume-download` to continue interrupted downloads.
-
-#### Model Reference Table
-
-| Model | Hugging Face Repo | VRAM | Quant | Docker Image | Profile |
-|-------|-------------------|------|-------|--------------|---------|
-| GPT-OSS 120B | `openai/gpt-oss-120b` | ~84 GB | MXFP4 CUTLASS sm_121 | `vllm-mxfp4-spark` | `focus` |
-| Qwen3-Coder-Next | `Qwen/Qwen3-Coder-Next-FP8` | ~95 GB | FP8 native | `blackwell-vllm` | `focus_code` |
-| Qwen3 Coder 30B | `Qwen/Qwen3-Coder-30B-A3B-Instruct` | ~35 GB | auto | `blackwell-vllm` | Creative |
-| FLUX.1 Dev | `black-forest-labs/FLUX.1-dev` | ~42 GB | FP16 | `comfyui-flux` | `creative_image` |
-| LTX-Video | `Lightricks/LTX-Video` | ~42 GB | Q8 | `ltx-video` | `creative_video` |
-
-Expected directory layout after downloading:
-
-```
-/home/alejandroacho/Models/
-├── gpt-oss-120b-q8/     # GPT-OSS 120B weights (MXFP4, from openai/gpt-oss-120b)
-├── flux2-pro-fp16/      # FLUX.2 Pro weights
-└── ltx-video-2-q8/      # LTX-Video 2 weights
-
-# Qwen3-Coder-Next-FP8 is served directly from HuggingFace Hub cache.
-# No local copy needed — it downloads on first run to ~/.cache/huggingface/hub/
-```
-
-### 3. Configure environment
-
-Edit `.env` to match your hardware:
-
-```bash
-# Key settings to review:
-SYSTEM_RAM_GB=218        # Your actual system RAM (affects swap strategy)
-MODELS_PATH=/mnt/nvme_data/models   # Path to your model weights
-```
-
-### 4. Build the Docker images
-
-```bash
-# 1. Build the MXFP4 image for GPT-OSS 120B (~30 min first time)
-git clone https://github.com/christopherowen/spark-vllm-mxfp4-docker
-cd spark-vllm-mxfp4-docker
-docker build -t vllm-mxfp4-spark .
-cd ..
-
-# 2. Pull the nightly vLLM image for Qwen3-Coder-Next and other models
-docker pull vllm/vllm-openai:cu130-nightly
-docker tag vllm/vllm-openai:cu130-nightly blackwell-vllm:latest
-
-# 3. Pre-download the Qwen3 runtime patches (applied at container startup)
-mkdir -p /tmp/qwen3-patches
-BASE=https://raw.githubusercontent.com/eugr/spark-vllm-docker/main/mods/fix-qwen3-coder-next
-curl -sL $BASE/fix_slowness.diff        -o /tmp/qwen3-patches/fix_slowness.diff
-curl -sL $BASE/_triton_alloc_setup.py   -o /tmp/qwen3-patches/_triton_alloc_setup.py
-curl -sL $BASE/_triton_alloc_setup.pth  -o /tmp/qwen3-patches/_triton_alloc_setup.pth
-
-# 4. Build the Gateway container
-docker compose build gateway
-```
+> Ctrl+C pauses any download — re-running resumes it.
 
 ### 5. Launch
 
 ```bash
-# Start the Gateway (it manages inference containers dynamically)
-docker compose up -d gateway
+just up
 ```
 
-### 6. Verify it's running
+### 7. Verify it's running
 
 ```bash
-# Check health
-curl http://localhost:8000/health
-
-# Check VRAM status
-curl http://localhost:8000/status/vram
-
-# Check active profile
-curl http://localhost:8000/status/profile
+just health    # gateway health check
+just vram      # VRAM usage
+just profile   # active profile and loaded models
 ```
 
 ---
@@ -432,22 +339,33 @@ When a request requires a different profile than the currently active one:
 
 ```
 Server/
-├── .env                     # Environment variables
+├── .env                        # Environment variables
 ├── .gitignore
-├── Dockerfile               # Gateway container image
-├── docker-compose.yml       # Full stack definition
-├── requirements.txt         # Python dependencies
-├── README.md                # This file
+├── Dockerfile                  # Gateway container image
+├── docker-compose.yml          # Full stack definition
+├── justfile                    # Task runner (install: cargo install just)
+├── requirements.txt            # Python dependencies
+├── README.md                   # This file
+├── models/
+│   ├── gpt-oss-120b/
+│   │   ├── Dockerfile          # FROM vllm-mxfp4-spark:latest (built from fork)
+│   │   └── download.sh         # hf download openai/gpt-oss-120b
+│   └── qwen3-coder-next/
+│       ├── Dockerfile          # FROM cu130-nightly + GB10 patches applied at build time
+│       ├── fix_slowness.diff   # Reverts vLLM PR #34279 (Triton MoE slowness on GB10)
+│       ├── _triton_alloc_setup.py  # Fixes Triton NullAllocator crash
+│       ├── _triton_alloc_setup.pth # Auto-loaded by Python on startup
+│       └── download.sh         # hf download Qwen/Qwen3-Coder-Next-FP8
 └── gateway/
-    ├── __init__.py           # Package init + version
-    ├── app.py                # FastAPI application (main entry point)
-    ├── config.py             # Central configuration + VRAM profiles
-    ├── orchestrator.py       # Docker container lifecycle manager
-    ├── proxy.py              # HTTP proxy to inference backends
-    ├── request_buffer.py     # Request queue + Radix Prefix Cache
-    ├── router.py             # Smart routing + trigger detection
-    ├── schemas.py            # Pydantic data models
-    └── vram_monitor.py       # nvidia-smi VRAM monitoring
+    ├── __init__.py             # Package init + version
+    ├── app.py                  # FastAPI application (main entry point)
+    ├── config.py               # Central configuration + VRAM profiles
+    ├── orchestrator.py         # Docker container lifecycle manager
+    ├── proxy.py                # HTTP proxy to inference backends
+    ├── request_buffer.py       # Request queue + Radix Prefix Cache
+    ├── router.py               # Smart routing + trigger detection
+    ├── schemas.py              # Pydantic data models
+    └── vram_monitor.py         # nvidia-smi VRAM monitoring
 ```
 
 ---
