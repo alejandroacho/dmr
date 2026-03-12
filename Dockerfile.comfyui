@@ -7,10 +7,15 @@
 #
 # Run standalone (for testing):
 #   docker run --rm --gpus all -p 8004:8004 \
-#     -v /mnt/nvme_data/models/flux2-pro-fp16:/models:ro \
+#     -v /home/alejandroacho/Models/flux2-pro-fp16:/models:ro \
 #     comfyui-flux:latest
+#
+# Download weights first:
+#   cd models/flux2-pro && ./download.sh
 
-FROM nvcr.io/nvidia/pytorch:26.01-py3
+# pytorch:25.01-py3 uses CUDA 12.8, compatible with driver 525+ (host: 580.x)
+# Avoid 26.01 which requires driver 590.48+ and fails without compat mode.
+FROM nvcr.io/nvidia/pytorch:25.01-py3
 
 WORKDIR /app
 

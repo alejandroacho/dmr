@@ -33,11 +33,10 @@ async def load_model() -> None:
     t0 = time.time()
     pipe = FluxPipeline.from_pretrained(
         MODEL_PATH,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         local_files_only=True,
     )
     pipe.to("cuda")
-    pipe.enable_attention_slicing()
     logger.info("Model loaded in %.1fs", time.time() - t0)
 
 
@@ -53,8 +52,12 @@ class GenerateRequest(BaseModel):
 
 
 @app.get("/health")
-async def health() -> dict:
-    return {"status": "ok", "model": "flux1-dev", "ready": pipe is not None}
+async def health() -> JSONResponse:
+    ready = pipe is not None
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "ok" if ready else "loading", "model": "flux1-dev", "ready": ready},
+    )
 
 
 @app.post("/generate")

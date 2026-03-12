@@ -273,9 +273,8 @@ PROFILE_FOCUS_CODE = VRAMProfile(
 
 PROFILE_CREATIVE_IMAGE = VRAMProfile(
     mode=ProfileMode.CREATIVE,
-    description="Creative Image Mode: Qwen3 Coder 30B + FLUX.2 Pro (~77 GB)",
-    primary_models=[QWEN3_CODER_BASE],
-    secondary_models=[FLUX2_PRO],
+    description="Creative Image Mode: FLUX.2 Pro (~42 GB)",
+    primary_models=[FLUX2_PRO],
 )
 
 PROFILE_CREATIVE_VIDEO = VRAMProfile(

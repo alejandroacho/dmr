@@ -457,12 +457,12 @@ class ContainerOrchestrator:
                     )
                     if container.status == "running":
                         # Attempt HTTP healthcheck if vLLM
-                        if model.engine == "vllm":
+                        if model.engine in ("vllm", "comfyui", "diffusers"):
                             healthy = await self._check_vllm_health(
                                 model.container_name, model.port
                             )
                         else:
-                            healthy = True  # ComfyUI/Diffusers: running = ready
+                            healthy = True
 
                         if healthy:
                             self._container_states[name] = ContainerState.READY

@@ -201,7 +201,7 @@ class InferenceProxy:
 
     # ──────────── Image (ComfyUI / Diffusers) ────────
 
-    IMAGE_TIMEOUT_S = 300   # 5 min — FLUX generation is fast on Blackwell
+    IMAGE_TIMEOUT_S = 900   # 15 min — pytorch:25.01 sin kernels Blackwell nativos tarda ~6min/30steps
 
     async def generate_image(
         self,
