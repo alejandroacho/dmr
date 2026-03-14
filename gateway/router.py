@@ -84,7 +84,14 @@ class SmartRouter:
         if request.media_type != MediaType.TEXT:
             return request.media_type
 
-        # 2. Inspect tool_choice
+        # 2. Model name — image/video models identified by name
+        requested_model = (request.model or "").lower()
+        if any(k in requested_model for k in ("flux", "stable-diffusion", "sdxl")):
+            return MediaType.IMAGE
+        if any(k in requested_model for k in ("ltx", "video-gen", "animate")):
+            return MediaType.VIDEO
+
+        # 3. Inspect tool_choice
         tool_name = self._extract_tool_name(request.tool_choice)
         if tool_name:
             if any(vt in tool_name.lower() for vt in ("video", "animate", "ltx")):

@@ -7,7 +7,9 @@ Implements mutex (semaphore) to prevent VRAM collisions.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 from typing import Optional
 
@@ -32,6 +34,8 @@ from gateway.vram_monitor import VRAMMonitor
 
 logger = logging.getLogger("gateway.orchestrator")
 
+STATE_FILE = os.environ.get("GATEWAY_STATE_FILE", "/data/gateway_state.json")
+
 
 class ContainerOrchestrator:
     """
@@ -50,6 +54,28 @@ class ContainerOrchestrator:
         self._active_profile: Optional[str] = None
         self._swap_in_progress = False
         self._swap_start_time: float = 0.0
+
+    # ──────────────── State persistence ────────────────
+
+    def _persist_state(self) -> None:
+        """Write active profile to disk so restarts can resume it."""
+        if not self._active_profile:
+            return
+        try:
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            with open(STATE_FILE, "w") as f:
+                json.dump({"active_profile": self._active_profile}, f)
+        except Exception as exc:
+            logger.warning("Could not persist gateway state: %s", exc)
+
+    @staticmethod
+    def load_persisted_profile() -> Optional[str]:
+        """Return the last persisted profile key, or None if unavailable."""
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f).get("active_profile")
+        except Exception:
+            return None
 
     # ──────────────── Propiedades ──────────────────────
 
@@ -178,6 +204,7 @@ class ContainerOrchestrator:
                         logger.warning("Autodetect: could not remove '%s': %s", name, exc)
 
                 logger.info("Autodetect: adopted profile '%s'.", profile_key)
+                self._persist_state()
                 return profile_key
 
         # Containers exist but don't form a complete profile — treat as orphans
@@ -267,6 +294,7 @@ class ContainerOrchestrator:
 
                 # 5. Claim the profile only after health checks pass (or timeout)
                 self._active_profile = profile_key
+                self._persist_state()
 
                 elapsed = time.time() - self._swap_start_time
                 logger.info(

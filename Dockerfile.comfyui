@@ -13,9 +13,10 @@
 # Download weights first:
 #   cd models/flux2-pro && ./download.sh
 
-# pytorch:25.01-py3 uses CUDA 12.8, compatible with driver 525+ (host: 580.x)
-# Avoid 26.01 which requires driver 590.48+ and fails without compat mode.
-FROM nvcr.io/nvidia/pytorch:25.01-py3
+# vllm/vllm-openai:cu130-nightly has PyTorch compiled for SM121 (GB10 Blackwell).
+# Same base as blackwell-vllm:latest — proven to work on this machine.
+# Replaces pytorch:25.01-py3 which lacked SM121 kernels (~12s/step).
+FROM vllm/vllm-openai:cu130-nightly
 
 WORKDIR /app
 
@@ -40,4 +41,5 @@ EXPOSE 8004
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"
 
-CMD ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8004"]
+ENTRYPOINT []
+CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8004"]

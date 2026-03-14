@@ -10,18 +10,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from gateway import __version__
 from gateway.config import (
     GATEWAY_HOST,
     GATEWAY_PORT,
+    GATEWAY_PUBLIC_URL,
     LONG_POLLING_ENABLED,
     LONG_POLLING_TIMEOUT_S,
     PROFILES,
@@ -29,7 +34,7 @@ from gateway.config import (
     PROFILE_FOCUS_CODE,
     RETRY_AFTER_SECONDS,
 )
-from gateway.orchestrator import ContainerOrchestrator
+from gateway.orchestrator import ContainerOrchestrator, STATE_FILE
 from gateway.proxy import InferenceProxy
 from gateway.request_buffer import (
     BufferOverflowError,
@@ -97,12 +102,17 @@ async def lifespan(app: FastAPI):
     if adopted:
         logger.info("Autodetect: resumed profile '%s' without restarting containers.", adopted)
     else:
-        # No usable containers found — clean up orphans and load the default
+        # No usable containers found — restore last known profile or fall back to default
         await orchestrator.cleanup_orphaned_containers()
-        logger.info("Loading default profile: FOCUS_CODE (Qwen3 Coder Next 80B)")
-        success = await orchestrator.switch_profile(PROFILE_FOCUS_CODE)
+        last_profile_key = ContainerOrchestrator.load_persisted_profile()
+        startup_profile = PROFILES.get(last_profile_key, PROFILE_FOCUS_CODE) if last_profile_key else PROFILE_FOCUS_CODE
+        if last_profile_key and last_profile_key in PROFILES:
+            logger.info("Restoring last active profile: '%s'", last_profile_key)
+        else:
+            logger.info("Loading default profile: FOCUS_CODE (Qwen3 Coder Next 80B)")
+        success = await orchestrator.switch_profile(startup_profile)
         if not success:
-            logger.warning("Could not load the default FOCUS_CODE profile.")
+            logger.warning("Could not load startup profile '%s'.", startup_profile.name)
 
     logger.info("━━━ Gateway READY en %s:%d ━━━", GATEWAY_HOST, GATEWAY_PORT)
 
@@ -137,6 +147,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ──────────── Static file serving for generated images ────
+GENERATED_IMAGES_DIR = Path(os.getenv("GENERATED_IMAGES_DIR", "/tmp/gateway_images"))
+GENERATED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/generated", StaticFiles(directory=str(GENERATED_IMAGES_DIR)), name="generated")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -302,13 +317,29 @@ async def chat_completions(request: AgentRequest):
 
     elapsed = (time.time() - start_time) * 1000
 
-    # 5. If streaming, return SSE (VRAM log skipped — generator hasn't run yet)
-    if request.stream and decision.media_type == MediaType.TEXT:
-        return StreamingResponse(
-            result,
-            media_type="text/event-stream",
-            headers={"X-Processing-Time-Ms": f"{elapsed:.1f}"},
-        )
+    # 5. If streaming, return SSE
+    if request.stream:
+        if decision.media_type == MediaType.TEXT:
+            return StreamingResponse(
+                result,
+                media_type="text/event-stream",
+                headers={"X-Processing-Time-Ms": f"{elapsed:.1f}"},
+            )
+        # Non-text results (image/video): the client expects SSE but the
+        # backend returned a single JSON dict.  Wrap it as one SSE chunk
+        # so streaming parsers (OpenWebUI, etc.) can consume it.
+        if isinstance(result, dict) and result.get("object", "").startswith("chat.completion"):
+            import json as _json
+
+            async def _single_chunk_sse():
+                yield f"data: {_json.dumps(result)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(
+                _single_chunk_sse(),
+                media_type="text/event-stream",
+                headers={"X-Processing-Time-Ms": f"{elapsed:.1f}"},
+            )
 
     # Log VRAM only for non-streaming requests (generator is complete at this point)
     vram = vram_monitor.latest
@@ -321,6 +352,13 @@ async def chat_completions(request: AgentRequest):
         )
 
     # 6. Normal response
+    # If the backend already returned an OpenAI-compatible dict (e.g. image
+    # generation wrapped as chat.completion), return it directly so clients
+    # like OpenWebUI can find choices[0].message.content at the top level.
+    if isinstance(result, dict) and result.get("object") == "chat.completion":
+        result.setdefault("processing_time_ms", elapsed)
+        return JSONResponse(content=result)
+
     return GatewayResponse(
         success=True,
         data=result,
@@ -376,6 +414,56 @@ async def generate_image(request: ImageGenerationRequest):
         processing_time_ms=elapsed,
         model_used="flux2-pro",
     )
+
+
+@app.post("/v1/images/generations", tags=["Multimedia"])
+async def dalle_generate_image(request: Request):
+    """
+    DALL-E compatible image generation endpoint.
+    Open WebUI and other clients use this format.
+    """
+    import time as _time
+    body = await request.json()
+    start_time = _time.time()
+
+    from gateway.config import PROFILE_CREATIVE_IMAGE, FLUX2_PRO
+    current = orchestrator.active_profile or ""
+    target_key = orchestrator._profile_key(PROFILE_CREATIVE_IMAGE)
+    model_ready = orchestrator.is_model_ready(FLUX2_PRO.container_name)
+    if current != target_key or not model_ready:
+        force_swap = current == target_key and not model_ready
+        success = await orchestrator.switch_profile(PROFILE_CREATIVE_IMAGE, force=force_swap)
+        if not success:
+            raise HTTPException(status_code=503, detail="Could not activate image generation mode")
+
+    payload = {
+        "prompt": body.get("prompt", ""),
+        "width": body.get("size", "1024x1024").split("x")[0] if "size" in body else body.get("width", 1024),
+        "height": body.get("size", "1024x1024").split("x")[1] if "size" in body else body.get("height", 1024),
+        "steps": body.get("steps", 30),
+        "seed": body.get("seed"),
+    }
+    result = await inference_proxy.generate_image(FLUX2_PRO, payload)
+    created = int(_time.time())
+
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+
+    import base64 as _b64
+
+
+    data_items = []
+    for img_b64 in result.get("images", []):
+        filename = f"{uuid.uuid4().hex}.png"
+        filepath = GENERATED_IMAGES_DIR / filename
+        filepath.write_bytes(_b64.b64decode(img_b64))
+        image_url = f"{GATEWAY_PUBLIC_URL}/generated/{filename}"
+        data_items.append({"url": image_url, "b64_json": img_b64})
+
+    return {
+        "created": created,
+        "data": data_items,
+    }
 
 
 @app.post("/v1/videos/generate", tags=["Multimedia"])
@@ -632,7 +720,49 @@ async def _dispatch_to_backend(decision, request: AgentRequest) -> Any:
         if "prompt" not in payload and request.messages:
             last_msg = request.messages[-1]
             payload["prompt"] = last_msg.get("content", "")
-        return await inference_proxy.generate_image(model, payload)
+        result = await inference_proxy.generate_image(model, payload)
+        # Wrap as OpenAI chat completion so any client can render it
+        if "images" in result and result["images"]:
+            import base64 as _b64
+
+            b64 = result["images"][0]
+            img_id = f"img-{result.get('seed', 0)}"
+
+            # Save image to disk and serve via URL (avoids huge SSE chunks)
+            filename = f"{uuid.uuid4().hex}.png"
+            filepath = GENERATED_IMAGES_DIR / filename
+            filepath.write_bytes(_b64.b64decode(b64))
+
+        
+            image_url = f"{GATEWAY_PUBLIC_URL}/generated/{filename}"
+            content = f"![generated image]({image_url})"
+
+            if request.stream:
+                return {
+                    "id": img_id,
+                    "object": "chat.completion.chunk",
+                    "model": model.name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }],
+                }
+            return {
+                "id": img_id,
+                "object": "chat.completion",
+                "model": model.name,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        return result
 
     elif decision.media_type == MediaType.VIDEO:
         payload = request.media_params or {}

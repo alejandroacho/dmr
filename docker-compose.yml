@@ -78,6 +78,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /home/alejandroacho/Models:/home/alejandroacho/Models:ro
+      - /home/alejandroacho/Server/.gateway-state:/data
     networks:
       - blackwell_net
     healthcheck:

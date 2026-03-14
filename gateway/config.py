@@ -22,6 +22,10 @@ from gateway.schemas import (
 GATEWAY_HOST: str = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT: int = int(os.getenv("GATEWAY_PORT", "8000"))
 
+# Public base URL for generated assets (images, videos).
+# Must be reachable from clients like OpenWebUI.
+GATEWAY_PUBLIC_URL: str = os.getenv("GATEWAY_PUBLIC_URL", "http://192.168.1.125:8000")
+
 # Local path where model weights reside
 MODELS_PATH: str = os.getenv("MODELS_PATH", "/home/alejandroacho/Models")
 
