@@ -165,9 +165,10 @@ GPT_OSS_120B = ModelDefinition(
         "--mxfp4-layers": "moe,qkv,o,lm_head",
         "--attention-backend": "FLASHINFER",
         "--gpu-memory-utilization": "0.70",
-        "--max-num-seqs": "2",
+        "--max-num-seqs": "10",
         "--max-num-batched-tokens": "8192",
         "--load-format": "fastsafetensors",
+        "--enforce-eager": True,          # Disable CUDA graphs — avoids cudaErrorIllegalAddress with MXFP4 CUTLASS on SM121
     },
     # Provide o200k_harmony.tiktoken (copy of o200k_base) so the openai_harmony
     # Rust binary can load the harmony encoding without internet access.

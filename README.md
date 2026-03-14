@@ -49,7 +49,7 @@ Intelligent middleware layer for autonomous VRAM management (~120 GB), dynamic m
 
 > **Note:** `creative_image` runs FLUX.1-dev solo (no text model). Image generation via `/v1/images/generate`. Current speed: ~12s/step on pytorch:25.01 (no sm_121 kernels). Pending migration to a Blackwell-native image for <1s/step.
 
-> **Note:** `focus` (GPT-OSS 120B) requires a custom vLLM image with CUTLASS MXFP4 kernels compiled for sm_121. Build it first: `just build-spark` (~30 min). Expected throughput: 57–60 tok/s on single GB10.
+> **Note:** `focus` (GPT-OSS 120B) requires a custom vLLM image with CUTLASS MXFP4 kernels compiled for sm_121. Build it first: `just build-spark` (~30 min). Runs with `--enforce-eager` (CUDA graphs crash on SM121 with MXFP4 batching). Expected throughput: ~57 tok/s single request, ~5-6 tok/s per request with 10 concurrent agents. Supports up to 10 simultaneous requests (`--max-num-seqs 10`).
 
 > **Note:** `focus_code` (Qwen3-Coder-Next FP8) uses `blackwell-vllm:latest` with two runtime patches applied at build time. Expected throughput: ~43–48 tok/s on single GB10.
 
@@ -414,6 +414,28 @@ pytorch:25.01 does not have native SM121 (GB10) kernels. The container warns "GB
 curl http://localhost:8000/status/vram
 curl -X POST "http://localhost:8000/admin/profile/focus?force=true"
 ```
+
+### GPT-OSS 120B: `cudaErrorIllegalAddress` crash with concurrent requests
+
+CUDA graphs are incompatible with MXFP4 CUTLASS kernels on SM121 (GB10) when batching multiple requests. The vLLM EngineCore crashes with `torch.AcceleratorError: CUDA error: an illegal memory access was encountered`.
+
+**Fix:** `--enforce-eager` is enabled in `config.py` to disable CUDA graphs. This adds ~5-10% latency per token but eliminates the crash entirely, allowing multi-agent concurrency.
+
+The `--max-num-seqs` parameter controls how many requests vLLM batches simultaneously. Default: `10`. All requests run in parallel sharing GPU throughput (e.g. 10 concurrent requests ≈ 5-6 tok/s each instead of ~57 tok/s for a single one).
+
+### Config changes don't take effect after editing `config.py`
+
+The Gateway builds container args at creation time. If a container is already running (or gets restarted by Docker's `unless-stopped` policy), it keeps its original args. To apply new config:
+
+```bash
+# 1. Remove the container (stops and deletes it)
+curl -X POST http://localhost:8000/admin/container/<container-name>/remove
+
+# 2. Force-recreate with new args
+curl -X POST "http://localhost:8000/admin/profile/<profile>?force=true"
+```
+
+This causes ~60-90s downtime while vLLM reloads the model.
 
 ### Container stuck in STARTING state
 ```bash
