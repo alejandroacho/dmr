@@ -94,6 +94,16 @@ class ContainerOrchestrator:
         return time.time() - self._swap_start_time
 
     @property
+    def active_vram_profile(self) -> Optional[VRAMProfile]:
+        """Return the active VRAMProfile object, or None."""
+        if not self._active_profile:
+            return None
+        for profile in PROFILES.values():
+            if self._profile_key(profile) == self._active_profile:
+                return profile
+        return None
+
+    @property
     def container_states(self) -> dict[str, ContainerState]:
         return dict(self._container_states)
 
@@ -291,6 +301,17 @@ class ContainerOrchestrator:
                         "Containers are running but models may still be loading.",
                         profile_key,
                     )
+                    # Promote any still-STARTING containers to READY so that
+                    # incoming requests don't trigger a redundant swap to the
+                    # same profile.  The models are loading; re-swapping would
+                    # only restart them and make things worse.
+                    for m in all_models:
+                        if self._container_states.get(m.container_name) == ContainerState.STARTING:
+                            self._container_states[m.container_name] = ContainerState.READY
+                            logger.info(
+                                "Promoted '%s' to READY after timeout (still loading).",
+                                m.container_name,
+                            )
 
                 # 5. Claim the profile only after health checks pass (or timeout)
                 self._active_profile = profile_key

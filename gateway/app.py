@@ -50,6 +50,8 @@ from gateway.schemas import (
     ImageGenerationRequest,
     MediaType,
     ProfileMode,
+    ProfileDetail,
+    ProfilesOverviewResponse,
     ProfileStatusResponse,
     SwapStatusResponse,
     VideoGenerationRequest,
@@ -204,26 +206,106 @@ async def profile_status():
     mode = ProfileMode.FOCUS if "focus" in profile_key else ProfileMode.CREATIVE
 
     # Get slots for the active profile
+    from gateway.config import ALL_MODELS
+    model_map = {m.container_name: m for m in ALL_MODELS}
+
+    # Build reverse label map for the active profile
+    active = orchestrator.active_vram_profile
+    label_by_name: dict[str, str] = {}
+    if active:
+        for lbl, m in active.labels.items():
+            label_by_name[m.name] = lbl
+
     models = []
     for name, state in orchestrator.container_states.items():
-        from gateway.config import (
-            GPT_OSS_120B, QWEN3_CODER_NEXT_80B, QWEN3_CODER_BASE,
-            FLUX2_PRO, LTX_VIDEO_2,
-        )
-        model_map = {
-            GPT_OSS_120B.container_name: GPT_OSS_120B,
-            QWEN3_CODER_NEXT_80B.container_name: QWEN3_CODER_NEXT_80B,
-            QWEN3_CODER_BASE.container_name: QWEN3_CODER_BASE,
-            FLUX2_PRO.container_name: FLUX2_PRO,
-            LTX_VIDEO_2.container_name: LTX_VIDEO_2,
-        }
         if name in model_map:
-            models.append(model_map[name].to_slot(state))
+            slot = model_map[name].to_slot(state)
+            slot.label = label_by_name.get(model_map[name].name, "")
+            models.append(slot)
 
     return ProfileStatusResponse(
         active_profile=mode,
         models=models,
         vram=vram_monitor.latest,
+    )
+
+
+@app.get("/v1/profiles", response_model=ProfilesOverviewResponse, tags=["System"])
+async def list_profiles():
+    """Lists all available VRAM profiles and their models."""
+    from gateway.config import PROFILES, ALL_MODELS
+
+    active_key = orchestrator.active_profile
+
+    details: list[ProfileDetail] = []
+    for key, profile in PROFILES.items():
+        is_active = (orchestrator._profile_key(profile) == active_key)
+        # Build label map for this profile
+        label_by_container: dict[str, str] = {}
+        for lbl, m in profile.labels.items():
+            label_by_container[m.container_name] = lbl
+
+        slots: list[ModelSlot] = []
+        for m in profile.primary_models + profile.secondary_models:
+            state = orchestrator.container_states.get(m.container_name, ContainerState.STOPPED)
+            slot = m.to_slot(state if is_active else ContainerState.STOPPED)
+            slot.label = label_by_container.get(m.container_name, "")
+            slots.append(slot)
+
+        details.append(ProfileDetail(
+            key=key,
+            mode=profile.mode,
+            description=profile.description,
+            total_vram_required_mb=profile.total_vram_required_mb,
+            is_active=is_active,
+            models=slots,
+        ))
+
+    return ProfilesOverviewResponse(
+        active_profile=active_key,
+        profiles=details,
+    )
+
+
+@app.get("/v1/profiles/active", response_model=ProfileDetail, tags=["System"])
+async def active_profile():
+    """Returns the currently active VRAM profile and its models."""
+    from gateway.config import PROFILES
+
+    active_key = orchestrator.active_profile
+    if not active_key:
+        raise HTTPException(status_code=404, detail="No active profile found")
+
+    # Match by _profile_key (e.g. "creative:flux2-pro|qwen3.5-4b") → dict key (e.g. "creative_image")
+    profile = None
+    dict_key = active_key
+    for k, p in PROFILES.items():
+        if orchestrator._profile_key(p) == active_key:
+            profile = p
+            dict_key = k
+            break
+
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"Active profile '{active_key}' not in registry")
+
+    label_by_container: dict[str, str] = {}
+    for lbl, m in profile.labels.items():
+        label_by_container[m.container_name] = lbl
+
+    slots: list[ModelSlot] = []
+    for m in profile.primary_models + profile.secondary_models:
+        state = orchestrator.container_states.get(m.container_name, ContainerState.STOPPED)
+        slot = m.to_slot(state)
+        slot.label = label_by_container.get(m.container_name, "")
+        slots.append(slot)
+
+    return ProfileDetail(
+        key=dict_key,
+        mode=profile.mode,
+        description=profile.description,
+        total_vram_required_mb=profile.total_vram_required_mb,
+        is_active=True,
+        models=slots,
     )
 
 
@@ -244,8 +326,8 @@ async def chat_completions(request: AgentRequest):
     """
     start_time = time.time()
 
-    # 1. Routing
-    decision = router_engine.route(request)
+    # 1. Routing (pass active profile so labels resolve without swap)
+    decision = router_engine.route(request, active_profile=orchestrator.active_vram_profile)
 
     # 2. Compute prefix if there are system messages
     if request.messages:
@@ -563,27 +645,41 @@ async def remove_container(container_name: str):
 
 @app.get("/v1/models", tags=["Inference"])
 async def list_models():
-    """Lists available models (OpenAI format)."""
-    from gateway.config import (
-        GPT_OSS_120B, QWEN3_CODER_NEXT_80B, QWEN3_CODER_BASE,
-        FLUX2_PRO, LTX_VIDEO_2,
-    )
-    all_models = [GPT_OSS_120B, QWEN3_CODER_NEXT_80B, QWEN3_CODER_BASE, FLUX2_PRO, LTX_VIDEO_2]
+    """Lists available models (OpenAI format).
 
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": m.name,
+    Each model appears with its real name.  Models in the active profile
+    also appear under their label alias (e.g. "chat", "code", "image")
+    so agents can use stable identifiers across profile switches.
+    """
+    from gateway.config import ALL_MODELS
+
+    data = [
+        {
+            "id": m.name,
+            "object": "model",
+            "owned_by": "blackwell-gateway",
+            "engine": m.engine,
+            "vram_mb": m.vram_required_mb,
+            "quantization": m.quantization,
+        }
+        for m in ALL_MODELS
+    ]
+
+    # Add label aliases from the active profile
+    active = orchestrator.active_vram_profile
+    if active:
+        for label, model in active.labels.items():
+            data.append({
+                "id": label,
                 "object": "model",
                 "owned_by": "blackwell-gateway",
-                "engine": m.engine,
-                "vram_mb": m.vram_required_mb,
-                "quantization": m.quantization,
-            }
-            for m in all_models
-        ],
-    }
+                "engine": model.engine,
+                "vram_mb": model.vram_required_mb,
+                "quantization": model.quantization,
+                "alias_for": model.name,
+            })
+
+    return {"object": "list", "data": data}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -683,7 +779,10 @@ async def _drain_buffered_requests() -> None:
         drained = await request_buffer.drain_all()
         for buffered in drained:
             try:
-                decision = router_engine.route(buffered.request)
+                decision = router_engine.route(
+                    buffered.request,
+                    active_profile=orchestrator.active_vram_profile,
+                )
                 result = await _dispatch_to_backend(decision, buffered.request)
                 await request_buffer.resolve(buffered, result)
             except Exception as exc:

@@ -71,6 +71,7 @@ class VRAMReport(BaseModel):
 class ModelSlot(BaseModel):
     """Describes a model slot loaded into VRAM."""
     name: str
+    label: str = ""
     container_name: str
     vram_allocated_mb: int
     state: ContainerState = ContainerState.STOPPED
@@ -180,3 +181,19 @@ class ProfileStatusResponse(BaseModel):
     active_profile: ProfileMode
     models: list[ModelSlot] = []
     vram: VRAMReport | None = None
+
+
+class ProfileDetail(BaseModel):
+    """Description of a single VRAM profile and its models."""
+    key: str
+    mode: ProfileMode
+    description: str
+    total_vram_required_mb: int
+    is_active: bool = False
+    models: list[ModelSlot] = []
+
+
+class ProfilesOverviewResponse(BaseModel):
+    """All available profiles with their models."""
+    active_profile: str | None = None
+    profiles: list[ProfileDetail] = []

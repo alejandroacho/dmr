@@ -25,6 +25,7 @@ from gateway.config import (
     QWEN3_CODER_BASE,
     FLUX2_PRO,
     LTX_VIDEO_2,
+    QWEN3_5_4B,
 )
 from gateway.schemas import AgentRequest, MediaType, ProfileMode
 
@@ -45,13 +46,48 @@ class SmartRouter:
     3. What type of media is being requested (TEXT / IMAGE / VIDEO).
     """
 
-    def route(self, request: AgentRequest) -> RoutingDecision:
+    def route(
+        self,
+        request: AgentRequest,
+        active_profile: VRAMProfile | None = None,
+    ) -> RoutingDecision:
         """
         Main entry point.
         Returns a routing decision with profile, model, and media type.
+
+        If *active_profile* is provided, label aliases (e.g. "chat", "code")
+        are resolved against it first so that requests using a label stay
+        in the current profile whenever possible.
         """
+        requested = (request.model or "").strip()
+
+        # Try label resolution before anything else
+        if requested and requested not in ("auto", ""):
+            resolved = self._resolve_label(requested, active_profile)
+            if resolved:
+                profile, model = resolved
+                # Infer media type from the resolved model's engine
+                if model.engine == "comfyui":
+                    media_type = MediaType.IMAGE
+                elif model.engine == "diffusers":
+                    media_type = MediaType.VIDEO
+                else:
+                    media_type = self._detect_media_type(request)
+
+                logger.debug(
+                    "Routing (label '%s'): agent=%s media=%s profile=%s model=%s",
+                    requested, request.agent_id, media_type.value,
+                    profile.mode.value, model.name,
+                )
+                return RoutingDecision(
+                    media_type=media_type,
+                    profile=profile,
+                    target_model=model,
+                )
+
+        # Standard routing (no label match)
         media_type = self._detect_media_type(request)
-        profile = self._select_profile(request, media_type)
+        profile = self._select_profile(request, media_type, active_profile)
         model = self._select_model(request, media_type, profile)
 
         decision = RoutingDecision(
@@ -120,8 +156,13 @@ class SmartRouter:
         self,
         request: AgentRequest,
         media_type: MediaType,
+        active_profile: VRAMProfile | None = None,
     ) -> VRAMProfile:
-        """Selects the VRAM profile based on the detected media type and model hint."""
+        """Selects the VRAM profile based on the detected media type and model hint.
+
+        If the active profile already has a model that can serve the request
+        (i.e. a "chat" label for text), stay on it to avoid unnecessary swaps.
+        """
         if media_type == MediaType.VIDEO:
             return PROFILE_CREATIVE_VIDEO
         if media_type == MediaType.IMAGE:
@@ -131,6 +172,10 @@ class SmartRouter:
         requested = (request.model or "").lower()
         if any(k in requested for k in ("qwen", "coder", "next", "80b")):
             return PROFILE_FOCUS_CODE
+
+        # If the active profile has a chat-capable model, stay on it
+        if active_profile and "chat" in active_profile.labels:
+            return active_profile
 
         # Default text → GPT-OSS reasoning mode
         return PROFILE_FOCUS
@@ -143,7 +188,12 @@ class SmartRouter:
         media_type: MediaType,
         profile: VRAMProfile,
     ) -> ModelDefinition:
-        """Selects the specific backend model within the profile."""
+        """Selects the specific backend model within the profile.
+
+        Always returns a model that belongs to *profile* so that the
+        orchestrator never tries to proxy to a container that isn't part
+        of the active profile.
+        """
         # Multimedia
         if media_type == MediaType.IMAGE:
             return FLUX2_PRO
@@ -154,22 +204,41 @@ class SmartRouter:
         requested = request.model.lower() if request.model else "auto"
 
         if requested in ("auto", ""):
-            # Focus → primary model (GPT-OSS 120B)
-            if profile.mode == ProfileMode.FOCUS:
-                return GPT_OSS_120B
-            # Creative → Qwen3 Coder base (agent support)
-            return QWEN3_CODER_BASE
+            # Use the profile's "chat" label if available, else primary model
+            if "chat" in profile.labels:
+                return profile.labels["chat"]
+            return profile.primary_models[0]
 
-        # Explicit matching
+        # Try to match against models *in the selected profile* first.
+        all_profile_models = profile.primary_models + profile.secondary_models
+        for model in all_profile_models:
+            if model.name.lower() in requested or requested in model.name.lower():
+                return model
+
+        # Fallback: best-effort match across the global catalog, but only
+        # if the result is in the profile.  Otherwise stay in-profile.
+        global_match = self._match_global(requested)
+        if global_match and global_match in all_profile_models:
+            return global_match
+
+        # Last resort: primary model of the profile (never return an
+        # out-of-profile model — that causes a phantom swap).
+        if "code" in profile.labels:
+            return profile.labels["code"]
+        if "chat" in profile.labels:
+            return profile.labels["chat"]
+        return profile.primary_models[0]
+
+    @staticmethod
+    def _match_global(requested: str) -> ModelDefinition | None:
+        """Best-effort keyword match against the full model catalog."""
         if "120b" in requested or "gpt" in requested:
             return GPT_OSS_120B
         if "next" in requested or "80b" in requested:
             return QWEN3_CODER_NEXT_80B
         if "coder" in requested or "qwen" in requested:
             return QWEN3_CODER_BASE
-
-        # Fallback
-        return GPT_OSS_120B if profile.mode == ProfileMode.FOCUS else QWEN3_CODER_BASE
+        return None
 
     # ──────────── Helpers ──────────────────────────────
 
@@ -199,6 +268,23 @@ class SmartRouter:
                     if isinstance(block, dict) and block.get("type") == "text":
                         parts.append(block.get("text", ""))
         return " ".join(parts)
+
+    @staticmethod
+    def _resolve_label(
+        name: str,
+        active_profile: VRAMProfile | None,
+    ) -> tuple[VRAMProfile, ModelDefinition] | None:
+        """Resolve a label alias to a (profile, model) pair.
+
+        Priority: active profile first (avoids unnecessary swap),
+        then any profile that defines the label.
+        """
+        if active_profile and name in active_profile.labels:
+            return (active_profile, active_profile.labels[name])
+        for profile in PROFILES.values():
+            if name in profile.labels:
+                return (profile, profile.labels[name])
+        return None
 
     @staticmethod
     def _contains_video_keywords(text: str) -> bool:

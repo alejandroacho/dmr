@@ -19,6 +19,9 @@ docker>=7.1.0
 httptools>=0.6.0
 websockets>=13.0
 
+# GPU monitoring (NVML bindings — works inside containers without nvidia-smi binary)
+nvidia-ml-py>=12.0.0
+
 # Utilities
 python-multipart>=0.0.12
 orjson>=3.10.0

@@ -201,6 +201,7 @@ QWEN3_CODER_NEXT_80B = ModelDefinition(
         "--attention-backend": "flashinfer",
         "--enable-auto-tool-choice": True,
         "--tool-call-parser": "qwen3_coder",
+        "--enforce-eager": True,
     },
 )
 
@@ -247,6 +248,24 @@ LTX_VIDEO_2 = ModelDefinition(
     engine="diffusers",
 )
 
+QWEN3_5_4B = ModelDefinition(
+    name="qwen3.5-4b",
+    container_image="blackwell-vllm:latest",
+    container_name="vllm-qwen3-5-4b",
+    vram_required_mb=4_000,         # ~4 GB: 4B params at FP8
+    port=8006,
+    quantization="auto",
+    tensor_parallel_size=1,
+    max_model_len=32768,
+    kv_cache_dtype="fp8",
+    hf_model_id="Qwen/Qwen3.5-4B",
+    engine="vllm",
+    extra_args={
+        "--gpu-memory-utilization": "0.15",
+        "--enforce-eager": True,            # Disable CUDA graphs — avoids cudagraph mode mismatch with Mamba hybrid arch on GB10
+    },
+)
+
 
 # ────── Load Profiles ──────
 
@@ -257,6 +276,7 @@ class VRAMProfile:
     description: str
     primary_models: list[ModelDefinition]
     secondary_models: list[ModelDefinition] = field(default_factory=list)
+    labels: dict[str, ModelDefinition] = field(default_factory=dict)
     total_vram_required_mb: int = 0
 
     def __post_init__(self):
@@ -268,18 +288,23 @@ PROFILE_FOCUS = VRAMProfile(
     mode=ProfileMode.FOCUS,
     description="Reasoning Mode: GPT-OSS 120B (single-GPU, ~84 GB, MXFP4 CUTLASS sm_121)",
     primary_models=[GPT_OSS_120B],
+    labels={"chat": GPT_OSS_120B},
 )
 
 PROFILE_FOCUS_CODE = VRAMProfile(
     mode=ProfileMode.FOCUS,
-    description="Code Mode: Qwen3-Coder-Next 80B MoE FP8 (~95 GB, FlashInfer sm_121)",
+    description="Code Mode: Qwen3-Coder-Next 80B MoE FP8 + Qwen3.5-4B chat (~99 GB)",
     primary_models=[QWEN3_CODER_NEXT_80B],
+    secondary_models=[QWEN3_5_4B],
+    labels={"code": QWEN3_CODER_NEXT_80B, "chat": QWEN3_5_4B},
 )
 
 PROFILE_CREATIVE_IMAGE = VRAMProfile(
     mode=ProfileMode.CREATIVE,
-    description="Creative Image Mode: FLUX.2 Pro (~42 GB)",
+    description="Creative Image Mode: FLUX.2 Pro + Qwen3.5-4B chat (~46 GB)",
     primary_models=[FLUX2_PRO],
+    secondary_models=[QWEN3_5_4B],
+    labels={"image": FLUX2_PRO, "chat": QWEN3_5_4B},
 )
 
 PROFILE_CREATIVE_VIDEO = VRAMProfile(
@@ -287,6 +312,7 @@ PROFILE_CREATIVE_VIDEO = VRAMProfile(
     description="Creative Video Mode: Qwen3 Coder 30B + LTX-Video 2 (~77 GB)",
     primary_models=[QWEN3_CODER_BASE],
     secondary_models=[LTX_VIDEO_2],
+    labels={"video": LTX_VIDEO_2, "chat": QWEN3_CODER_BASE},
 )
 
 PROFILES: dict[str, VRAMProfile] = {
@@ -303,6 +329,7 @@ ALL_MODELS: list[ModelDefinition] = [
     QWEN3_CODER_BASE,
     FLUX2_PRO,
     LTX_VIDEO_2,
+    QWEN3_5_4B,
 ]
 
 

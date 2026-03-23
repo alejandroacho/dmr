@@ -131,11 +131,14 @@ class TestChatCompletionsSwap:
     async def test_successful_completion_when_profile_active(self, client):
         """When the correct profile is already active, should proxy through."""
         import gateway.app as app_module
-        from gateway.config import PROFILE_FOCUS
+        from gateway.config import PROFILE_FOCUS, GPT_OSS_120B
 
-        # Set active profile to focus
+        # Set active profile to focus with model READY
         key = app_module.orchestrator._profile_key(PROFILE_FOCUS)
         app_module.orchestrator._active_profile = key
+        app_module.orchestrator._container_states[GPT_OSS_120B.container_name] = (
+            ContainerState.READY
+        )
 
         # Mock inference proxy
         expected_response = {
@@ -169,6 +172,105 @@ class TestModelListing:
         names = [m["id"] for m in data["data"]]
         assert "gpt-oss-120b" in names
         assert "qwen3-coder-next-80b" in names
+        assert "qwen3.5-4b" in names
+
+    @pytest.mark.asyncio
+    async def test_list_models_includes_labels_for_active_profile(self, client):
+        """When a profile is active, its label aliases should appear."""
+        import gateway.app as app_module
+        from gateway.config import PROFILE_FOCUS
+
+        key = app_module.orchestrator._profile_key(PROFILE_FOCUS)
+        app_module.orchestrator._active_profile = key
+
+        resp = await client.get("/v1/models")
+        data = resp.json()
+        names = [m["id"] for m in data["data"]]
+        assert "chat" in names
+
+        # The "chat" entry should reference gpt-oss-120b
+        chat_entry = next(m for m in data["data"] if m["id"] == "chat")
+        assert chat_entry["alias_for"] == "gpt-oss-120b"
+
+    @pytest.mark.asyncio
+    async def test_list_models_labels_change_with_profile(self, client):
+        """Labels should reflect the active profile's model mapping."""
+        import gateway.app as app_module
+        from gateway.config import PROFILE_FOCUS_CODE
+
+        key = app_module.orchestrator._profile_key(PROFILE_FOCUS_CODE)
+        app_module.orchestrator._active_profile = key
+
+        resp = await client.get("/v1/models")
+        data = resp.json()
+        names = [m["id"] for m in data["data"]]
+        assert "chat" in names
+        assert "code" in names
+
+        chat_entry = next(m for m in data["data"] if m["id"] == "chat")
+        assert chat_entry["alias_for"] == "qwen3.5-4b"
+
+        code_entry = next(m for m in data["data"] if m["id"] == "code")
+        assert code_entry["alias_for"] == "qwen3-coder-next-80b"
+
+
+# ──────────────────────────────────────────────────────
+#  Label-based routing
+# ──────────────────────────────────────────────────────
+
+class TestLabelRouting:
+
+    @pytest.mark.asyncio
+    async def test_chat_label_stays_in_current_profile(self, client):
+        """model='chat' should NOT trigger a swap — it resolves within active profile."""
+        import gateway.app as app_module
+        from gateway.config import PROFILE_FOCUS_CODE, QWEN3_5_4B
+
+        key = app_module.orchestrator._profile_key(PROFILE_FOCUS_CODE)
+        app_module.orchestrator._active_profile = key
+        app_module.orchestrator._container_states[QWEN3_5_4B.container_name] = (
+            ContainerState.READY
+        )
+
+        expected = {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        app_module.inference_proxy.chat_completion = AsyncMock(return_value=expected)
+
+        resp = await client.post("/v1/chat/completions", json={
+            "model": "chat",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+
+        assert resp.status_code == 200
+        # The proxy should have been called with the Qwen3.5-4B model
+        call_args = app_module.inference_proxy.chat_completion.call_args
+        model_used = call_args[0][0]  # first positional arg = ModelDefinition
+        assert model_used.name == "qwen3.5-4b"
+
+    @pytest.mark.asyncio
+    async def test_code_label_triggers_swap_from_focus(self, client):
+        """model='code' from focus profile should trigger swap to focus_code."""
+        import gateway.app as app_module
+        from gateway.config import PROFILE_FOCUS, GPT_OSS_120B
+
+        key = app_module.orchestrator._profile_key(PROFILE_FOCUS)
+        app_module.orchestrator._active_profile = key
+        app_module.orchestrator._container_states[GPT_OSS_120B.container_name] = (
+            ContainerState.READY
+        )
+
+        # Disable long polling so we get an immediate 503 on swap
+        original_lp = app_module.LONG_POLLING_ENABLED
+        app_module.LONG_POLLING_ENABLED = False
+
+        try:
+            resp = await client.post("/v1/chat/completions", json={
+                "model": "code",
+                "messages": [{"role": "user", "content": "write code"}],
+            })
+            # Should trigger a swap → 503 (long polling disabled)
+            assert resp.status_code == 503
+        finally:
+            app_module.LONG_POLLING_ENABLED = original_lp
 
 
 # ──────────────────────────────────────────────────────

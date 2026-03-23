@@ -1,6 +1,6 @@
 """
 conftest.py — Shared fixtures for gateway tests.
-All Docker / nvidia-smi / aiohttp dependencies are mocked.
+All Docker / NVML / aiohttp dependencies are mocked.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ def _mock_docker(monkeypatch):
     return mock_client
 
 
-# ─── VRAMMonitor that never calls nvidia-smi ───
+# ─── VRAMMonitor that never calls NVML ───
 
 @pytest.fixture()
 def mock_vram_monitor():
