@@ -326,6 +326,8 @@ async def chat_completions(request: AgentRequest):
     """
     start_time = time.time()
 
+    logger.info("Request model='%s' agent=%s stream=%s", request.model, request.agent_id, request.stream)
+
     # 1. Routing (pass active profile so labels resolve without swap)
     decision = router_engine.route(request, active_profile=orchestrator.active_vram_profile)
 

@@ -23,6 +23,7 @@ from gateway.config import (
     GPT_OSS_120B,
     QWEN3_CODER_NEXT_80B,
     QWEN3_CODER_BASE,
+    QWEN25_CODER_7B,
     FLUX2_PRO,
     LTX_VIDEO_2,
     QWEN3_5_4B,
@@ -168,8 +169,14 @@ class SmartRouter:
         if media_type == MediaType.IMAGE:
             return PROFILE_CREATIVE_IMAGE
 
-        # Text: check if user explicitly requests a coding model
+        # Text: check if user explicitly requests a specific model
         requested = (request.model or "").lower()
+
+        # Explicit GPT-OSS request → reasoning profile
+        if "gpt" in requested or "120b" in requested:
+            return PROFILE_FOCUS
+
+        # Explicit coding model request → code profile
         if any(k in requested for k in ("qwen", "coder", "next", "80b")):
             return PROFILE_FOCUS_CODE
 
@@ -236,6 +243,10 @@ class SmartRouter:
             return GPT_OSS_120B
         if "next" in requested or "80b" in requested:
             return QWEN3_CODER_NEXT_80B
+        if "2.5" in requested and "coder" in requested:
+            return QWEN25_CODER_7B
+        if "7b" in requested and "coder" in requested:
+            return QWEN25_CODER_7B
         if "coder" in requested or "qwen" in requested:
             return QWEN3_CODER_BASE
         return None

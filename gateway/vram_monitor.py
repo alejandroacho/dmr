@@ -103,15 +103,24 @@ class VRAMMonitor:
                 name = pynvml.nvmlDeviceGetName(handle)
 
                 # --- Memory ---
+                cap_mb = SYSTEM_RAM_GB * 1024  # Configured addressable GPU memory
                 try:
                     mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
                     total_mb = mem_info.total // (1024 * 1024)
                     used_mb = mem_info.used // (1024 * 1024)
                     free_mb = mem_info.free // (1024 * 1024)
+
+                    # On unified memory systems (GB10/ATS) NVML reports
+                    # the full system RAM as GPU memory.  Cap to the
+                    # configured addressable pool so VRAM budgets are
+                    # meaningful.
+                    if total_mb > cap_mb:
+                        total_mb = cap_mb
+                        free_mb = max(total_mb - used_mb, 0)
                 except pynvml.NVMLError:
-                    # Unified memory (GB10/ATS): NVML may not report
-                    # fb memory. Fall back to process accounting.
-                    total_mb = SYSTEM_RAM_GB * 1024
+                    # NVML cannot report memory at all — fall back to
+                    # process accounting.
+                    total_mb = cap_mb
                     used_mb = VRAMMonitor._sum_process_memory_nvml(handle)
                     free_mb = max(total_mb - used_mb, 0)
                     logger.debug(

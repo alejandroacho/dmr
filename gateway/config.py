@@ -248,6 +248,24 @@ LTX_VIDEO_2 = ModelDefinition(
     engine="diffusers",
 )
 
+QWEN25_CODER_7B = ModelDefinition(
+    name="qwen2.5-coder-7b",
+    container_image="blackwell-vllm:latest",
+    container_name="vllm-qwen25-coder-7b",
+    vram_required_mb=8_000,             # ~8 GB: 7B params at FP8 + KV cache
+    port=8007,
+    quantization="fp8",                 # On-the-fly FP8 quantization (model is BF16 natively)
+    tensor_parallel_size=1,
+    max_model_len=32768,
+    kv_cache_dtype="fp8",
+    hf_model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
+    engine="vllm",
+    extra_args={
+        "--gpu-memory-utilization": "0.30",
+        "--enforce-eager": True,            # GB10 CUDA graph compat
+    },
+)
+
 QWEN3_5_4B = ModelDefinition(
     name="qwen3.5-4b",
     container_image="blackwell-vllm:latest",
@@ -263,6 +281,7 @@ QWEN3_5_4B = ModelDefinition(
     extra_args={
         "--gpu-memory-utilization": "0.15",
         "--enforce-eager": True,            # Disable CUDA graphs — avoids cudagraph mode mismatch with Mamba hybrid arch on GB10
+        "--reasoning-parser": "qwen3",      # Parse <think>...</think> into reasoning_content field
     },
 )
 
@@ -286,9 +305,10 @@ class VRAMProfile:
 
 PROFILE_FOCUS = VRAMProfile(
     mode=ProfileMode.FOCUS,
-    description="Reasoning Mode: GPT-OSS 120B (single-GPU, ~84 GB, MXFP4 CUTLASS sm_121)",
+    description="Reasoning Mode: GPT-OSS 120B + Qwen2.5-Coder-7B (~92 GB)",
     primary_models=[GPT_OSS_120B],
-    labels={"chat": GPT_OSS_120B},
+    secondary_models=[QWEN25_CODER_7B],
+    labels={"chat": GPT_OSS_120B, "code": QWEN25_CODER_7B},
 )
 
 PROFILE_FOCUS_CODE = VRAMProfile(
@@ -327,6 +347,7 @@ ALL_MODELS: list[ModelDefinition] = [
     GPT_OSS_120B,
     QWEN3_CODER_NEXT_80B,
     QWEN3_CODER_BASE,
+    QWEN25_CODER_7B,
     FLUX2_PRO,
     LTX_VIDEO_2,
     QWEN3_5_4B,
