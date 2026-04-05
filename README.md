@@ -57,6 +57,63 @@ Profile transitions are **automatic** — the Gateway detects visual keywords in
 
 ---
 
+## Ray Cluster
+
+The `focus_code`, `focus_large`, and other TP=2 models require a 2-node Ray cluster for distributed inference across both GPUs.
+
+| Node | Role | IP | Container |
+|---|---|---|---|
+| Node 1 | Head + gateway host | 192.168.200.12 | `ray-node-head` |
+| Node 2 | Worker | 192.168.200.13 | `ray-node-worker` |
+
+Both nodes run `blackwell-vllm:latest` with `--network host` for NCCL/UCX inter-node communication.
+
+### Initial cluster setup
+
+**Node 1:**
+```bash
+bash ~/Server/ray-cluster/reset_ray_node.sh --head
+```
+
+**Node 2:**
+```bash
+bash ~/Server/ray-cluster/reset_ray_node.sh --worker 192.168.200.12
+```
+
+Verify both nodes are up:
+```bash
+bash ~/Server/ray-cluster/check_ray_cluster_status.sh
+# Expected: 2 active nodes, 2/2 GPUs
+```
+
+### Systemd services (auto-restart on reboot)
+
+**Node 1:**
+```bash
+sudo cp ~/Server/ray-cluster/ray-node-head.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ray-node-head
+```
+
+**Node 2** (copy service file from Node 1 first):
+```bash
+scp alejandroacho@192.168.200.12:~/Server/ray-cluster/ray-node-worker.service ~/
+sudo cp ~/Server/ray-cluster/ray-node-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ray-node-worker
+```
+
+### Resilience layers
+
+| Layer | Mechanism | Effect |
+|---|---|---|
+| Docker restart policy | `--restart unless-stopped` in `ray-cluster/run_cluster.sh` | Container auto-recovers from crashes |
+| Systemd services | `ray-node-{head,worker}.service` | Cluster auto-starts after host reboot |
+| TP=2 pre-flight | `_verify_ray_cluster_ready()` in `orchestrator.py` | Fails fast with a clear error if worker is down instead of hanging 10 min |
+| Gateway watchdog | `_ray_watchdog_loop()` in `app.py` (every 30 s) | Detects silent failures between requests and marks models as `ERROR` |
+
+See [ray-cluster/](ray-cluster/) for scripts, service files, and per-node setup guides. The [Stacked Sparks guide](ray-cluster/README.md) covers the full setup from scratch.
+
+---
+
 ## Docker Images
 
 ### `vllm-mxfp4-spark:latest` — GPT-OSS 120B only
@@ -332,6 +389,17 @@ Server/
 ├── docker-compose.yml          # Full stack definition
 ├── justfile                    # Task runner
 ├── requirements.txt            # Python dependencies
+├── ray-cluster/                # Ray distributed inference cluster
+│   ├── README.md               # Stacked Sparks full setup guide (connect, NCCL, vLLM)
+│   ├── README_head_node.md     # Node 1 (head) setup guide
+│   ├── README_worker_node.md   # Node 2 (worker) setup guide
+│   ├── Dockerfile.blackwell-vllm  # Ray node image (blackwell-vllm:latest)
+│   ├── patch_gemma4.py         # Patches vLLM 0.17.1 to register Gemma 4 architectures
+│   ├── run_cluster.sh          # Low-level Docker run wrapper for Ray nodes
+│   ├── reset_ray_node.sh       # Tear-down + restart a Ray node (head or worker)
+│   ├── check_ray_cluster_status.sh  # Quick cluster health check (ray status)
+│   ├── ray-node-head.service   # systemd unit for Node 1
+│   └── ray-node-worker.service # systemd unit for Node 2
 ├── inference/
 │   ├── flux_server.py          # FLUX.1-dev FastAPI server (port 8004)
 │   └── ltx_server.py           # LTX-Video 2 FastAPI server (port 8005)
@@ -378,6 +446,7 @@ Server/
 | `LONG_POLLING_TIMEOUT_S` | `600` | Max long polling wait |
 | `MAX_QUEUE_SIZE` | `200` | Max requests queued during swap |
 | `RETRY_AFTER_SECONDS` | `5` | Retry-After header value for 503s |
+| `RAY_WATCHDOG_INTERVAL_S` | `30` | Seconds between Ray cluster health checks (0 to disable) |
 
 ---
 

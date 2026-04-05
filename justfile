@@ -46,6 +46,10 @@ build-spark:
 build-qwen3:
     docker build -f models/qwen3-coder-next/Dockerfile -t blackwell-vllm:latest models/qwen3-coder-next/
 
+# Build the blackwell-vllm image with Gemma 4 support (for Ray cluster nodes)
+build-blackwell:
+    docker build -f ray-cluster/Dockerfile.blackwell-vllm -t blackwell-vllm:latest ray-cluster/
+
 # Build the gateway container
 build-gateway:
     docker compose build gateway

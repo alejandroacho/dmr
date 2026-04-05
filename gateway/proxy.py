@@ -12,7 +12,7 @@ from typing import Any, AsyncIterator
 
 import aiohttp
 
-from gateway.config import ModelDefinition, RETRY_LOG_INTERVAL_S
+from gateway.config import ModelDefinition, RAY_HEAD_HOST, RETRY_LOG_INTERVAL_S
 
 logger = logging.getLogger("gateway.proxy")
 
@@ -28,6 +28,16 @@ class InferenceProxy:
 
     def __init__(self):
         self._session: aiohttp.ClientSession | None = None
+
+    @staticmethod
+    def _backend_host(model: ModelDefinition) -> str:
+        """Returns the hostname used to reach a model's HTTP backend.
+
+        Ray vllm models run inside the Ray head node container which uses
+        --network host, so they are reachable at the Ray head IP directly.
+        Docker-managed models are reachable by container name via bridge DNS.
+        """
+        return RAY_HEAD_HOST if model.engine == "ray_vllm" else model.container_name
 
     async def startup(self) -> None:
         connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
@@ -53,7 +63,7 @@ class InferenceProxy:
         Forwards a chat completion request to the vLLM container.
         Retries on transient connection errors (model still loading).
         """
-        url = f"http://{model.container_name}:{model.port}/v1/chat/completions"
+        url = f"http://{self._backend_host(model)}:{model.port}/v1/chat/completions"
         # Use the served-model-name registered via --served-model-name
         payload["model"] = model.name
 
@@ -211,7 +221,7 @@ class InferenceProxy:
         """
         Sends an image generation request to the ComfyUI/Diffusers container.
         """
-        url = f"http://{model.container_name}:{model.port}/generate"
+        url = f"http://{self._backend_host(model)}:{model.port}/generate"
         timeout = aiohttp.ClientTimeout(total=self.IMAGE_TIMEOUT_S, connect=10)
 
         start = time.time()
@@ -248,7 +258,7 @@ class InferenceProxy:
         """
         Sends a video generation request to the LTX-Video container.
         """
-        url = f"http://{model.container_name}:{model.port}/generate"
+        url = f"http://{self._backend_host(model)}:{model.port}/generate"
         timeout = aiohttp.ClientTimeout(total=self.VIDEO_TIMEOUT_S, connect=10)
 
         start = time.time()
@@ -281,7 +291,7 @@ class InferenceProxy:
 
     async def healthcheck(self, model: ModelDefinition) -> bool:
         """Verifies that the inference backend is responding."""
-        url = f"http://{model.container_name}:{model.port}/health"
+        url = f"http://{self._backend_host(model)}:{model.port}/health"
 
         try:
             async with self._session.get(url) as resp:

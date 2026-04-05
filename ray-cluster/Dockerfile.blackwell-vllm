@@ -1,0 +1,72 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Dockerfile.blackwell-vllm
+#  Extends nvcr.io/nvidia/vllm:26.03-py3 with Gemma 4 support.
+#
+#  Strategy: surgical patch — copies only the Gemma 4 Python files
+#  from upstream vllm 0.19.0 into the NVIDIA 0.17.1 installation,
+#  preserving all Blackwell-specific compiled kernels (FlashInfer
+#  SM_121, custom Triton, Flash Attention, CUTLASS).
+#
+#  Build:
+#    docker build -f ray-cluster/Dockerfile.blackwell-vllm -t blackwell-vllm:latest ray-cluster/
+#    # or: just build-blackwell
+#
+#  Run (Ray head node):
+#    docker run --gpus all --network host \
+#      -v ~/.cache/huggingface:/root/.cache/huggingface \
+#      blackwell-vllm:latest
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FROM nvcr.io/nvidia/vllm:26.03-py3
+
+ENV VLLM=/usr/local/lib/python3.12/dist-packages/vllm
+
+# ── 1. Upgrade transformers (adds gemma4 to CONFIG_MAPPING_NAMES) ──────────
+RUN pip install "transformers>=5.0" --quiet 2>&1 | grep -E "Successfully|already|ERROR" || true
+
+# ── 2. Download vllm 0.19.0 wheel and extract Gemma 4 source files ─────────
+RUN pip download vllm==0.19.0 --no-deps -d /tmp/vllm_dl --quiet 2>/dev/null \
+ && mkdir -p /tmp/vllm_src \
+ && cd /tmp/vllm_src \
+ && unzip -q /tmp/vllm_dl/vllm-0.19.0-*.whl
+
+# ── 3. Copy Gemma 4 Python implementation files ────────────────────────────
+RUN cp /tmp/vllm_src/vllm/model_executor/models/gemma4.py \
+       /tmp/vllm_src/vllm/model_executor/models/gemma4_mm.py \
+       /tmp/vllm_src/vllm/model_executor/models/gemma4_utils.py \
+       ${VLLM}/model_executor/models/ \
+ && cp /tmp/vllm_src/vllm/model_executor/layers/rotary_embedding/gemma4_rope.py \
+       ${VLLM}/model_executor/layers/rotary_embedding/ \
+ && cp /tmp/vllm_src/vllm/tool_parsers/gemma4_utils.py \
+       /tmp/vllm_src/vllm/tool_parsers/gemma4_tool_parser.py \
+       ${VLLM}/tool_parsers/ \
+ && cp /tmp/vllm_src/vllm/reasoning/gemma4_utils.py \
+       /tmp/vllm_src/vllm/reasoning/gemma4_reasoning_parser.py \
+       ${VLLM}/reasoning/
+
+# ── 4-8. Patch all registries with a single Python script ─────────────────
+COPY patch_gemma4.py /tmp/patch_gemma4.py
+RUN python3 /tmp/patch_gemma4.py
+
+# ── 9. Verify Gemma 4 is fully registered ─────────────────────────────────
+RUN python3 -c "\
+from vllm.model_executor.models.registry import ModelRegistry; \
+archs = ModelRegistry.get_supported_archs(); \
+gemma4 = [a for a in archs if 'Gemma4' in a]; \
+assert gemma4, 'Gemma4 NOT registered!'; \
+print('Gemma4 registered:', gemma4); \
+from vllm.model_executor.layers.rotary_embedding import Gemma4RotaryEmbedding; \
+print('Gemma4RotaryEmbedding: OK'); \
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES; \
+assert 'gemma4' in CONFIG_MAPPING_NAMES, 'gemma4 not in transformers!'; \
+print('transformers gemma4: OK'); \
+"
+
+# ── 10. Cleanup ────────────────────────────────────────────────────────────
+RUN rm -rf /tmp/vllm_src /tmp/vllm_dl /tmp/patch_gemma4.py
+
+# ── Ray head node entrypoint ───────────────────────────────────────────────
+ENV RAY_HEAD_IP=192.168.200.12
+
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["ray start --block --head --node-ip-address=${RAY_HEAD_IP} --port=6379"]

@@ -22,6 +22,9 @@ from gateway.schemas import (
 GATEWAY_HOST: str = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT: int = int(os.getenv("GATEWAY_PORT", "8000"))
 
+# IP of the Ray head node — used to reach vllm serve running inside the Ray cluster
+RAY_HEAD_HOST: str = os.getenv("RAY_HEAD_HOST", "192.168.200.12")
+
 # Public base URL for generated assets (images, videos).
 # Must be reachable from clients like OpenWebUI.
 GATEWAY_PUBLIC_URL: str = os.getenv("GATEWAY_PUBLIC_URL", "http://192.168.1.125:8000")
@@ -188,20 +191,43 @@ QWEN3_CODER_NEXT_80B = ModelDefinition(
     name="qwen3-coder-next-80b",
     container_image="blackwell-vllm:latest",
     container_name="vllm-qwen3-coder-next-80b",
-    vram_required_mb=95_000,        # FP8 ~90 GB weights + KV cache
+    # TP=2: ~90 GB weights split across both GB10s (~45 GB each),
+    # leaving ~74 GB per node for KV cache.
+    vram_required_mb=95_000,
     port=8002,
-    quantization="auto",            # FP8 auto-detected from model config
-    tensor_parallel_size=1,
-    max_model_len=131072,           # 128K context
+    quantization="auto",
+    tensor_parallel_size=2,
+    max_model_len=131072,
     kv_cache_dtype="fp8",
     hf_model_id="Qwen/Qwen3-Coder-Next-FP8",
-    engine="vllm",
+    engine="ray_vllm",
     extra_args={
-        "--gpu-memory-utilization": "0.85",
-        "--attention-backend": "flashinfer",
+        "--gpu-memory-utilization": "0.79",
         "--enable-auto-tool-choice": True,
         "--tool-call-parser": "qwen3_coder",
         "--enforce-eager": True,
+        "--distributed-executor-backend": "ray",
+    },
+)
+
+GEMMA4_31B = ModelDefinition(
+    name="gemma-4-31b",
+    container_image="blackwell-vllm:latest",
+    container_name="vllm-gemma4-31b",
+    # TP=2: BF16 weights ~62 GB split across both GB10s (~31 GB each).
+    # Leaves ~64 GB KV cache per node at 0.80 utilization (119 GB unified).
+    # Gemma 4 supports up to 256K context; start with 128K for stability.
+    vram_required_mb=62_000,
+    port=8009,
+    quantization="auto",            # BF16 native; vLLM detects from config.json
+    tensor_parallel_size=2,
+    max_model_len=131072,           # 128K — raise to 262144 once confirmed stable
+    kv_cache_dtype="fp8",
+    hf_model_id="google/gemma-4-31B-it",
+    engine="ray_vllm",
+    extra_args={
+        "--gpu-memory-utilization": "0.80",
+        "--distributed-executor-backend": "ray",
     },
 )
 
@@ -209,14 +235,14 @@ QWEN3_CODER_BASE = ModelDefinition(
     name="qwen3-coder",
     container_image="blackwell-vllm:latest",
     container_name="vllm-qwen3-coder",
-    vram_required_mb=35_000,        # ~35 GB: 30B-A3B MoE at Q8 (3B active params)
+    vram_required_mb=35_000,
     port=8003,
-    quantization="auto",            # Auto-detect from config.json
+    quantization="auto",
     tensor_parallel_size=1,
     max_model_len=32768,
     kv_cache_dtype="fp8",
     model_path="qwen3-coder-q8",
-    engine="vllm",
+    engine="ray_vllm",
     extra_args={"--gpu-memory-utilization": "0.92"},
 )
 
@@ -252,17 +278,17 @@ QWEN25_CODER_7B = ModelDefinition(
     name="qwen2.5-coder-7b",
     container_image="blackwell-vllm:latest",
     container_name="vllm-qwen25-coder-7b",
-    vram_required_mb=8_000,             # ~8 GB: 7B params at FP8 + KV cache
+    vram_required_mb=8_000,
     port=8007,
-    quantization="fp8",                 # On-the-fly FP8 quantization (model is BF16 natively)
+    quantization="fp8",
     tensor_parallel_size=1,
     max_model_len=32768,
     kv_cache_dtype="fp8",
     hf_model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
-    engine="vllm",
+    engine="ray_vllm",
     extra_args={
-        "--gpu-memory-utilization": "0.30",
-        "--enforce-eager": True,            # GB10 CUDA graph compat
+        "--gpu-memory-utilization": "0.23",
+        "--enforce-eager": True,
     },
 )
 
@@ -270,18 +296,43 @@ QWEN3_5_4B = ModelDefinition(
     name="qwen3.5-4b",
     container_image="blackwell-vllm:latest",
     container_name="vllm-qwen3-5-4b",
-    vram_required_mb=4_000,         # ~4 GB: 4B params at FP8
+    vram_required_mb=4_000,
     port=8006,
     quantization="auto",
     tensor_parallel_size=1,
     max_model_len=32768,
     kv_cache_dtype="fp8",
     hf_model_id="Qwen/Qwen3.5-4B",
-    engine="vllm",
+    engine="ray_vllm",
     extra_args={
         "--gpu-memory-utilization": "0.15",
-        "--enforce-eager": True,            # Disable CUDA graphs — avoids cudagraph mode mismatch with Mamba hybrid arch on GB10
-        "--reasoning-parser": "qwen3",      # Parse <think>...</think> into reasoning_content field
+        "--enforce-eager": True,
+        "--reasoning-parser": "qwen3",
+    },
+)
+
+QWEN3_5_122B = ModelDefinition(
+    name="qwen3.5-122b",
+    container_image="blackwell-vllm:latest",
+    container_name="vllm-qwen3-5-122b",
+    # TP=2: 61 GB GPTQ Int4 weights split across both GB10s (~30 GB each),
+    # doubling available KV cache and allowing higher context utilization.
+    vram_required_mb=72_000,
+    port=8008,
+    quantization="gptq",
+    tensor_parallel_size=2,
+    max_model_len=131072,            # 128K now feasible with TP=2 KV headroom
+    kv_cache_dtype="fp8",
+    hf_model_id="Qwen/Qwen3.5-122B-A10B-GPTQ-Int4",
+    engine="ray_vllm",
+    extra_args={
+        "--gpu-memory-utilization": "0.62",
+        "--enforce-eager": True,
+        "--language-model-only": True,
+        "--reasoning-parser": "qwen3",
+        "--enable-auto-tool-choice": True,
+        "--tool-call-parser": "qwen3_coder",
+        "--distributed-executor-backend": "ray",
     },
 )
 
@@ -297,6 +348,9 @@ class VRAMProfile:
     secondary_models: list[ModelDefinition] = field(default_factory=list)
     labels: dict[str, ModelDefinition] = field(default_factory=dict)
     total_vram_required_mb: int = 0
+    # Skip local VRAM check for profiles that run on the Ray cluster,
+    # where memory is distributed across nodes and not visible to NVML.
+    skip_vram_check: bool = False
 
     def __post_init__(self):
         all_models = self.primary_models + self.secondary_models
@@ -309,14 +363,17 @@ PROFILE_FOCUS = VRAMProfile(
     primary_models=[GPT_OSS_120B],
     secondary_models=[QWEN25_CODER_7B],
     labels={"chat": GPT_OSS_120B, "code": QWEN25_CODER_7B},
+    # GPT-OSS runs as a local Docker container; Qwen2.5-7B runs on Ray cluster.
+    skip_vram_check=False,
 )
 
 PROFILE_FOCUS_CODE = VRAMProfile(
     mode=ProfileMode.FOCUS,
-    description="Code Mode: Qwen3-Coder-Next 80B MoE FP8 + Qwen3.5-4B chat (~99 GB)",
+    description="Code Mode: Qwen3-Coder-Next 80B TP=2 Ray + Qwen3.5-4B (~95 GB across cluster)",
     primary_models=[QWEN3_CODER_NEXT_80B],
     secondary_models=[QWEN3_5_4B],
     labels={"code": QWEN3_CODER_NEXT_80B, "chat": QWEN3_5_4B},
+    skip_vram_check=True,
 )
 
 PROFILE_CREATIVE_IMAGE = VRAMProfile(
@@ -325,19 +382,41 @@ PROFILE_CREATIVE_IMAGE = VRAMProfile(
     primary_models=[FLUX2_PRO],
     secondary_models=[QWEN3_5_4B],
     labels={"image": FLUX2_PRO, "chat": QWEN3_5_4B},
+    skip_vram_check=False,
 )
 
 PROFILE_CREATIVE_VIDEO = VRAMProfile(
     mode=ProfileMode.CREATIVE,
-    description="Creative Video Mode: Qwen3 Coder 30B + LTX-Video 2 (~77 GB)",
+    description="Creative Video Mode: Qwen3 Coder 30B Ray + LTX-Video 2 (~77 GB)",
     primary_models=[QWEN3_CODER_BASE],
     secondary_models=[LTX_VIDEO_2],
     labels={"video": LTX_VIDEO_2, "chat": QWEN3_CODER_BASE},
+    skip_vram_check=False,
+)
+
+PROFILE_FOCUS_LARGE = VRAMProfile(
+    mode=ProfileMode.FOCUS,
+    description="Large Reasoning Mode: Qwen3.5-122B TP=2 Ray 128K (~72 GB across cluster)",
+    primary_models=[QWEN3_5_122B],
+    secondary_models=[],
+    labels={"chat": QWEN3_5_122B},
+    skip_vram_check=True,
+)
+
+PROFILE_GEMMA4 = VRAMProfile(
+    mode=ProfileMode.FOCUS,
+    description="Gemma 4 31B-it BF16 TP=2 Ray 128K (~62 GB across cluster)",
+    primary_models=[GEMMA4_31B],
+    secondary_models=[],
+    labels={"chat": GEMMA4_31B},
+    skip_vram_check=True,
 )
 
 PROFILES: dict[str, VRAMProfile] = {
     "focus": PROFILE_FOCUS,
     "focus_code": PROFILE_FOCUS_CODE,
+    "focus_large": PROFILE_FOCUS_LARGE,
+    "gemma4": PROFILE_GEMMA4,
     "creative_image": PROFILE_CREATIVE_IMAGE,
     "creative_video": PROFILE_CREATIVE_VIDEO,
 }
@@ -351,6 +430,8 @@ ALL_MODELS: list[ModelDefinition] = [
     FLUX2_PRO,
     LTX_VIDEO_2,
     QWEN3_5_4B,
+    QWEN3_5_122B,
+    GEMMA4_31B,
 ]
 
 

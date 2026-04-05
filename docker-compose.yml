@@ -77,6 +77,7 @@ services:
       - MAX_QUEUE_SIZE=200
       - RETRY_AFTER_SECONDS=5
       - RETRY_LOG_INTERVAL_S=10
+      - RAY_WATCHDOG_INTERVAL_S=30
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /home/alejandroacho/Models:/home/alejandroacho/Models:ro
@@ -207,3 +208,41 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
     profiles:
       - creative_video
+
+  # ════════════════════════════════════════════════════
+  #  FOCUS_LARGE PROFILE — Large Reasoning Model
+  # ════════════════════════════════════════════════════
+
+  # Qwen3.5-122B-A10B — Large MoE reasoning model (GPTQ Int4, ~61 GB weights)
+  # Hybrid Gated DeltaNet + MoE arch: only 12/48 layers use KV cache → tiny KV footprint
+  # Requires blackwell-vllm:latest with Gated DeltaNet kernel support
+  vllm-qwen3-5-122b:
+    <<: *gpu-common
+    image: blackwell-vllm:latest
+    container_name: vllm-qwen3-5-122b
+    ports:
+      - "8008:8008"
+    volumes: *model-volumes
+    environment:
+      - MODEL_NAME=qwen3.5-122b
+      - NVIDIA_VISIBLE_DEVICES=all
+      - VLLM_PORT=8008
+      - TRITON_CACHE_DIR=/root/.triton
+    command: >
+      Qwen/Qwen3.5-122B-A10B-GPTQ-Int4
+      --port 8008
+      --served-model-name qwen3.5-122b
+      --tensor-parallel-size 1
+      --max-model-len 65536
+      --kv-cache-dtype fp8
+      --quantization gptq
+      --enable-prefix-caching
+      --trust-remote-code
+      --gpu-memory-utilization 0.62
+      --enforce-eager
+      --language-model-only
+      --reasoning-parser qwen3
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_coder
+    profiles:
+      - focus_large

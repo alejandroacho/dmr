@@ -15,18 +15,12 @@ from gateway.config import (
     VISUAL_TOOL_NAMES,
     PROFILES,
     PROFILE_FOCUS,
-    PROFILE_FOCUS_CODE,
     PROFILE_CREATIVE_IMAGE,
     PROFILE_CREATIVE_VIDEO,
     VRAMProfile,
     ModelDefinition,
-    GPT_OSS_120B,
-    QWEN3_CODER_NEXT_80B,
-    QWEN3_CODER_BASE,
-    QWEN25_CODER_7B,
     FLUX2_PRO,
     LTX_VIDEO_2,
-    QWEN3_5_4B,
 )
 from gateway.schemas import AgentRequest, MediaType, ProfileMode
 
@@ -67,13 +61,16 @@ class SmartRouter:
             resolved = self._resolve_label(requested, active_profile)
             if resolved:
                 profile, model = resolved
-                # Infer media type from the resolved model's engine
+                # Infer media type from the resolved model's engine.
+                # vllm models are always TEXT — never re-run prompt detection
+                # here, or a video keyword in the prompt would send the request
+                # to generate_video() against a vllm container (→ 404).
                 if model.engine == "comfyui":
                     media_type = MediaType.IMAGE
                 elif model.engine == "diffusers":
                     media_type = MediaType.VIDEO
                 else:
-                    media_type = self._detect_media_type(request)
+                    media_type = MediaType.TEXT
 
                 logger.debug(
                     "Routing (label '%s'): agent=%s media=%s profile=%s model=%s",
@@ -161,31 +158,45 @@ class SmartRouter:
     ) -> VRAMProfile:
         """Selects the VRAM profile based on the detected media type and model hint.
 
-        If the active profile already has a model that can serve the request
-        (i.e. a "chat" label for text), stay on it to avoid unnecessary swaps.
+        Profile is derived from the model catalog: whichever profile owns the
+        requested model wins. This avoids hardcoded string matching — adding a
+        model to a profile in config.py is sufficient.
         """
         if media_type == MediaType.VIDEO:
             return PROFILE_CREATIVE_VIDEO
         if media_type == MediaType.IMAGE:
             return PROFILE_CREATIVE_IMAGE
 
-        # Text: check if user explicitly requests a specific model
-        requested = (request.model or "").lower()
+        requested = (request.model or "").strip().lower()
 
-        # Explicit GPT-OSS request → reasoning profile
-        if "gpt" in requested or "120b" in requested:
-            return PROFILE_FOCUS
-
-        # Explicit coding model request → code profile
-        if any(k in requested for k in ("qwen", "coder", "next", "80b")):
-            return PROFILE_FOCUS_CODE
-
-        # If the active profile has a chat-capable model, stay on it
-        if active_profile and "chat" in active_profile.labels:
-            return active_profile
+        if requested and requested not in ("auto", ""):
+            profile = self._find_profile_for_model(requested)
+            if profile:
+                return profile
 
         # Default text → GPT-OSS reasoning mode
         return PROFILE_FOCUS
+
+    @staticmethod
+    def _find_profile_for_model(requested: str) -> VRAMProfile | None:
+        """Return the profile that owns the requested model.
+
+        Tries exact name match first, then checks if the requested string
+        is contained in (or contains) a model name — longest model-name
+        match wins to avoid 'qwen' matching the wrong profile.
+        """
+        best_profile: VRAMProfile | None = None
+        best_match_len = 0
+        for profile in PROFILES.values():
+            for model in profile.primary_models + profile.secondary_models:
+                name = model.name.lower()
+                if name == requested:
+                    return profile  # exact match, done
+                if requested in name or name in requested:
+                    if len(name) > best_match_len:
+                        best_match_len = len(name)
+                        best_profile = profile
+        return best_profile
 
     # ──────────── Model Selection ──────────────────
 
@@ -238,18 +249,19 @@ class SmartRouter:
 
     @staticmethod
     def _match_global(requested: str) -> ModelDefinition | None:
-        """Best-effort keyword match against the full model catalog."""
-        if "120b" in requested or "gpt" in requested:
-            return GPT_OSS_120B
-        if "next" in requested or "80b" in requested:
-            return QWEN3_CODER_NEXT_80B
-        if "2.5" in requested and "coder" in requested:
-            return QWEN25_CODER_7B
-        if "7b" in requested and "coder" in requested:
-            return QWEN25_CODER_7B
-        if "coder" in requested or "qwen" in requested:
-            return QWEN3_CODER_BASE
-        return None
+        """Best-effort match against the full model catalog by name."""
+        from gateway.config import ALL_MODELS
+        best: ModelDefinition | None = None
+        best_len = 0
+        for model in ALL_MODELS:
+            name = model.name.lower()
+            if name == requested:
+                return model
+            if requested in name or name in requested:
+                if len(name) > best_len:
+                    best_len = len(name)
+                    best = model
+        return best
 
     # ──────────── Helpers ──────────────────────────────
 

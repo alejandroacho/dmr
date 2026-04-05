@@ -10,6 +10,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import shlex
 import time
 from typing import Optional
 
@@ -21,6 +23,7 @@ from gateway.config import (
     DOCKER_SOCKET,
     DOCKER_NETWORK,
     MODELS_PATH,
+    RAY_HEAD_HOST,
     SWAP_TIMEOUT_S,
     RETRY_LOG_INTERVAL_S,
     ALL_MODELS,
@@ -116,16 +119,21 @@ class ContainerOrchestrator:
     async def cleanup_orphaned_containers(self) -> None:
         """Remove all known inference containers on startup.
 
-        Prevents VRAM contention from containers left running by a
-        previous gateway session (Docker restart-policy keeps them alive).
-        Containers are **removed** (not just stopped) so that stale
-        Docker-network bindings are discarded.  ``_ensure_container_running``
-        will create fresh containers on the current network.
+        For Docker-managed models: force-removes containers.
+        For Ray vllm models: kills any lingering vllm serve processes inside
+        the Ray head node container.
         """
         loop = asyncio.get_event_loop()
         removed = 0
+        ray_cleaned = False
 
         for model in ALL_MODELS:
+            if model.engine == "ray_vllm":
+                if not ray_cleaned:
+                    await self._kill_all_ray_vllm()
+                    ray_cleaned = True
+                continue
+
             name = model.container_name
             try:
                 container = await loop.run_in_executor(
@@ -163,6 +171,12 @@ class ContainerOrchestrator:
         running: dict[str, str] = {}  # name → status
         for model in ALL_MODELS:
             name = model.container_name
+            if model.engine == "ray_vllm":
+                # Check via HTTP health instead of Docker container
+                healthy = await self._check_vllm_health(name, model.port, model.engine)
+                if healthy:
+                    running[name] = "running"
+                continue
             try:
                 container = await loop.run_in_executor(
                     None, lambda n=name: self._client.containers.get(n)
@@ -194,9 +208,10 @@ class ContainerOrchestrator:
                         if status == "running"
                         else ContainerState.STARTING
                     )
+                    source = "Ray cluster" if model.engine == "ray_vllm" else "docker"
                     logger.info(
-                        "Autodetect: adopted '%s' (docker status: %s).",
-                        name, status,
+                        "Autodetect: adopted '%s' (%s, status: %s).",
+                        name, source, status,
                     )
 
                 # Remove containers that don't belong to this profile
@@ -260,10 +275,13 @@ class ContainerOrchestrator:
                 # 1. Stop/pause containers from current profile (preserve targets)
                 await self._teardown_current(strategy, preserve=target_names)
 
-                # 2. Verify available VRAM (use fresh query, not stale cache)
+                # 2. Verify available VRAM (skip for Ray profiles — memory is
+                #    distributed across nodes and not visible to local NVML)
                 vram_report = await self._vram.query_gpus()
                 needed = target_profile.total_vram_required_mb
-                if not self._vram.has_enough_vram(needed, vram_report):
+                if target_profile.skip_vram_check:
+                    logger.info("Skipping VRAM check for Ray cluster profile '%s'.", profile_key)
+                elif not self._vram.has_enough_vram(needed, vram_report):
                     logger.warning(
                         "Insufficient VRAM (%d MB free, %d MB required). "
                         "Forcing deep cleanup...",
@@ -336,11 +354,26 @@ class ContainerOrchestrator:
         model: ModelDefinition,
         strategy: SwapStrategy,
     ) -> None:
-        """Ensures the model container is running."""
+        """Ensures the model is running — either as a Docker container or
+        as a vllm serve process inside the Ray cluster."""
         name = model.container_name
         self._container_states[name] = ContainerState.STARTING
-        logger.info("Starting container '%s'...", name)
 
+        if model.engine == "ray_vllm":
+            logger.info("Starting Ray vllm model '%s' on port %d...", model.name, model.port)
+            if model.tensor_parallel_size >= 2:
+                cluster_ready = await self._verify_ray_cluster_ready(required_nodes=2)
+                if not cluster_ready:
+                    self._container_states[name] = ContainerState.ERROR
+                    raise RuntimeError(
+                        f"Ray cluster needs 2 nodes for TP=2 model '{model.name}' "
+                        f"but worker is disconnected. Run ray-cluster/reset_ray_node.sh --worker on Node 2."
+                    )
+            await self._start_ray_vllm(model)
+            self._container_states[name] = ContainerState.STARTING
+            return
+
+        logger.info("Starting container '%s'...", name)
         loop = asyncio.get_event_loop()
 
         try:
@@ -353,9 +386,6 @@ class ContainerOrchestrator:
                 await loop.run_in_executor(None, container.unpause)
                 logger.info("Container '%s' resumed (unpause).", name)
             elif status in ("exited", "created", "dead"):
-                # Remove and recreate so the container gets the current
-                # Docker network.  Restarting a stopped container would
-                # keep its old (possibly stale) network binding.
                 logger.info(
                     "Container '%s' in state '%s', removing to recreate fresh.",
                     name, status,
@@ -366,11 +396,9 @@ class ContainerOrchestrator:
                 await self._create_and_start(model)
                 logger.info("Container '%s' recreated and started.", name)
             elif status == "running":
-                # Ensure container is on the correct Docker network
                 await self._ensure_correct_network(container, loop)
                 logger.info("Container '%s' already running.", name)
             else:
-                # Unexpected state, recreate
                 await loop.run_in_executor(None, lambda: container.remove(force=True))
                 await self._create_and_start(model)
 
@@ -455,6 +483,14 @@ class ContainerOrchestrator:
                 continue
 
             self._container_states[name] = ContainerState.STOPPING
+
+            # Find the model definition to check engine type
+            model_def = next((m for m in ALL_MODELS if m.container_name == name), None)
+            if model_def and model_def.engine == "ray_vllm":
+                await self._stop_ray_vllm(model_def)
+                self._container_states[name] = ContainerState.STOPPED
+                continue
+
             try:
                 container = await loop.run_in_executor(
                     None, lambda n=name: self._client.containers.get(n)
@@ -500,50 +536,72 @@ class ContainerOrchestrator:
                 attempt += 1
                 now = time.time()
                 should_log = (now - last_log) >= RETRY_LOG_INTERVAL_S
-                try:
-                    container = await loop.run_in_executor(
-                        None, lambda n=name: self._client.containers.get(n)
-                    )
-                    if container.status == "running":
-                        # Attempt HTTP healthcheck if vLLM
-                        if model.engine in ("vllm", "comfyui", "diffusers"):
-                            healthy = await self._check_vllm_health(
-                                model.container_name, model.port
-                            )
-                        else:
-                            healthy = True
 
-                        if healthy:
-                            self._container_states[name] = ContainerState.READY
-                            logger.info("Container '%s' READY (%.0fs).", name, elapsed)
-                            break
-                        elif should_log:
-                            logger.info(
-                                "Waiting for '%s' healthcheck... (%.0fs elapsed)",
-                                name, elapsed,
-                            )
+                if model.engine == "ray_vllm":
+                    # No Docker container to check — poll HTTP health directly.
+                    healthy = await self._check_vllm_health(name, model.port, model.engine)
+                    if healthy:
+                        self._container_states[name] = ContainerState.READY
+                        logger.info("Ray vllm '%s' READY (%.0fs).", name, elapsed)
+                        break
                     elif should_log:
                         logger.info(
-                            "Waiting for '%s' to start (status=%s, %.0fs elapsed)",
-                            name, container.status, elapsed,
-                        )
-                except (NotFound, APIError):
-                    if should_log:
-                        logger.info(
-                            "Waiting for '%s' container to appear... (%.0fs elapsed)",
+                            "Waiting for Ray vllm '%s' healthcheck... (%.0fs elapsed)",
                             name, elapsed,
                         )
+                else:
+                    try:
+                        container = await loop.run_in_executor(
+                            None, lambda n=name: self._client.containers.get(n)
+                        )
+                        if container.status == "running":
+                            if model.engine in ("vllm", "comfyui", "diffusers"):
+                                healthy = await self._check_vllm_health(
+                                    model.container_name, model.port, model.engine
+                                )
+                            else:
+                                healthy = True
+
+                            if healthy:
+                                self._container_states[name] = ContainerState.READY
+                                logger.info("Container '%s' READY (%.0fs).", name, elapsed)
+                                break
+                            elif should_log:
+                                logger.info(
+                                    "Waiting for '%s' healthcheck... (%.0fs elapsed)",
+                                    name, elapsed,
+                                )
+                        elif should_log:
+                            logger.info(
+                                "Waiting for '%s' to start (status=%s, %.0fs elapsed)",
+                                name, container.status, elapsed,
+                            )
+                    except (NotFound, APIError):
+                        if should_log:
+                            logger.info(
+                                "Waiting for '%s' container to appear... (%.0fs elapsed)",
+                                name, elapsed,
+                            )
 
                 if should_log:
                     last_log = now
                 await asyncio.sleep(1)
 
-    async def _check_vllm_health(self, container_name: str, port: int) -> bool:
-        """HTTP healthcheck for a vLLM container via Docker network."""
+    async def _check_vllm_health(
+        self,
+        container_name: str,
+        port: int,
+        engine: str = "vllm",
+    ) -> bool:
+        """HTTP healthcheck for a vLLM backend.
+
+        Ray vllm models are reached via the Ray head node IP (host network).
+        Docker-managed models are reached via container hostname (bridge network).
+        """
         import aiohttp
 
-        # Use container name as hostname (same Docker network)
-        url = f"http://{container_name}:{port}/health"
+        host = RAY_HEAD_HOST if engine == "ray_vllm" else container_name
+        url = f"http://{host}:{port}/health"
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=3)
@@ -640,11 +698,10 @@ class ContainerOrchestrator:
     @staticmethod
     def _build_cmd(model: ModelDefinition) -> str | list[str] | None:
         """Builds the container startup command."""
-        if model.engine == "vllm":
-            # Standard vllm/vllm-openai images have 'python -m vllm...' as ENTRYPOINT,
-            # so the model path is the first positional arg.
-            # Custom images whose ENTRYPOINT is a generic shell script (exec "$@")
-            # must set cmd_prefix=["vllm", "serve"] in their ModelDefinition.
+        if model.engine in ("vllm", "ray_vllm"):
+            # For ray_vllm, model weights are loaded from HuggingFace cache
+            # (already present in the Ray container from previous runs).
+            # Local model_path is not used — always use hf_model_id or /models.
             model_arg = model.hf_model_id if model.hf_model_id else "/models"
             cmd_parts = [
                 *model.cmd_prefix,
@@ -657,7 +714,6 @@ class ContainerOrchestrator:
                 "--enable-prefix-caching",
                 "--trust-remote-code",
             ]
-            # Only pass --quantization if not 'auto' (let vLLM detect from config.json)
             if model.quantization.lower() != "auto":
                 cmd_parts.extend(["--quantization", model.quantization.lower()])
             for key, val in model.extra_args.items():
@@ -678,3 +734,118 @@ class ContainerOrchestrator:
             m.name for m in profile.primary_models + profile.secondary_models
         )
         return f"{profile.mode.value}:{'|'.join(model_names)}"
+
+    # ──────────── Ray Cluster Management ──────────────
+
+    async def _verify_ray_cluster_ready(self, required_nodes: int = 2) -> bool:
+        """Returns True if the Ray cluster has at least `required_nodes` active nodes."""
+        ray_container = await self._get_ray_container()
+        if not ray_container:
+            return False
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: ray_container.exec_run(
+                    ["bash", "-c", "ray status 2>&1 | grep -c ' node_'"],
+                    detach=False,
+                ),
+            )
+            count_str = result.output.decode("utf-8", errors="ignore").strip()
+            return int(count_str) >= required_nodes
+        except Exception as exc:
+            logger.warning("Could not verify Ray cluster node count: %s", exc)
+            return False
+
+    async def _get_ray_container(self) -> Optional[Container]:
+        """Find the running Ray head node container (node-<digits>)."""
+        loop = asyncio.get_event_loop()
+        try:
+            containers = await loop.run_in_executor(
+                None,
+                lambda: self._client.containers.list(filters={"status": "running"}),
+            )
+            for c in containers:
+                if re.match(r"^ray-node-head$", c.name):
+                    return c
+            logger.warning("No Ray head container found. Run ray-cluster/reset_ray_node.sh --head first.")
+            return None
+        except Exception as exc:
+            logger.error("Error finding Ray container: %s", exc)
+            return None
+
+    async def _start_ray_vllm(self, model: ModelDefinition) -> None:
+        """Starts vllm serve inside the Ray head node container as a background process."""
+        ray_container = await self._get_ray_container()
+        if not ray_container:
+            raise RuntimeError(
+                f"Cannot start '{model.name}': Ray head container not found."
+            )
+
+        # Stop any existing vllm process occupying this port
+        await self._stop_ray_vllm(model)
+
+        cmd_list = self._build_cmd(model)
+        # For ray_vllm the Docker entrypoint is not involved — prepend 'vllm serve'
+        # unless cmd_prefix already contains it (e.g. custom images).
+        if not model.cmd_prefix:
+            cmd_list = ["vllm", "serve"] + list(cmd_list)
+        cmd_str = " ".join(shlex.quote(str(p)) for p in cmd_list)
+
+        log_file = f"/tmp/vllm_{model.container_name}.log"
+        # Use exec -a to set a unique process title (argv[0]) so pkill can
+        # reliably identify and kill this specific model's process without
+        # relying on PID files (which are lost if the container restarts).
+        bg_cmd = (
+            f"nohup bash -c 'exec -a vllm-serve-{model.container_name} {cmd_str}' "
+            f"> {log_file} 2>&1 &"
+        )
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: ray_container.exec_run(["bash", "-c", bg_cmd], detach=False),
+        )
+        logger.info(
+            "Started vllm serve for '%s' in Ray container '%s' (port %d, TP=%d).",
+            model.name, ray_container.name, model.port, model.tensor_parallel_size,
+        )
+
+    async def _stop_ray_vllm(self, model: ModelDefinition) -> None:
+        """Kills the vllm serve process for this model inside the Ray container."""
+        ray_container = await self._get_ray_container()
+        if not ray_container:
+            logger.warning("Cannot stop '%s': Ray container not found.", model.name)
+            return
+
+        # Kill by process title set via exec -a in _start_ray_vllm.
+        # Fallback to port-based pkill covers processes started before this change.
+        kill_cmd = (
+            f"pkill -TERM -f 'vllm-serve-{model.container_name}' 2>/dev/null; "
+            f"sleep 2; "
+            f"pkill -KILL -f 'vllm-serve-{model.container_name}' 2>/dev/null; "
+            f"pkill -f 'vllm.*--port {model.port}' 2>/dev/null; "
+            f"true"
+        )
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: ray_container.exec_run(["bash", "-c", kill_cmd], detach=False),
+        )
+        logger.info("Stopped vllm serve for '%s' in Ray container.", model.name)
+
+    async def _kill_all_ray_vllm(self) -> None:
+        """Kills all vllm serve processes inside the Ray container (used at startup cleanup)."""
+        ray_container = await self._get_ray_container()
+        if not ray_container:
+            return
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: ray_container.exec_run(
+                ["bash", "-c", "pkill -f 'vllm-serve-vllm-' 2>/dev/null; pkill -f 'vllm serve' 2>/dev/null; true"],
+                detach=False,
+            ),
+        )
+        logger.info("Killed all vllm serve processes in Ray container.")

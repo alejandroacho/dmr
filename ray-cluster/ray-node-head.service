@@ -1,0 +1,20 @@
+[Unit]
+Description=Ray Head Node (vLLM Inference Cluster)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/bin/docker stop ray-node-head
+ExecStartPre=-/usr/bin/docker rm ray-node-head
+ExecStart=/bin/bash /home/alejandroacho/Server/ray-cluster/reset_ray_node.sh --head
+ExecStop=/usr/bin/docker stop ray-node-head
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+
+[Install]
+WantedBy=multi-user.target

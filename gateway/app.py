@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 
 from gateway import __version__
 from gateway.config import (
+    ALL_MODELS,
     GATEWAY_HOST,
     GATEWAY_PORT,
     GATEWAY_PUBLIC_URL,
@@ -34,6 +35,8 @@ from gateway.config import (
     PROFILE_FOCUS_CODE,
     RETRY_AFTER_SECONDS,
 )
+
+RAY_WATCHDOG_INTERVAL_S: int = int(os.getenv("RAY_WATCHDOG_INTERVAL_S", "30"))
 from gateway.orchestrator import ContainerOrchestrator, STATE_FILE
 from gateway.proxy import InferenceProxy
 from gateway.request_buffer import (
@@ -114,17 +117,62 @@ async def lifespan(app: FastAPI):
             logger.info("Loading default profile: FOCUS_CODE (Qwen3 Coder Next 80B)")
         success = await orchestrator.switch_profile(startup_profile)
         if not success:
-            logger.warning("Could not load startup profile '%s'.", startup_profile.name)
+            logger.warning("Could not load startup profile '%s'.", startup_profile.description)
 
     logger.info("━━━ Gateway READY en %s:%d ━━━", GATEWAY_HOST, GATEWAY_PORT)
+
+    watchdog_task = asyncio.create_task(_ray_watchdog_loop())
 
     yield  # App running
 
     # Shutdown
+    watchdog_task.cancel()
+    try:
+        await watchdog_task
+    except asyncio.CancelledError:
+        pass
     logger.info("━━━ Shutting down Smart Gateway ━━━")
     await vram_monitor.stop()
     await inference_proxy.shutdown()
     logger.info("━━━ Gateway shut down successfully ━━━")
+
+
+async def _ray_watchdog_loop() -> None:
+    """Proactively monitors the Ray head container and active ray_vllm models every RAY_WATCHDOG_INTERVAL_S seconds."""
+    logger.info("Ray watchdog started (interval=%ds)", RAY_WATCHDOG_INTERVAL_S)
+    while True:
+        await asyncio.sleep(RAY_WATCHDOG_INTERVAL_S)
+        try:
+            ray_container = await orchestrator._get_ray_container()
+            if ray_container is None:
+                logger.error(
+                    "WATCHDOG: Ray head container missing. Marking all ray_vllm models as ERROR."
+                )
+                for model in ALL_MODELS:
+                    if model.engine == "ray_vllm":
+                        orchestrator._container_states[model.container_name] = ContainerState.ERROR
+                continue
+
+            active_profile = orchestrator.active_vram_profile
+            if active_profile:
+                for model in active_profile.primary_models + active_profile.secondary_models:
+                    if model.engine != "ray_vllm":
+                        continue
+                    healthy = await orchestrator._check_vllm_health(
+                        model.container_name, model.port, model.engine
+                    )
+                    if not healthy and orchestrator._container_states.get(
+                        model.container_name
+                    ) == ContainerState.READY:
+                        logger.error(
+                            "WATCHDOG: ray_vllm '%s' (port %d) failed health check. Marking ERROR.",
+                            model.name, model.port,
+                        )
+                        orchestrator._container_states[model.container_name] = ContainerState.ERROR
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("WATCHDOG: unexpected error: %s", exc)
 
 
 # ──────────────────── App ──────────────────────────────
