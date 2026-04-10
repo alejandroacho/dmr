@@ -66,6 +66,12 @@ LONG_POLLING_ENABLED: bool = os.getenv("LONG_POLLING_ENABLED", "true").lower() =
 # Maximum Long Polling timeout (seconds)
 LONG_POLLING_TIMEOUT_S: int = int(os.getenv("LONG_POLLING_TIMEOUT_S", "600"))
 
+# Orchestration backend: "docker" (default) or "kubernetes"
+ORCHESTRATION_BACKEND: str = os.getenv("ORCHESTRATION_BACKEND", "docker")
+
+# Kubernetes namespace (only used when ORCHESTRATION_BACKEND=kubernetes)
+K8S_NAMESPACE: str = os.getenv("K8S_NAMESPACE", "blackwell")
+
 
 # ─────────────────── Trigger Keywords ─────────────────────
 
@@ -191,8 +197,9 @@ QWEN3_CODER_NEXT_80B = ModelDefinition(
     name="qwen3-coder-next-80b",
     container_image="blackwell-vllm:latest",
     container_name="vllm-qwen3-coder-next-80b",
-    # TP=2: ~90 GB weights split across both GB10s (~45 GB each),
-    # leaving ~74 GB per node for KV cache.
+    # TP=2: ~90 GB weights split across both GB10s (~45 GB each).
+    # Reduced from 0.79 to 0.75 to leave room for qwen3.5-4b (secondary
+    # model in focus_code profile) which needs ~15% of VRAM on one node.
     vram_required_mb=95_000,
     port=8002,
     quantization="auto",
@@ -202,7 +209,7 @@ QWEN3_CODER_NEXT_80B = ModelDefinition(
     hf_model_id="Qwen/Qwen3-Coder-Next-FP8",
     engine="ray_vllm",
     extra_args={
-        "--gpu-memory-utilization": "0.79",
+        "--gpu-memory-utilization": "0.75",
         "--enable-auto-tool-choice": True,
         "--tool-call-parser": "qwen3_coder",
         "--enforce-eager": True,
@@ -228,6 +235,12 @@ GEMMA4_31B = ModelDefinition(
     extra_args={
         "--gpu-memory-utilization": "0.80",
         "--distributed-executor-backend": "ray",
+        # gemma4_mm.py (multimodal) was patched from vLLM 0.19.0 but imports
+        # symbols missing in the base 0.17.1 image.  Override architectures
+        # so vLLM inspects Gemma4ForCausalLM (text-only, works on 0.17.1)
+        # instead of Gemma4ForConditionalGeneration (multimodal, broken import).
+        "--hf-overrides": '{"architectures": ["Gemma4ForCausalLM"]}',
+        "--language-model-only": True,
     },
 )
 
@@ -305,9 +318,10 @@ QWEN3_5_4B = ModelDefinition(
     hf_model_id="Qwen/Qwen3.5-4B",
     engine="ray_vllm",
     extra_args={
-        "--gpu-memory-utilization": "0.15",
+        "--gpu-memory-utilization": "0.10",
         "--enforce-eager": True,
         "--reasoning-parser": "qwen3",
+        "--language-model-only": True,  # Skip vision encoder — conv3d lacks SM121 kernels
     },
 )
 

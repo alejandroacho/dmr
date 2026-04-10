@@ -37,6 +37,7 @@ from gateway.config import (
 )
 
 RAY_WATCHDOG_INTERVAL_S: int = int(os.getenv("RAY_WATCHDOG_INTERVAL_S", "30"))
+from gateway.backends import create_backend
 from gateway.orchestrator import ContainerOrchestrator, STATE_FILE
 from gateway.proxy import InferenceProxy
 from gateway.request_buffer import (
@@ -80,11 +81,12 @@ logger = logging.getLogger("gateway.app")
 # ──────────────────── Singletons ───────────────────────
 
 vram_monitor = VRAMMonitor()
-orchestrator = ContainerOrchestrator(vram_monitor)
+backend = create_backend()
+orchestrator = ContainerOrchestrator(vram_monitor, backend)
 router_engine = SmartRouter()
 request_buffer = RequestBuffer()
 prefix_cache = RadixPrefixCache()
-inference_proxy = InferenceProxy()
+inference_proxy = InferenceProxy(hostname_resolver=backend.resolve_hostname)
 
 _start_time: float = 0.0
 
@@ -110,11 +112,12 @@ async def lifespan(app: FastAPI):
         # No usable containers found — restore last known profile or fall back to default
         await orchestrator.cleanup_orphaned_containers()
         last_profile_key = ContainerOrchestrator.load_persisted_profile()
-        startup_profile = PROFILES.get(last_profile_key, PROFILE_FOCUS_CODE) if last_profile_key else PROFILE_FOCUS_CODE
+        default_profile = PROFILES.get("gemma4", PROFILE_FOCUS_CODE)
+        startup_profile = PROFILES.get(last_profile_key, default_profile) if last_profile_key else default_profile
         if last_profile_key and last_profile_key in PROFILES:
             logger.info("Restoring last active profile: '%s'", last_profile_key)
         else:
-            logger.info("Loading default profile: FOCUS_CODE (Qwen3 Coder Next 80B)")
+            logger.info("Loading default profile: '%s'", startup_profile.description)
         success = await orchestrator.switch_profile(startup_profile)
         if not success:
             logger.warning("Could not load startup profile '%s'.", startup_profile.description)
@@ -143,8 +146,8 @@ async def _ray_watchdog_loop() -> None:
     while True:
         await asyncio.sleep(RAY_WATCHDOG_INTERVAL_S)
         try:
-            ray_container = await orchestrator._get_ray_container()
-            if ray_container is None:
+            ray_head = await orchestrator._find_ray_head()
+            if ray_head is None:
                 logger.error(
                     "WATCHDOG: Ray head container missing. Marking all ray_vllm models as ERROR."
                 )
@@ -393,15 +396,29 @@ async def chat_completions(request: AgentRequest):
 
         if current_profile == target_key and not model_ready:
             # Profile matches but container is not READY (crashed, restarting, etc.)
-            # Force the swap to bring it back up.
-            logger.warning(
-                "Model '%s' is not ready (state=%s). Forcing restart.",
-                decision.target_model.container_name,
-                orchestrator.container_states.get(decision.target_model.container_name),
-            )
+            # Force the swap to bring it back up — but only if no swap is
+            # already running (otherwise just join the in-flight swap).
+            if not orchestrator.is_swapping:
+                logger.warning(
+                    "Model '%s' is not ready (state=%s). Forcing restart.",
+                    decision.target_model.container_name,
+                    orchestrator.container_states.get(decision.target_model.container_name),
+                )
+            else:
+                logger.info(
+                    "Model '%s' is not ready (state=%s) but swap already in progress, joining.",
+                    decision.target_model.container_name,
+                    orchestrator.container_states.get(decision.target_model.container_name),
+                )
 
         # Obtain or create a swap task (never duplicate)
-        force_swap = current_profile == target_key and not model_ready
+        # Only force when the profile matches but is unhealthy AND no swap
+        # is already in progress — avoids queuing redundant force-swaps.
+        force_swap = (
+            current_profile == target_key
+            and not model_ready
+            and not orchestrator.is_swapping
+        )
         swap_task = _get_or_create_swap_task(decision.profile, target_key, force=force_swap)
 
         if LONG_POLLING_ENABLED:
@@ -750,14 +767,16 @@ def _get_or_create_swap_task(profile, target_key: str, force: bool = False) -> a
     """
     global _active_swap_task, _active_swap_target
 
-    # Reuse an existing swap to the SAME target (only when not forced)
+    # Reuse an existing swap to the SAME target.
+    # Even with force=True we reuse — the in-flight swap is already
+    # restarting this profile; queuing another behind the mutex just
+    # causes a redundant stop/start cycle.
     if (
-        not force
-        and _active_swap_task is not None
+        _active_swap_task is not None
         and not _active_swap_task.done()
         and _active_swap_target == target_key
     ):
-        logger.debug("Reusing existing swap task → '%s'", target_key)
+        logger.debug("Reusing existing swap task → '%s' (force=%s)", target_key, force)
         return _active_swap_task
 
     logger.info("Swap required: '%s' → '%s'", orchestrator.active_profile or "", target_key)

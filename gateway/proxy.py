@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 import aiohttp
 
@@ -26,18 +26,21 @@ class InferenceProxy:
     CONNECT_RETRIES = 300     # Max retries for connection failures
     CONNECT_RETRY_DELAY = 2   # Seconds between retries (300×2 = 600s window, matches SWAP_TIMEOUT_S)
 
-    def __init__(self):
+    def __init__(
+        self,
+        hostname_resolver: Callable[[str, str], str] | None = None,
+    ):
         self._session: aiohttp.ClientSession | None = None
+        self._resolve = hostname_resolver or self._default_resolve
 
     @staticmethod
-    def _backend_host(model: ModelDefinition) -> str:
-        """Returns the hostname used to reach a model's HTTP backend.
+    def _default_resolve(name: str, engine: str) -> str:
+        """Fallback resolver: Ray head IP for ray_vllm, container name for others."""
+        return RAY_HEAD_HOST if engine == "ray_vllm" else name
 
-        Ray vllm models run inside the Ray head node container which uses
-        --network host, so they are reachable at the Ray head IP directly.
-        Docker-managed models are reachable by container name via bridge DNS.
-        """
-        return RAY_HEAD_HOST if model.engine == "ray_vllm" else model.container_name
+    def _backend_host(self, model: ModelDefinition) -> str:
+        """Returns the hostname used to reach a model's HTTP backend."""
+        return self._resolve(model.container_name, model.engine)
 
     async def startup(self) -> None:
         connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)

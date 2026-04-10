@@ -1,0 +1,87 @@
+# LTX-Video 2 — Q8 Video Generation
+# Profile: creative_video | Engine: diffusers
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: diffusers-ltx-video-2
+  namespace: blackwell
+  labels:
+    app: diffusers-ltx-video-2
+    engine: diffusers
+    profile: creative-video
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: diffusers-ltx-video-2
+  template:
+    metadata:
+      labels:
+        app: diffusers-ltx-video-2
+        engine: diffusers
+        profile: creative-video
+    spec:
+      containers:
+        - name: ltx
+          image: ltx-video:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8005
+          env:
+            - name: MODEL_NAME
+              value: "ltx-video-2"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+          volumeMounts:
+            - name: model-weights
+              mountPath: /models
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8005
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 18  # 3 min
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8005
+            periodSeconds: 30
+            timeoutSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8005
+            initialDelaySeconds: 180
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: model-weights
+          hostPath:
+            path: /home/alejandroacho/Models/ltx-video-2-q8
+            type: Directory
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: diffusers-ltx-video-2
+  namespace: blackwell
+spec:
+  selector:
+    app: diffusers-ltx-video-2
+  ports:
+    - port: 8005
+      targetPort: 8005
+  type: ClusterIP

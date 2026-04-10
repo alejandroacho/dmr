@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.backends.base import ExecResult, WorkloadInfo
 from gateway.config import (
     PROFILE_FOCUS,
     PROFILE_FOCUS_CODE,
@@ -30,10 +31,28 @@ from tests.conftest import set_vram_free
 #  Helpers
 # ──────────────────────────────────────────────────────
 
-def _make_orchestrator(vram_monitor) -> ContainerOrchestrator:
-    """Creates an orchestrator with mocked Docker client."""
+def _make_orchestrator(vram_monitor, backend=None) -> ContainerOrchestrator:
+    """Creates an orchestrator with a mocked backend."""
+    if backend is None:
+        backend = MagicMock()
+        backend.supports_pause = True
+        backend.get_workload = AsyncMock(return_value=None)
+        backend.create_and_start = AsyncMock()
+        backend.stop_workload = AsyncMock()
+        backend.remove_workload = AsyncMock()
+        backend.pause_workload = AsyncMock()
+        backend.unpause_workload = AsyncMock()
+        backend.exec_in_workload = AsyncMock(
+            return_value=ExecResult(exit_code=0, output="")
+        )
+        backend.list_workloads = AsyncMock(return_value=[])
+        backend.ensure_network = AsyncMock()
+        backend.resolve_hostname = MagicMock(
+            side_effect=lambda name, engine: "192.168.200.12" if engine == "ray_vllm" else name
+        )
+
     orch = ContainerOrchestrator.__new__(ContainerOrchestrator)
-    orch._client = MagicMock()
+    orch._backend = backend
     orch._vram = vram_monitor
     orch._swap_lock = asyncio.Lock()
     orch._container_states = {}
@@ -62,27 +81,21 @@ class TestProfileClaimedAfterHealthcheck:
         orch = _make_orchestrator(mock_vram_monitor)
         profile_during_wait = None
 
-        original_wait = orch._wait_all_ready
-
         async def _spy_wait(models, *args, **kwargs):
             nonlocal profile_during_wait
-            # Capture active_profile WHILE waiting
             profile_during_wait = orch._active_profile
-            # Simulate a brief wait
             await asyncio.sleep(0.01)
 
         orch._wait_all_ready = _spy_wait
         orch._teardown_current = AsyncMock()
         orch._ensure_container_running = AsyncMock()
 
-        set_vram_free(mock_vram_monitor, 131072)  # plenty of VRAM
+        set_vram_free(mock_vram_monitor, 131072)
 
         result = await orch.switch_profile(PROFILE_FOCUS)
 
         assert result is True
-        # During _wait_all_ready, the profile should NOT have been claimed yet
         assert profile_during_wait is None
-        # After completion, it SHOULD be set
         assert orch._active_profile is not None
         assert "gpt-oss-120b" in orch._active_profile
 
@@ -121,13 +134,10 @@ class TestContainerStateStarting:
 
     @pytest.mark.asyncio
     async def test_container_state_is_starting_after_ensure(self, mock_vram_monitor):
+        """Container not found → triggers create_and_start → state=STARTING."""
         orch = _make_orchestrator(mock_vram_monitor)
 
-        # Simulate container.get() raises NotFound → triggers _create_and_start
-        from docker.errors import NotFound
-        orch._client.containers.get.side_effect = NotFound("not found")
-        orch._client.containers.run.return_value = MagicMock()
-
+        # Backend returns None → workload not found → create_and_start called
         await orch._ensure_container_running(GPT_OSS_120B, SwapStrategy.STOP_START)
 
         state = orch._container_states[GPT_OSS_120B.container_name]
@@ -138,39 +148,33 @@ class TestContainerStateStarting:
 
     @pytest.mark.asyncio
     async def test_container_state_is_starting_for_existing_exited(self, mock_vram_monitor):
-        """An existing container in 'exited' state should be removed and
-        recreated fresh (to avoid stale network bindings)."""
+        """An existing workload in 'exited' state should be removed and
+        recreated fresh."""
         orch = _make_orchestrator(mock_vram_monitor)
 
-        mock_container = MagicMock()
-        mock_container.status = "exited"
-        orch._client.containers.get.return_value = mock_container
-        orch._client.containers.run.return_value = MagicMock()
+        # Backend finds an exited workload
+        orch._backend.get_workload = AsyncMock(
+            return_value=WorkloadInfo(name="vllm-gpt-oss-120b", status="exited")
+        )
 
         await orch._ensure_container_running(GPT_OSS_120B, SwapStrategy.STOP_START)
 
-        # Old container should be removed
-        mock_container.remove.assert_called_once_with(force=True)
-        # A new container should be created
-        orch._client.containers.run.assert_called_once()
+        # Old workload should be removed
+        orch._backend.remove_workload.assert_called_once_with("vllm-gpt-oss-120b")
+        # A new workload should be created
+        orch._backend.create_and_start.assert_called_once()
         state = orch._container_states[GPT_OSS_120B.container_name]
         assert state == ContainerState.STARTING
 
     @pytest.mark.asyncio
     async def test_container_state_is_starting_for_running(self, mock_vram_monitor):
-        """Even if container is already running, state should be STARTING
+        """Even if workload is already running, state should be STARTING
         (healthcheck hasn't confirmed yet)."""
         orch = _make_orchestrator(mock_vram_monitor)
-        from gateway.config import DOCKER_NETWORK
 
-        mock_container = MagicMock()
-        mock_container.status = "running"
-        mock_container.attrs = {
-            "NetworkSettings": {
-                "Networks": {DOCKER_NETWORK: {"NetworkID": "abc"}}
-            }
-        }
-        orch._client.containers.get.return_value = mock_container
+        orch._backend.get_workload = AsyncMock(
+            return_value=WorkloadInfo(name="vllm-gpt-oss-120b", status="running")
+        )
 
         await orch._ensure_container_running(GPT_OSS_120B, SwapStrategy.STOP_START)
 
@@ -189,13 +193,10 @@ class TestVRAMFreshCheck:
     """
 
     def test_has_enough_vram_uses_report_arg(self, mock_vram_monitor):
-        """When a fresh report is passed, it should be used instead of cache."""
         from gateway.schemas import VRAMReport
 
-        # Cache says 0 free
         set_vram_free(mock_vram_monitor, 0)
 
-        # Fresh report says plenty free
         fresh = VRAMReport(
             total_vram_mb=131072,
             total_used_mb=0,
@@ -203,17 +204,12 @@ class TestVRAMFreshCheck:
             healthy=True,
         )
 
-        # Without report arg → should fail (uses stale cache)
         assert mock_vram_monitor.has_enough_vram(90000) is False
-
-        # With report arg → should succeed (uses fresh data)
         assert mock_vram_monitor.has_enough_vram(90000, fresh) is True
 
     def test_has_enough_vram_includes_safety_margin(self, mock_vram_monitor):
-        """VRAM check includes the safety margin."""
         from gateway.schemas import VRAMReport
 
-        # Exactly at the limit (required + safety margin)
         needed = 90000
         barely_enough = needed + VRAM_SAFETY_MARGIN_MB
         fresh = VRAMReport(
@@ -224,7 +220,6 @@ class TestVRAMFreshCheck:
         )
         assert mock_vram_monitor.has_enough_vram(needed, fresh) is True
 
-        # 1 MB below → should fail
         not_enough = barely_enough - 1
         fresh2 = VRAMReport(
             total_vram_mb=131072,
@@ -236,21 +231,15 @@ class TestVRAMFreshCheck:
 
     @pytest.mark.asyncio
     async def test_vram_wait_loop_retries_until_freed(self, mock_vram_monitor):
-        """
-        When VRAM is insufficient after teardown, the orchestrator should
-        poll up to 15 times (not just sleep 2s).
-        """
         orch = _make_orchestrator(mock_vram_monitor)
         orch._teardown_current = AsyncMock()
         orch._ensure_container_running = AsyncMock()
 
         query_count = 0
-        original_query = mock_vram_monitor.query_gpus
 
         async def _gradual_free():
             nonlocal query_count
             query_count += 1
-            # Simulate VRAM freeing on the 3rd query
             if query_count >= 3:
                 set_vram_free(mock_vram_monitor, 131072)
             else:
@@ -267,7 +256,6 @@ class TestVRAMFreshCheck:
         result = await orch.switch_profile(PROFILE_FOCUS)
 
         assert result is True
-        # Should have queried at least 3 times (initial + retries)
         assert query_count >= 3
 
 
@@ -276,11 +264,9 @@ class TestVRAMFreshCheck:
 # ──────────────────────────────────────────────────────
 
 class TestSwapMutex:
-    """Verifies swap operations are serialized."""
 
     @pytest.mark.asyncio
     async def test_is_swapping_flag(self, mock_vram_monitor):
-        """is_swapping should be True during swap and False after."""
         orch = _make_orchestrator(mock_vram_monitor)
         was_swapping = False
 
@@ -301,7 +287,6 @@ class TestSwapMutex:
 
     @pytest.mark.asyncio
     async def test_skip_if_same_profile(self, mock_vram_monitor):
-        """Switching to the already-active profile should skip."""
         orch = _make_orchestrator(mock_vram_monitor)
         orch._active_profile = orch._profile_key(PROFILE_FOCUS)
         orch._teardown_current = AsyncMock()
@@ -313,11 +298,10 @@ class TestSwapMutex:
 
     @pytest.mark.asyncio
     async def test_swap_failure_returns_false(self, mock_vram_monitor):
-        """If an exception occurs during swap, return False."""
         orch = _make_orchestrator(mock_vram_monitor)
 
         async def _explode(strategy, preserve=None):
-            raise RuntimeError("Docker daemon crashed")
+            raise RuntimeError("Backend crashed")
 
         orch._teardown_current = _explode
         set_vram_free(mock_vram_monitor, 131072)
@@ -325,7 +309,7 @@ class TestSwapMutex:
         result = await orch.switch_profile(PROFILE_FOCUS)
 
         assert result is False
-        assert orch.is_swapping is False  # Must reset even on failure
+        assert orch.is_swapping is False
 
 
 # ──────────────────────────────────────────────────────
@@ -333,52 +317,32 @@ class TestSwapMutex:
 # ──────────────────────────────────────────────────────
 
 class TestTeardownPreserve:
-    """
-    Validates that _teardown_current does NOT stop containers
-    that belong to the target profile (the 'preserve' set).
-    This prevents the death loop where the orchestrator stops
-    the container it just started.
-    """
 
     @pytest.mark.asyncio
     async def test_teardown_skips_preserved_containers(self, mock_vram_monitor):
-        """Containers in the preserve set should NOT be stopped."""
         orch = _make_orchestrator(mock_vram_monitor)
 
-        # Simulate: qwen3 is READY, gpt-oss is STARTING (just created)
         orch._container_states = {
             "vllm-qwen3-coder-next-80b": ContainerState.READY,
             "vllm-gpt-oss-120b": ContainerState.STARTING,
         }
 
-        mock_container = MagicMock()
-        mock_container.status = "running"
-        orch._client.containers.get.return_value = mock_container
-
-        # Preserve gpt-oss (target), only tear down qwen3
         await orch._teardown_current(
             SwapStrategy.STOP_START,
             preserve={"vllm-gpt-oss-120b"},
         )
 
-        # qwen3 should be stopped
         assert orch._container_states["vllm-qwen3-coder-next-80b"] == ContainerState.STOPPED
-        # gpt-oss should remain STARTING (untouched)
         assert orch._container_states["vllm-gpt-oss-120b"] == ContainerState.STARTING
 
     @pytest.mark.asyncio
     async def test_teardown_without_preserve_stops_all(self, mock_vram_monitor):
-        """Without preserve, all READY/STARTING containers are stopped."""
         orch = _make_orchestrator(mock_vram_monitor)
 
         orch._container_states = {
             "container-a": ContainerState.READY,
             "container-b": ContainerState.STARTING,
         }
-
-        mock_container = MagicMock()
-        mock_container.status = "running"
-        orch._client.containers.get.return_value = mock_container
 
         await orch._teardown_current(SwapStrategy.STOP_START)
 
@@ -387,7 +351,6 @@ class TestTeardownPreserve:
 
     @pytest.mark.asyncio
     async def test_switch_profile_passes_target_containers_to_teardown(self, mock_vram_monitor):
-        """switch_profile should send target container names to teardown."""
         orch = _make_orchestrator(mock_vram_monitor)
         teardown_calls = []
 
@@ -405,7 +368,6 @@ class TestTeardownPreserve:
 
         await orch.switch_profile(PROFILE_FOCUS)
 
-        # The first teardown call should preserve the target model containers
         assert len(teardown_calls) >= 1
         preserve_set = teardown_calls[0]["preserve"]
         assert GPT_OSS_120B.container_name in preserve_set
@@ -432,137 +394,71 @@ class TestProfileKey:
 # ──────────────────────────────────────────────────────
 
 class TestCleanupOrphanedContainers:
-    """
-    Validates that cleanup_orphaned_containers stops all known
-    inference containers regardless of which profile is active.
-    """
 
     @pytest.mark.asyncio
-    async def test_stops_running_containers(self, mock_vram_monitor):
-        """Running containers from ALL_MODELS should be removed."""
+    async def test_removes_found_workloads(self, mock_vram_monitor):
+        """Found workloads from ALL_MODELS should be removed."""
         orch = _make_orchestrator(mock_vram_monitor)
 
-        mock_container = MagicMock()
-        mock_container.status = "running"
-        orch._client.containers.get.return_value = mock_container
+        # Backend finds workloads for non-ray models
+        orch._backend.get_workload = AsyncMock(
+            return_value=WorkloadInfo(name="test", status="running")
+        )
 
         await orch.cleanup_orphaned_containers()
 
-        # remove(force=True) should have been called for every container found
-        assert mock_container.remove.call_count >= 1
+        assert orch._backend.remove_workload.call_count >= 1
 
     @pytest.mark.asyncio
     async def test_ignores_not_found(self, mock_vram_monitor):
-        """Containers that don't exist should be silently skipped."""
-        from docker.errors import NotFound
-
+        """Workloads that don't exist should be silently skipped."""
         orch = _make_orchestrator(mock_vram_monitor)
-        orch._client.containers.get.side_effect = NotFound("gone")
+
+        # Backend returns None for all workloads
+        orch._backend.get_workload = AsyncMock(return_value=None)
 
         # Should not raise
         await orch.cleanup_orphaned_containers()
 
     @pytest.mark.asyncio
-    async def test_removes_paused_containers(self, mock_vram_monitor):
-        """Paused containers should also be removed."""
+    async def test_removes_paused_workloads(self, mock_vram_monitor):
         orch = _make_orchestrator(mock_vram_monitor)
-
-        mock_container = MagicMock()
-        mock_container.status = "paused"
-        orch._client.containers.get.return_value = mock_container
+        orch._backend.get_workload = AsyncMock(
+            return_value=WorkloadInfo(name="test", status="paused")
+        )
 
         await orch.cleanup_orphaned_containers()
 
-        assert mock_container.remove.call_count >= 1
+        assert orch._backend.remove_workload.call_count >= 1
 
     @pytest.mark.asyncio
-    async def test_removes_exited_containers(self, mock_vram_monitor):
-        """Exited containers should also be removed (stale network config)."""
+    async def test_removes_exited_workloads(self, mock_vram_monitor):
         orch = _make_orchestrator(mock_vram_monitor)
-
-        mock_container = MagicMock()
-        mock_container.status = "exited"
-        orch._client.containers.get.return_value = mock_container
+        orch._backend.get_workload = AsyncMock(
+            return_value=WorkloadInfo(name="test", status="exited")
+        )
 
         await orch.cleanup_orphaned_containers()
 
-        assert mock_container.remove.call_count >= 1
+        assert orch._backend.remove_workload.call_count >= 1
 
 
 # ──────────────────────────────────────────────────────
-#  Network reconnection for stale containers
+#  Network check delegates to backend
 # ──────────────────────────────────────────────────────
 
-class TestEnsureCorrectNetwork:
-    """
-    Validates that _ensure_correct_network reconnects a container
-    to the inference Docker network when it's on a stale network.
-    """
-
-    @pytest.mark.asyncio
-    async def test_no_action_if_already_on_network(self, mock_vram_monitor):
-        """Container already on the correct network → no reconnect."""
-        import asyncio
-        from gateway.config import DOCKER_NETWORK
-
-        orch = _make_orchestrator(mock_vram_monitor)
-
-        mock_container = MagicMock()
-        mock_container.attrs = {
-            "NetworkSettings": {
-                "Networks": {DOCKER_NETWORK: {"NetworkID": "abc123"}}
-            }
-        }
-
-        await orch._ensure_correct_network(mock_container, asyncio.get_event_loop())
-
-        # networks.get should NOT have been called (no reconnect needed)
-        orch._client.networks.get.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_reconnects_if_on_wrong_network(self, mock_vram_monitor):
-        """Container on a stale network → should be reconnected."""
-        import asyncio
-        from gateway.config import DOCKER_NETWORK
-
-        orch = _make_orchestrator(mock_vram_monitor)
-
-        mock_container = MagicMock()
-        mock_container.name = "vllm-gpt-oss-120b"
-        mock_container.attrs = {
-            "NetworkSettings": {
-                "Networks": {"old_stale_network": {"NetworkID": "old123"}}
-            }
-        }
-
-        mock_network = MagicMock()
-        orch._client.networks.get.return_value = mock_network
-
-        await orch._ensure_correct_network(mock_container, asyncio.get_event_loop())
-
-        orch._client.networks.get.assert_called_once_with(DOCKER_NETWORK)
-        mock_network.connect.assert_called_once_with(mock_container)
+class TestEnsureNetwork:
 
     @pytest.mark.asyncio
     async def test_ensure_running_calls_network_check(self, mock_vram_monitor):
-        """_ensure_container_running should verify network for running containers."""
+        """_ensure_container_running should call backend.ensure_network for running workloads."""
         orch = _make_orchestrator(mock_vram_monitor)
 
-        mock_container = MagicMock()
-        mock_container.status = "running"
-        mock_container.attrs = {
-            "NetworkSettings": {
-                "Networks": {"stale_net": {"NetworkID": "old"}}
-            }
-        }
-        orch._client.containers.get.return_value = mock_container
-
-        mock_network = MagicMock()
-        orch._client.networks.get.return_value = mock_network
+        orch._backend.get_workload = AsyncMock(
+            return_value=WorkloadInfo(name="vllm-gpt-oss-120b", status="running")
+        )
 
         await orch._ensure_container_running(GPT_OSS_120B, SwapStrategy.STOP_START)
 
-        # Network should have been reconnected
-        mock_network.connect.assert_called_once_with(mock_container)
-        # State should still be STARTING
+        orch._backend.ensure_network.assert_called_once_with("vllm-gpt-oss-120b")
         assert orch._container_states[GPT_OSS_120B.container_name] == ContainerState.STARTING

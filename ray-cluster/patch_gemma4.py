@@ -65,6 +65,25 @@ patch_after(
     label="rotary_embedding/__init__.py",
 )
 
+# ── 5b. Rotary embedding get_rope() — add "proportional" scaling type ─────
+patch_before(
+    path=f"{VLLM}/model_executor/layers/rotary_embedding/__init__.py",
+    marker='    else:\n        raise ValueError(f"Unknown RoPE scaling type {scaling_type}")',
+    insertion=(
+        '    elif scaling_type == "proportional":\n'
+        '        rotary_emb = Gemma4RotaryEmbedding(\n'
+        '            head_size,\n'
+        '            rotary_dim,\n'
+        '            max_position,\n'
+        '            base,\n'
+        '            is_neox_style,\n'
+        '            dtype,\n'
+        '        )\n'
+    ),
+    unique_check='"proportional"',
+    label="rotary_embedding/__init__.py (get_rope proportional)",
+)
+
 # ── 6. tool_parsers/__init__.py ───────────────────────────────────────────
 patch_before(
     path=f"{VLLM}/tool_parsers/__init__.py",

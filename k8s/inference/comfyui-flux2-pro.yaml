@@ -1,0 +1,87 @@
+# FLUX.2 Pro — FP16 Image Generation
+# Profile: creative_image | Engine: comfyui
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comfyui-flux2-pro
+  namespace: blackwell
+  labels:
+    app: comfyui-flux2-pro
+    engine: comfyui
+    profile: creative-image
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: comfyui-flux2-pro
+  template:
+    metadata:
+      labels:
+        app: comfyui-flux2-pro
+        engine: comfyui
+        profile: creative-image
+    spec:
+      containers:
+        - name: flux
+          image: comfyui-flux:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8004
+          env:
+            - name: MODEL_NAME
+              value: "flux2-pro"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+          volumeMounts:
+            - name: model-weights
+              mountPath: /models
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8004
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 18  # 3 min
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8004
+            periodSeconds: 30
+            timeoutSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8004
+            initialDelaySeconds: 180
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: model-weights
+          hostPath:
+            path: /home/alejandroacho/Models/flux2-pro-fp16
+            type: Directory
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: comfyui-flux2-pro
+  namespace: blackwell
+spec:
+  selector:
+    app: comfyui-flux2-pro
+  ports:
+    - port: 8004
+      targetPort: 8004
+  type: ClusterIP

@@ -30,7 +30,19 @@ def patched_app(mock_vram_monitor):
     # Replace singletons
     app_module.vram_monitor = mock_vram_monitor
     app_module.orchestrator._vram = mock_vram_monitor
-    app_module.orchestrator._client = MagicMock()
+    # Mock the backend instead of Docker client directly
+    mock_be = MagicMock()
+    mock_be.supports_pause = True
+    mock_be.get_workload = AsyncMock(return_value=None)
+    mock_be.create_and_start = AsyncMock()
+    mock_be.stop_workload = AsyncMock()
+    mock_be.remove_workload = AsyncMock()
+    mock_be.list_workloads = AsyncMock(return_value=[])
+    mock_be.ensure_network = AsyncMock()
+    mock_be.resolve_hostname = MagicMock(
+        side_effect=lambda name, engine: "192.168.200.12" if engine == "ray_vllm" else name
+    )
+    app_module.orchestrator._backend = mock_be
     app_module.orchestrator._container_states = {}
     app_module.orchestrator._swap_in_progress = False
     app_module.orchestrator._active_profile = None

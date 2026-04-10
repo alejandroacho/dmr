@@ -1,0 +1,119 @@
+# GPT-OSS 120B — MXFP4 CUTLASS sm_121
+# Profile: focus | Engine: vllm (local Docker-managed)
+# Deployment starts with replicas: 0 (dormant). Gateway scales to 1 when needed.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-gpt-oss-120b
+  namespace: blackwell
+  labels:
+    app: vllm-gpt-oss-120b
+    engine: vllm
+    profile: focus
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: vllm-gpt-oss-120b
+  template:
+    metadata:
+      labels:
+        app: vllm-gpt-oss-120b
+        engine: vllm
+        profile: focus
+    spec:
+      containers:
+        - name: vllm
+          image: vllm-mxfp4-spark:latest
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve", "/models"]
+          args:
+            - "--port=8001"
+            - "--served-model-name=gpt-oss-120b"
+            - "--tensor-parallel-size=1"
+            - "--max-model-len=131072"
+            - "--kv-cache-dtype=fp8"
+            - "--enable-prefix-caching"
+            - "--trust-remote-code"
+            - "--quantization=mxfp4"
+            - "--mxfp4-backend=CUTLASS"
+            - "--mxfp4-layers=moe,qkv,o,lm_head"
+            - "--attention-backend=FLASHINFER"
+            - "--gpu-memory-utilization=0.70"
+            - "--max-num-seqs=10"
+            - "--max-num-batched-tokens=8192"
+            - "--load-format=fastsafetensors"
+            - "--enforce-eager"
+          ports:
+            - containerPort: 8001
+          env:
+            - name: MODEL_NAME
+              value: "gpt-oss-120b"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: VLLM_PORT
+              value: "8001"
+            - name: TIKTOKEN_ENCODINGS_BASE
+              value: "/tiktoken_enc"
+          volumeMounts:
+            - name: model-weights
+              mountPath: /models
+              readOnly: true
+            - name: tiktoken-encodings
+              mountPath: /tiktoken_enc
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30  # 5 min
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 300
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: model-weights
+          hostPath:
+            path: /home/alejandroacho/Models/gpt-oss-120b-q8
+            type: Directory
+        - name: tiktoken-encodings
+          hostPath:
+            path: /home/alejandroacho/Server/tiktoken_encodings
+            type: Directory
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-gpt-oss-120b
+  namespace: blackwell
+spec:
+  selector:
+    app: vllm-gpt-oss-120b
+  ports:
+    - port: 8001
+      targetPort: 8001
+  type: ClusterIP

@@ -12,8 +12,11 @@ pydantic>=2.9.0
 # Async HTTP client (proxy to backends)
 aiohttp>=3.10.0
 
-# Docker SDK (container management)
+# Docker SDK (container management — used when ORCHESTRATION_BACKEND=docker)
 docker>=7.1.0
+
+# Kubernetes client (used when ORCHESTRATION_BACKEND=kubernetes)
+kubernetes>=28.1.0
 
 # ASGI server
 httptools>=0.6.0

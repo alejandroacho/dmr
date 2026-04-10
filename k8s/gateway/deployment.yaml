@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blackwell-gateway
+  namespace: blackwell
+  labels:
+    app: blackwell-gateway
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # Single-worker constraint — no rolling updates
+  selector:
+    matchLabels:
+      app: blackwell-gateway
+  template:
+    metadata:
+      labels:
+        app: blackwell-gateway
+    spec:
+      serviceAccountName: gateway-sa
+      containers:
+        - name: gateway
+          image: blackwell-gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: GATEWAY_HOST
+              value: "0.0.0.0"
+            - name: GATEWAY_PORT
+              value: "8000"
+            - name: ORCHESTRATION_BACKEND
+              value: "kubernetes"
+            - name: K8S_NAMESPACE
+              value: "blackwell"
+            - name: MODELS_PATH
+              value: "/models"
+            - name: SYSTEM_RAM_GB
+              value: "218"
+            - name: SWAP_TIMEOUT_S
+              value: "600"
+            - name: RAY_HEAD_HOST
+              value: "192.168.200.12"
+            - name: LONG_POLLING_ENABLED
+              value: "true"
+            - name: LONG_POLLING_TIMEOUT_S
+              value: "600"
+            - name: MAX_QUEUE_SIZE
+              value: "200"
+          envFrom:
+            - configMapRef:
+                name: gateway-config
+                optional: true
+          volumeMounts:
+            - name: gateway-state
+              mountPath: /data
+            - name: model-weights
+              mountPath: /models
+              readOnly: true
+            - name: generated-images
+              mountPath: /tmp/gateway_images
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+      volumes:
+        - name: gateway-state
+          persistentVolumeClaim:
+            claimName: gateway-state-pvc
+        - name: model-weights
+          hostPath:
+            path: /home/alejandroacho/Models
+            type: Directory
+        - name: generated-images
+          emptyDir: {}

@@ -1,0 +1,148 @@
+# KubeRay RayCluster CRD for multi-node deployment (2+ DGX Sparks).
+# Requires: KubeRay Operator installed via Helm.
+# Both head and worker use hostNetwork for NCCL over QSFP 200 Gbps.
+#
+# Prerequisites:
+#   helm install kuberay-operator kuberay/kuberay-operator
+#   kubectl label node <node1> node-role.kubernetes.io/ray-head=""
+#   kubectl label node <node2> node-role.kubernetes.io/ray-worker=""
+---
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: blackwell-cluster
+  namespace: blackwell
+spec:
+  rayVersion: "2.44.0"
+  headGroupSpec:
+    rayStartParams:
+      block: "true"
+      node-ip-address: "192.168.200.12"
+      port: "6379"
+    template:
+      metadata:
+        labels:
+          app: ray-node-head
+          ray.io/cluster: blackwell-cluster
+          ray.io/node-type: head
+      spec:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        nodeSelector:
+          node-role.kubernetes.io/ray-head: ""
+        containers:
+          - name: ray-head
+            image: blackwell-vllm:latest
+            imagePullPolicy: IfNotPresent
+            env:
+              - name: NVIDIA_VISIBLE_DEVICES
+                value: "all"
+              - name: VLLM_HOST_IP
+                value: "192.168.200.12"
+              - name: UCX_NET_DEVICES
+                value: "enp1s0f1np1"
+              - name: NCCL_SOCKET_IFNAME
+                value: "enp1s0f1np1"
+              - name: GLOO_SOCKET_IFNAME
+                value: "enp1s0f1np1"
+              - name: OMPI_MCA_btl_tcp_if_include
+                value: "enp1s0f1np1"
+              - name: TP_SOCKET_IFNAME
+                value: "enp1s0f1np1"
+              - name: RAY_memory_monitor_refresh_ms
+                value: "0"
+              - name: RAY_memory_usage_threshold
+                value: "0.99"
+              - name: MASTER_ADDR
+                value: "192.168.200.12"
+            resources:
+              limits:
+                nvidia.com/gpu: "1"
+              requests:
+                memory: "128Gi"
+            volumeMounts:
+              - name: hf-cache
+                mountPath: /root/.cache/huggingface
+              - name: dshm
+                mountPath: /dev/shm
+        volumes:
+          - name: hf-cache
+            hostPath:
+              path: /home/alejandroacho/.cache/huggingface
+              type: DirectoryOrCreate
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+  workerGroupSpecs:
+    - groupName: worker
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 4
+      rayStartParams:
+        block: "true"
+        address: "192.168.200.12:6379"
+        node-ip-address: "192.168.200.13"
+      template:
+        metadata:
+          labels:
+            app: ray-node-worker
+            ray.io/cluster: blackwell-cluster
+            ray.io/node-type: worker
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeSelector:
+            node-role.kubernetes.io/ray-worker: ""
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      ray.io/cluster: blackwell-cluster
+                      ray.io/node-type: head
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: ray-worker
+              image: blackwell-vllm:latest
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: NVIDIA_VISIBLE_DEVICES
+                  value: "all"
+                - name: VLLM_HOST_IP
+                  value: "192.168.200.13"
+                - name: UCX_NET_DEVICES
+                  value: "enp1s0f1np1"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "enp1s0f1np1"
+                - name: GLOO_SOCKET_IFNAME
+                  value: "enp1s0f1np1"
+                - name: OMPI_MCA_btl_tcp_if_include
+                  value: "enp1s0f1np1"
+                - name: TP_SOCKET_IFNAME
+                  value: "enp1s0f1np1"
+                - name: RAY_memory_monitor_refresh_ms
+                  value: "0"
+                - name: RAY_memory_usage_threshold
+                  value: "0.99"
+                - name: MASTER_ADDR
+                  value: "192.168.200.12"
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"
+                requests:
+                  memory: "128Gi"
+              volumeMounts:
+                - name: hf-cache
+                  mountPath: /root/.cache/huggingface
+                - name: dshm
+                  mountPath: /dev/shm
+          volumes:
+            - name: hf-cache
+              hostPath:
+                path: /home/alejandroacho/.cache/huggingface
+                type: DirectoryOrCreate
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Gi

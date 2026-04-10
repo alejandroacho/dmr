@@ -12,12 +12,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.backends.base import ExecResult, WorkloadInfo
+
 
 # ─── Patch docker.DockerClient BEFORE importing gateway modules ──
 
 @pytest.fixture(autouse=True)
 def _mock_docker(monkeypatch):
-    """Prevents orchestrator from connecting to a real Docker daemon."""
+    """Prevents DockerBackend from connecting to a real Docker daemon."""
     mock_client = MagicMock()
     mock_client.containers = MagicMock()
     monkeypatch.setattr(
@@ -25,6 +27,33 @@ def _mock_docker(monkeypatch):
         lambda *a, **kw: mock_client,
     )
     return mock_client
+
+
+# ─── Mock OrchestrationBackend ────
+
+@pytest.fixture()
+def mock_backend():
+    """A MagicMock that satisfies the OrchestrationBackend protocol."""
+    backend = MagicMock()
+    backend.supports_pause = True
+
+    # Default: get_workload returns None (container not found)
+    backend.get_workload = AsyncMock(return_value=None)
+    backend.create_and_start = AsyncMock()
+    backend.stop_workload = AsyncMock()
+    backend.remove_workload = AsyncMock()
+    backend.pause_workload = AsyncMock()
+    backend.unpause_workload = AsyncMock()
+    backend.exec_in_workload = AsyncMock(
+        return_value=ExecResult(exit_code=0, output="")
+    )
+    backend.list_workloads = AsyncMock(return_value=[])
+    backend.ensure_network = AsyncMock()
+    backend.resolve_hostname = MagicMock(
+        side_effect=lambda name, engine: "192.168.200.12" if engine == "ray_vllm" else name
+    )
+
+    return backend
 
 
 # ─── VRAMMonitor that never calls NVML ───

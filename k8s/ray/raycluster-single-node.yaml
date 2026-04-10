@@ -1,0 +1,74 @@
+# Ray head as a StatefulSet for single-node K8s deployment.
+# The Ray worker on Node 2 remains as a Docker container (not in K8s).
+# Uses hostNetwork for NCCL GPU-to-GPU communication over QSFP.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ray-node-head
+  namespace: blackwell
+  labels:
+    app: ray-node-head
+spec:
+  replicas: 1
+  serviceName: ray-node-head
+  selector:
+    matchLabels:
+      app: ray-node-head
+  template:
+    metadata:
+      labels:
+        app: ray-node-head
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: ray-head
+          image: blackwell-vllm:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - >
+              ray start --block --head
+              --node-ip-address=192.168.200.12
+              --port=6379
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: VLLM_HOST_IP
+              value: "192.168.200.12"
+            - name: UCX_NET_DEVICES
+              value: "enp1s0f1np1"
+            - name: NCCL_SOCKET_IFNAME
+              value: "enp1s0f1np1"
+            - name: GLOO_SOCKET_IFNAME
+              value: "enp1s0f1np1"
+            - name: OMPI_MCA_btl_tcp_if_include
+              value: "enp1s0f1np1"
+            - name: TP_SOCKET_IFNAME
+              value: "enp1s0f1np1"
+            - name: RAY_memory_monitor_refresh_ms
+              value: "0"
+            - name: RAY_memory_usage_threshold
+              value: "0.99"
+            - name: MASTER_ADDR
+              value: "192.168.200.12"
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              memory: "128Gi"
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: hf-cache
+          hostPath:
+            path: /home/alejandroacho/.cache/huggingface
+            type: DirectoryOrCreate
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi

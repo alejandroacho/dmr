@@ -145,6 +145,8 @@ docker run \
     --shm-size 10.24g \
     --gpus all \
     --restart unless-stopped \
+    --cap-add IPC_LOCK \
+    --device /dev/infiniband \
     "${DETACH_FLAG[@]}" \
     -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
     "${ADDITIONAL_ARGS[@]}" \
