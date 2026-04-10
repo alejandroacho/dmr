@@ -244,6 +244,27 @@ GEMMA4_31B = ModelDefinition(
     },
 )
 
+GEMMA4_31B_FP8 = ModelDefinition(
+    name="gemma-4-31b",
+    container_image="blackwell-vllm:latest",
+    container_name="vllm-gemma4-31b-fp8",
+    # FP8 weights ~31 GB on a single GB10 (96 GB VRAM).
+    # Leaves ~35 GB free for concurrent KV caches (5-9 users).
+    vram_required_mb=31_000,
+    port=8009,
+    quantization="fp8",
+    tensor_parallel_size=1,
+    max_model_len=131072,           # 128K context
+    kv_cache_dtype="fp8",
+    hf_model_id="RedHatAI/gemma-4-31B-it-FP8-block",
+    engine="ray_vllm",
+    extra_args={
+        "--gpu-memory-utilization": "0.90",
+        "--hf-overrides": '{"architectures": ["Gemma4ForCausalLM"]}',
+        "--language-model-only": True,
+    },
+)
+
 QWEN3_CODER_BASE = ModelDefinition(
     name="qwen3-coder",
     container_image="blackwell-vllm:latest",
@@ -426,11 +447,21 @@ PROFILE_GEMMA4 = VRAMProfile(
     skip_vram_check=True,
 )
 
+PROFILE_GEMMA4_FP8 = VRAMProfile(
+    mode=ProfileMode.FOCUS,
+    description="Gemma 4 31B-it FP8 TP=1 single-node 128K (~31 GB)",
+    primary_models=[GEMMA4_31B_FP8],
+    secondary_models=[],
+    labels={"chat": GEMMA4_31B_FP8},
+    skip_vram_check=True,
+)
+
 PROFILES: dict[str, VRAMProfile] = {
     "focus": PROFILE_FOCUS,
     "focus_code": PROFILE_FOCUS_CODE,
     "focus_large": PROFILE_FOCUS_LARGE,
     "gemma4": PROFILE_GEMMA4,
+    "gemma4_fp8": PROFILE_GEMMA4_FP8,
     "creative_image": PROFILE_CREATIVE_IMAGE,
     "creative_video": PROFILE_CREATIVE_VIDEO,
 }
@@ -446,6 +477,7 @@ ALL_MODELS: list[ModelDefinition] = [
     QWEN3_5_4B,
     QWEN3_5_122B,
     GEMMA4_31B,
+    GEMMA4_31B_FP8,
 ]
 
 

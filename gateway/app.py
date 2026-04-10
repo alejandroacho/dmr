@@ -112,7 +112,7 @@ async def lifespan(app: FastAPI):
         # No usable containers found — restore last known profile or fall back to default
         await orchestrator.cleanup_orphaned_containers()
         last_profile_key = ContainerOrchestrator.load_persisted_profile()
-        default_profile = PROFILES.get("gemma4", PROFILE_FOCUS_CODE)
+        default_profile = PROFILES.get("gemma4_fp8", PROFILE_FOCUS_CODE)
         startup_profile = PROFILES.get(last_profile_key, default_profile) if last_profile_key else default_profile
         if last_profile_key and last_profile_key in PROFILES:
             logger.info("Restoring last active profile: '%s'", last_profile_key)
