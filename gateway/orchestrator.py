@@ -99,10 +99,7 @@ class ContainerOrchestrator:
         """Return the active VRAMProfile object, or None."""
         if not self._active_profile:
             return None
-        for profile in PROFILES.values():
-            if self._profile_key(profile) == self._active_profile:
-                return profile
-        return None
+        return PROFILES.get(self._active_profile)
 
     @property
     def container_states(self) -> dict[str, ContainerState]:
@@ -177,7 +174,7 @@ class ContainerOrchestrator:
             if required and required.issubset(running) and all(
                 running[n] in valid_statuses for n in required
             ):
-                self._active_profile = self._profile_key(profile)
+                self._active_profile = profile_key
                 for model in all_models:
                     name = model.container_name
                     status = running[name]
@@ -220,9 +217,10 @@ class ContainerOrchestrator:
         Serialized with mutex to prevent collisions.
         Returns True if the switch was successful.
         """
-        profile_key = self._profile_key(target_profile)
+        registry_key = self._registry_key(target_profile)
+        profile_key = registry_key  # used in logs below
 
-        if self._active_profile == profile_key and not force:
+        if self._active_profile == registry_key and not force:
             logger.info("Profile '%s' already active, skipping.", profile_key)
             return True
 
@@ -294,7 +292,7 @@ class ContainerOrchestrator:
                             )
 
                 # 5. Claim the profile
-                self._active_profile = profile_key
+                self._active_profile = registry_key
                 self._persist_state()
 
                 elapsed = time.time() - self._swap_start_time
@@ -381,6 +379,7 @@ class ContainerOrchestrator:
                 volumes=volumes,
                 port=model.port,
                 shm_size="16g",
+                entrypoint=model.container_entrypoint,
             )
             logger.info("Workload '%s' created and started.", model.container_name)
         except Exception as exc:
@@ -563,7 +562,28 @@ class ContainerOrchestrator:
 
     @staticmethod
     def _profile_key(profile: VRAMProfile) -> str:
-        """Generates a unique key for a profile."""
+        """Generates a display key for a profile (mode:model_names).
+
+        NOTE: not unique when multiple profiles share the same model names
+        (e.g. gemma4, gemma4_fp8, gemma4_fp8_vllm all produce
+        'focus:gemma-4-31b'). Use _registry_key() for identity.
+        """
+        model_names = sorted(
+            m.name for m in profile.primary_models + profile.secondary_models
+        )
+        return f"{profile.mode.value}:{'|'.join(model_names)}"
+
+    @staticmethod
+    def _registry_key(profile: VRAMProfile) -> str:
+        """Return the PROFILES dict key for this profile object.
+
+        Falls back to _profile_key() if the profile isn't in the registry
+        (shouldn't happen in practice).
+        """
+        for key, p in PROFILES.items():
+            if p is profile:
+                return key
+        # Fallback: compute the old-style key
         model_names = sorted(
             m.name for m in profile.primary_models + profile.secondary_models
         )

@@ -99,6 +99,32 @@ patch_before(
     label="tool_parsers/__init__.py",
 )
 
+# ── 6b. Patch gemma4_tool_parser.py for vLLM 0.17.1 compatibility ─────────
+# The parser was copied from 0.19.0 which imports Tool from abstract_tool_parser
+# and expects `tools` in __init__.  In 0.17.1 neither exists.
+tool_parser_path = f"{VLLM}/tool_parsers/gemma4_tool_parser.py"
+with open(tool_parser_path) as f:
+    tp_content = f.read()
+
+if "# patched-for-017" not in tp_content:
+    # Fix import: remove Tool from the import
+    tp_content = tp_content.replace(
+        "from vllm.tool_parsers.abstract_tool_parser import Tool, ToolParser",
+        "from vllm.tool_parsers.abstract_tool_parser import ToolParser  # patched-for-017",
+    )
+    # Fix __init__ signature: remove tools param and super() call
+    tp_content = tp_content.replace(
+        "def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):\n"
+        "        super().__init__(tokenizer, tools)",
+        "def __init__(self, tokenizer: TokenizerLike, **kwargs):\n"
+        "        super().__init__(tokenizer)",
+    )
+    with open(tool_parser_path, "w") as f:
+        f.write(tp_content)
+    print("gemma4_tool_parser.py: patched for 0.17.1 compatibility")
+else:
+    print("gemma4_tool_parser.py: already patched for 0.17.1")
+
 # ── 7. reasoning/__init__.py ──────────────────────────────────────────────
 patch_before(
     path=f"{VLLM}/reasoning/__init__.py",

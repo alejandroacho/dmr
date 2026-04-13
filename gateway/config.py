@@ -134,6 +134,9 @@ class ModelDefinition:
     extra_volumes: dict[str, Any] = field(default_factory=dict)
     # Extra environment variables to inject into the container.
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Override the image ENTRYPOINT (e.g. ["vllm", "serve"] for images
+    # whose default entrypoint is a shell like /bin/bash -c).
+    container_entrypoint: list[str] | None = None
 
     def to_slot(self, state: ContainerState = ContainerState.STOPPED) -> ModelSlot:
         return ModelSlot(
@@ -241,6 +244,8 @@ GEMMA4_31B = ModelDefinition(
         # instead of Gemma4ForConditionalGeneration (multimodal, broken import).
         "--hf-overrides": '{"architectures": ["Gemma4ForCausalLM"]}',
         "--language-model-only": True,
+        "--enable-auto-tool-choice": True,
+        "--tool-call-parser": "gemma4",
     },
 )
 
@@ -252,7 +257,7 @@ GEMMA4_31B_FP8 = ModelDefinition(
     # Leaves ~35 GB free for concurrent KV caches (5-9 users).
     vram_required_mb=31_000,
     port=8009,
-    quantization="fp8",
+    quantization="compressed-tensors",
     tensor_parallel_size=1,
     max_model_len=131072,           # 128K context
     kv_cache_dtype="fp8",
@@ -262,6 +267,38 @@ GEMMA4_31B_FP8 = ModelDefinition(
         "--gpu-memory-utilization": "0.90",
         "--hf-overrides": '{"architectures": ["Gemma4ForCausalLM"]}',
         "--language-model-only": True,
+        "--enable-auto-tool-choice": True,
+        "--tool-call-parser": "gemma4",
+    },
+)
+
+GEMMA4_31B_FP8_VLLM = ModelDefinition(
+    name="gemma-4-31b",
+    # vLLM 0.19.1 with native Gemma 4 support + stable CUDA graphs on Blackwell.
+    # Entrypoint is ["vllm", "serve"] — no container_entrypoint override needed.
+    container_image="vllm/vllm-openai:gemma4-cu130",
+    container_name="vllm-gemma4-31b-fp8-direct",
+    # FP8 weights ~31 GB on a single GB10 (96 GB VRAM).
+    # Runs via Docker directly (no Ray) with CUDA graphs for max throughput.
+    vram_required_mb=31_000,
+    port=8010,
+    quantization="compressed-tensors",
+    tensor_parallel_size=1,
+    max_model_len=131072,           # 128K context
+    kv_cache_dtype="fp8",
+    hf_model_id="RedHatAI/gemma-4-31B-it-FP8-block",
+    engine="vllm",
+    # Mount host HF cache so weights are loaded locally, not re-downloaded.
+    extra_volumes={
+        "/home/alejandroacho/.cache/huggingface": {
+            "bind": "/root/.cache/huggingface",
+            "mode": "rw",
+        },
+    },
+    extra_args={
+        "--gpu-memory-utilization": "0.90",
+        "--enable-auto-tool-choice": True,
+        "--tool-call-parser": "gemma4",
     },
 )
 
@@ -371,6 +408,37 @@ QWEN3_5_122B = ModelDefinition(
     },
 )
 
+QWEN3_5_122B_VLLM = ModelDefinition(
+    name="qwen3.5-122b",
+    # Docker-direct single-node: ~64 GB GPTQ-Int4 weights on one GB10.
+    # Leaves ~46 GB for KV cache (9 agents × ~5K tokens each).
+    # No Ray overhead, no TP communication latency.
+    container_image="vllm/vllm-openai:gemma4-cu130",  # vLLM 0.19.1, CUDA 13.0
+    container_name="vllm-qwen3-5-122b-direct",
+    vram_required_mb=64_000,
+    port=8011,
+    quantization="gptq_marlin",
+    tensor_parallel_size=1,
+    max_model_len=32768,             # 32K per agent — safe for 9 concurrent
+    kv_cache_dtype="fp8",
+    hf_model_id="Qwen/Qwen3.5-122B-A10B-GPTQ-Int4",
+    engine="vllm",
+    # Mount host HF cache so weights are loaded locally.
+    extra_volumes={
+        "/home/alejandroacho/.cache/huggingface": {
+            "bind": "/root/.cache/huggingface",
+            "mode": "rw",
+        },
+    },
+    extra_args={
+        "--gpu-memory-utilization": "0.90",
+        "--max-num-batched-tokens": "8192",
+        "--reasoning-parser": "qwen3",
+        "--enable-auto-tool-choice": True,
+        "--tool-call-parser": "qwen3_coder",
+    },
+)
+
 
 # ────── Load Profiles ──────
 
@@ -456,12 +524,32 @@ PROFILE_GEMMA4_FP8 = VRAMProfile(
     skip_vram_check=True,
 )
 
+PROFILE_GEMMA4_FP8_VLLM = VRAMProfile(
+    mode=ProfileMode.FOCUS,
+    description="Gemma 4 31B-it FP8 Docker-direct single-GPU 128K (~31 GB)",
+    primary_models=[GEMMA4_31B_FP8_VLLM],
+    secondary_models=[],
+    labels={"chat": GEMMA4_31B_FP8_VLLM},
+    skip_vram_check=False,
+)
+
+PROFILE_FOCUS_LARGE_VLLM = VRAMProfile(
+    mode=ProfileMode.FOCUS,
+    description="Large Reasoning Mode: Qwen3.5-122B GPTQ-Int4 Docker-direct single-GPU 32K (~64 GB)",
+    primary_models=[QWEN3_5_122B_VLLM],
+    secondary_models=[],
+    labels={"chat": QWEN3_5_122B_VLLM},
+    skip_vram_check=False,
+)
+
 PROFILES: dict[str, VRAMProfile] = {
     "focus": PROFILE_FOCUS,
     "focus_code": PROFILE_FOCUS_CODE,
     "focus_large": PROFILE_FOCUS_LARGE,
     "gemma4": PROFILE_GEMMA4,
     "gemma4_fp8": PROFILE_GEMMA4_FP8,
+    "gemma4_fp8_vllm": PROFILE_GEMMA4_FP8_VLLM,
+    "focus_large_vllm": PROFILE_FOCUS_LARGE_VLLM,
     "creative_image": PROFILE_CREATIVE_IMAGE,
     "creative_video": PROFILE_CREATIVE_VIDEO,
 }
@@ -478,6 +566,8 @@ ALL_MODELS: list[ModelDefinition] = [
     QWEN3_5_122B,
     GEMMA4_31B,
     GEMMA4_31B_FP8,
+    GEMMA4_31B_FP8_VLLM,
+    QWEN3_5_122B_VLLM,
 ]
 
 

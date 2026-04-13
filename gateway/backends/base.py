@@ -57,6 +57,7 @@ class OrchestrationBackend(Protocol):
         volumes: dict[str, Any],
         port: int,
         shm_size: str = "16g",
+        entrypoint: list[str] | None = None,
     ) -> None:
         """Create and start a new workload."""
         ...

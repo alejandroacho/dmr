@@ -112,7 +112,7 @@ async def lifespan(app: FastAPI):
         # No usable containers found — restore last known profile or fall back to default
         await orchestrator.cleanup_orphaned_containers()
         last_profile_key = ContainerOrchestrator.load_persisted_profile()
-        default_profile = PROFILES.get("gemma4_fp8", PROFILE_FOCUS_CODE)
+        default_profile = PROFILES.get("focus_large_vllm", PROFILE_FOCUS_CODE)
         startup_profile = PROFILES.get(last_profile_key, default_profile) if last_profile_key else default_profile
         if last_profile_key and last_profile_key in PROFILES:
             logger.info("Restoring last active profile: '%s'", last_profile_key)
@@ -290,7 +290,7 @@ async def list_profiles():
 
     details: list[ProfileDetail] = []
     for key, profile in PROFILES.items():
-        is_active = (orchestrator._profile_key(profile) == active_key)
+        is_active = (key == active_key)
         # Build label map for this profile
         label_by_container: dict[str, str] = {}
         for lbl, m in profile.labels.items():
@@ -327,14 +327,9 @@ async def active_profile():
     if not active_key:
         raise HTTPException(status_code=404, detail="No active profile found")
 
-    # Match by _profile_key (e.g. "creative:flux2-pro|qwen3.5-4b") → dict key (e.g. "creative_image")
-    profile = None
+    # active_key is now the PROFILES dict key (e.g. "gemma4_fp8_vllm")
+    profile = PROFILES.get(active_key)
     dict_key = active_key
-    for k, p in PROFILES.items():
-        if orchestrator._profile_key(p) == active_key:
-            profile = p
-            dict_key = k
-            break
 
     if not profile:
         raise HTTPException(status_code=404, detail=f"Active profile '{active_key}' not in registry")
@@ -388,7 +383,7 @@ async def chat_completions(request: AgentRequest):
 
     # 3. Check if swap is needed
     current_profile = orchestrator.active_profile or ""
-    target_key = orchestrator._profile_key(decision.profile)
+    target_key = orchestrator._registry_key(decision.profile)
     model_ready = orchestrator.is_model_ready(decision.target_model.container_name)
 
     if current_profile != target_key or not model_ready:
@@ -531,7 +526,7 @@ async def generate_image(request: ImageGenerationRequest):
     from gateway.config import PROFILE_CREATIVE_IMAGE, FLUX2_PRO
 
     current = orchestrator.active_profile or ""
-    target_key = orchestrator._profile_key(PROFILE_CREATIVE_IMAGE)
+    target_key = orchestrator._registry_key(PROFILE_CREATIVE_IMAGE)
     model_ready = orchestrator.is_model_ready(FLUX2_PRO.container_name)
 
     if current != target_key or not model_ready:
@@ -577,7 +572,7 @@ async def dalle_generate_image(request: Request):
 
     from gateway.config import PROFILE_CREATIVE_IMAGE, FLUX2_PRO
     current = orchestrator.active_profile or ""
-    target_key = orchestrator._profile_key(PROFILE_CREATIVE_IMAGE)
+    target_key = orchestrator._registry_key(PROFILE_CREATIVE_IMAGE)
     model_ready = orchestrator.is_model_ready(FLUX2_PRO.container_name)
     if current != target_key or not model_ready:
         force_swap = current == target_key and not model_ready
@@ -626,7 +621,7 @@ async def generate_video(request: VideoGenerationRequest):
     from gateway.config import PROFILE_CREATIVE_VIDEO, LTX_VIDEO_2
 
     current = orchestrator.active_profile or ""
-    target_key = orchestrator._profile_key(PROFILE_CREATIVE_VIDEO)
+    target_key = orchestrator._registry_key(PROFILE_CREATIVE_VIDEO)
     model_ready = orchestrator.is_model_ready(LTX_VIDEO_2.container_name)
 
     if current != target_key or not model_ready:

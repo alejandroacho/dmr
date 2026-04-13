@@ -60,6 +60,7 @@ class DockerBackend:
         volumes: dict[str, Any],
         port: int,
         shm_size: str = "16g",
+        entrypoint: list[str] | None = None,
     ) -> None:
         loop = asyncio.get_event_loop()
 
@@ -71,29 +72,33 @@ class DockerBackend:
             retries=3,
         )
 
+        run_kwargs: dict[str, Any] = dict(
+            image=image,
+            name=name,
+            command=command,
+            environment=environment,
+            volumes=volumes,
+            ports={f"{port}/tcp": port},
+            network=DOCKER_NETWORK,
+            detach=True,
+            dns=["8.8.8.8", "8.8.4.4"],
+            device_requests=[
+                docker.types.DeviceRequest(
+                    count=-1,
+                    capabilities=[["gpu"]],
+                )
+            ],
+            restart_policy={"Name": "unless-stopped"},
+            shm_size=shm_size,
+            healthcheck=healthcheck,
+        )
+        if entrypoint is not None:
+            run_kwargs["entrypoint"] = entrypoint
+
         try:
             await loop.run_in_executor(
                 None,
-                lambda: self._client.containers.run(
-                    image=image,
-                    name=name,
-                    command=command,
-                    environment=environment,
-                    volumes=volumes,
-                    ports={f"{port}/tcp": port},
-                    network=DOCKER_NETWORK,
-                    detach=True,
-                    dns=["8.8.8.8", "8.8.4.4"],
-                    device_requests=[
-                        docker.types.DeviceRequest(
-                            count=-1,
-                            capabilities=[["gpu"]],
-                        )
-                    ],
-                    restart_policy={"Name": "unless-stopped"},
-                    shm_size=shm_size,
-                    healthcheck=healthcheck,
-                ),
+                lambda: self._client.containers.run(**run_kwargs),
             )
             logger.info("Container '%s' created and started.", name)
         except APIError as exc:
