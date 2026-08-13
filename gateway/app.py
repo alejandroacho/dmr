@@ -15,7 +15,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -34,7 +34,7 @@ from gateway.config import (
 
 RAY_WATCHDOG_INTERVAL_S: int = int(os.getenv("RAY_WATCHDOG_INTERVAL_S", "30"))
 from gateway.backends import create_backend
-from gateway.orchestrator import ContainerOrchestrator, STATE_FILE
+from gateway.orchestrator import ContainerOrchestrator
 from gateway.proxy import InferenceProxy
 from gateway.request_buffer import (
     BufferOverflowError,
@@ -47,7 +47,6 @@ from gateway.schemas import (
     ContainerState,
     GatewayResponse,
     HealthResponse,
-    MediaType,
     ModelSlot,
     ProfileMode,
     ProfileDetail,
@@ -136,6 +135,7 @@ async def lifespan(app: FastAPI):
     logger.info("━━━ Shutting down Smart Gateway ━━━")
     await vram_monitor.stop()
     await inference_proxy.shutdown()
+    await orchestrator.aclose()
     logger.info("━━━ Gateway shut down successfully ━━━")
 
 
@@ -492,29 +492,15 @@ async def chat_completions(request: AgentRequest):
 
     elapsed = (time.time() - start_time) * 1000
 
-    # 5. If streaming, return SSE
+    # 5. If streaming, return SSE. The catalog is text-only, so the proxy
+    # always hands back an async iterator here — the image/video wrapper that
+    # used to follow was unreachable and has been removed.
     if request.stream:
-        if decision.media_type == MediaType.TEXT:
-            return StreamingResponse(
-                result,
-                media_type="text/event-stream",
-                headers={"X-Processing-Time-Ms": f"{elapsed:.1f}"},
-            )
-        # Non-text results (image/video): the client expects SSE but the
-        # backend returned a single JSON dict.  Wrap it as one SSE chunk
-        # so streaming parsers (OpenWebUI, etc.) can consume it.
-        if isinstance(result, dict) and result.get("object", "").startswith("chat.completion"):
-            import json as _json
-
-            async def _single_chunk_sse():
-                yield f"data: {_json.dumps(result)}\n\n".encode()
-                yield b"data: [DONE]\n\n"
-
-            return StreamingResponse(
-                _single_chunk_sse(),
-                media_type="text/event-stream",
-                headers={"X-Processing-Time-Ms": f"{elapsed:.1f}"},
-            )
+        return StreamingResponse(
+            result,
+            media_type="text/event-stream",
+            headers={"X-Processing-Time-Ms": f"{elapsed:.1f}"},
+        )
 
     # Log VRAM only for non-streaming requests (generator is complete at this point)
     vram = vram_monitor.latest
@@ -681,6 +667,8 @@ async def _execute_swap_and_drain(profile, force: bool = False) -> bool:
     try:
         success = await orchestrator.switch_profile(profile, force=force)
         if success:
+            # The processes just restarted; the ids they register may differ.
+            inference_proxy.forget_served_names()
             asyncio.create_task(_drain_buffered_requests())
         else:
             await request_buffer.reject_all("Swap failed")
@@ -690,8 +678,13 @@ async def _execute_swap_and_drain(profile, force: bool = False) -> bool:
         await request_buffer.reject_all(f"Swap error: {exc}")
         return False
     finally:
-        _active_swap_task = None
-        _active_swap_target = None
+        # Clear the tracking only if it still points at *this* task. A swap to
+        # a different profile may have replaced it while we ran; blanking that
+        # one would leave it untracked and let a later request start a second,
+        # redundant swap to the same target.
+        if _active_swap_task is asyncio.current_task():
+            _active_swap_task = None
+            _active_swap_target = None
 
 
 async def _handle_during_swap(request: AgentRequest):
@@ -750,19 +743,10 @@ async def _dispatch_to_backend(decision, request: AgentRequest) -> Any:
 
     The catalog is text-only, so there is a single dispatch path.
     """
-    payload = {
-        "messages": request.messages,
-        "temperature": request.temperature,
-        "max_tokens": request.max_tokens,
-        "stream": request.stream,
-    }
-    if request.tools:
-        payload["tools"] = request.tools
-    if request.tool_choice:
-        payload["tool_choice"] = request.tool_choice
-
     return await inference_proxy.chat_completion(
-        decision.target_model, payload, stream=request.stream
+        decision.target_model,
+        request.forwarded_params(),
+        stream=request.stream,
     )
 
 

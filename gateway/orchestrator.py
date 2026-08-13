@@ -18,6 +18,8 @@ import shlex
 import time
 from typing import Optional
 
+import aiohttp
+
 from gateway.backends.base import OrchestrationBackend
 from gateway.config import (
     EXEC_ENGINES,
@@ -38,7 +40,6 @@ from gateway.config import (
 )
 from gateway.schemas import (
     ContainerState,
-    ProfileMode,
     RayClusterStatus,
     RayStatus,
     SwapStrategy,
@@ -73,17 +74,28 @@ class ContainerOrchestrator:
         self._ray_status: Optional[RayStatus] = None
         self._ray_status_profile: Optional[str] = None
         self._ray_status_at: float = 0.0
+        self._health_http: Optional[aiohttp.ClientSession] = None
 
     # ──────────────── State persistence ────────────────
 
     def _persist_state(self) -> None:
-        """Write active profile to disk so restarts can resume it."""
+        """Write active profile to disk so restarts can resume it.
+
+        Written atomically. This box loses power without warning, and
+        truncating this file mid-write costs a silent fallback to the default
+        profile: `load_persisted_profile` swallows the parse error, so the
+        damage would show up as an unexplained model reload, not as an error.
+        """
         if not self._active_profile:
             return
+        tmp_path = f"{STATE_FILE}.tmp"
         try:
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-            with open(STATE_FILE, "w") as f:
+            with open(tmp_path, "w") as f:
                 json.dump({"active_profile": self._active_profile}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, STATE_FILE)
         except Exception as exc:
             logger.warning("Could not persist gateway state: %s", exc)
 
@@ -284,6 +296,17 @@ class ContainerOrchestrator:
             return True
 
         async with self._swap_lock:
+            # Re-check now that we hold the mutex: while queueing behind another
+            # swap, that swap may have already brought this very profile up.
+            # Without this, the second waiter tears it all down and reloads the
+            # weights again — minutes of work for no change.
+            if self._active_profile == registry_key and not force:
+                logger.info(
+                    "Profile '%s' became active while waiting for the swap lock, skipping.",
+                    profile_key,
+                )
+                return True
+
             self._swap_in_progress = True
             self._swap_start_time = time.time()
             strategy = get_swap_strategy()
@@ -580,18 +603,33 @@ class ContainerOrchestrator:
         engine: str = "vllm",
     ) -> bool:
         """HTTP healthcheck for an inference backend."""
-        import aiohttp
-
         host = self._backend.resolve_hostname(container_name, engine)
         url = f"http://{host}:{port}/health"
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=3)
-            ) as session:
-                async with session.get(url) as resp:
-                    return resp.status == 200
+            session = await self._health_session()
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=3)
+            ) as resp:
+                return resp.status == 200
         except Exception:
             return False
+
+    async def _health_session(self) -> aiohttp.ClientSession:
+        """Shared session for health polling.
+
+        This runs every few seconds per model from `_wait_all_ready` and the
+        watchdog. Building a ClientSession per probe means a new connector and
+        a fresh TCP handshake each time, and aiohttp warns against it.
+        """
+        if self._health_http is None or self._health_http.closed:
+            self._health_http = aiohttp.ClientSession()
+        return self._health_http
+
+    async def aclose(self) -> None:
+        """Release the shared health-check session."""
+        if self._health_http is not None and not self._health_http.closed:
+            await self._health_http.close()
+        self._health_http = None
 
     # ──────────── Workload Stop/Remove ────────────────
 

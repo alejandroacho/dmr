@@ -14,7 +14,7 @@ from gateway.config import (
     VRAMProfile,
     ModelDefinition,
 )
-from gateway.schemas import AgentRequest, MediaType, ProfileMode
+from gateway.schemas import AgentRequest, MediaType
 
 logger = logging.getLogger("gateway.router")
 
@@ -41,10 +41,12 @@ class SmartRouter:
         are resolved against it first so that requests using a label stay
         in the current profile whenever possible.
         """
-        requested = (request.model or "").strip()
+        # Lowercased: labels in the catalog are lowercase, so "Chat" used to
+        # miss and fall through to a full profile lookup.
+        requested = (request.model or "").strip().lower()
 
         # Try label resolution before anything else
-        if requested and requested not in ("auto", ""):
+        if requested and requested != "auto":
             resolved = self._resolve_label(requested, active_profile)
             if resolved:
                 profile, model = resolved
@@ -185,20 +187,6 @@ class SmartRouter:
         return best
 
     # ──────────── Helpers ──────────────────────────────
-
-    @staticmethod
-    def _extract_prompt_text(request: AgentRequest) -> str:
-        """Extracts the combined text from the agent's messages."""
-        parts: list[str] = []
-        for msg in request.messages:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                parts.append(content)
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-        return " ".join(parts)
 
     @staticmethod
     def _resolve_label(

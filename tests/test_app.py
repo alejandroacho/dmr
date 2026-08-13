@@ -261,6 +261,71 @@ class TestRayWatchdog:
 
 
 # ──────────────────────────────────────────────────────
+#  Sampling parameter passthrough
+# ──────────────────────────────────────────────────────
+
+class TestForwardedParams:
+    """The gateway used to forward only messages/temperature/max_tokens/
+    stream/tools, silently dropping everything else a client sent."""
+
+    def test_forwards_declared_sampling_params(self):
+        from gateway.schemas import AgentRequest
+
+        req = AgentRequest(
+            model="deepseek-v4-flash",
+            messages=[{"role": "user", "content": "hi"}],
+            top_p=0.9,
+            stop=["\n\n"],
+            seed=42,
+            presence_penalty=0.5,
+        )
+        params = req.forwarded_params()
+
+        assert params["top_p"] == 0.9
+        assert params["stop"] == ["\n\n"]
+        assert params["seed"] == 42
+        assert params["presence_penalty"] == 0.5
+
+    def test_forwards_unknown_openai_params(self):
+        from gateway.schemas import AgentRequest
+
+        req = AgentRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            response_format={"type": "json_object"},
+            logit_bias={"123": -100},
+        )
+        params = req.forwarded_params()
+
+        assert params["response_format"] == {"type": "json_object"}
+        assert params["logit_bias"] == {"123": -100}
+
+    def test_omits_gateway_only_fields(self):
+        from gateway.schemas import AgentRequest
+
+        req = AgentRequest(
+            model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            agent_id="agent-3",
+            priority=9,
+        )
+        params = req.forwarded_params()
+
+        # The proxy sets "model" itself to the served-model-name.
+        for field in ("model", "agent_id", "priority", "media_type", "media_params"):
+            assert field not in params
+
+    def test_omits_unset_optionals(self):
+        """vLLM should apply its own defaults, not receive explicit nulls."""
+        from gateway.schemas import AgentRequest
+
+        params = AgentRequest(messages=[{"role": "user", "content": "hi"}]).forwarded_params()
+
+        assert "top_p" not in params
+        assert "seed" not in params
+        assert params["temperature"] == 0.7  # declared defaults still travel
+
+
+# ──────────────────────────────────────────────────────
 #  Profile status endpoint
 # ──────────────────────────────────────────────────────
 
@@ -444,6 +509,22 @@ class TestModelListing:
 
 class TestLabelRouting:
 
+    def test_label_lookup_is_case_insensitive(self):
+        """Regression: labels in the catalog are lowercase, so a client sending
+        model="Chat" missed the alias and fell through to a profile lookup."""
+        from gateway.router import SmartRouter
+        from gateway.schemas import AgentRequest
+        from tests.conftest import TEST_PROFILE_B, TEST_MODEL_C
+
+        router = SmartRouter()
+        decision = router.route(
+            AgentRequest(model="Chat", messages=[{"role": "user", "content": "hi"}]),
+            active_profile=TEST_PROFILE_B,
+        )
+
+        assert decision.target_model is TEST_MODEL_C
+        assert decision.profile is TEST_PROFILE_B
+
     @pytest.mark.asyncio
     async def test_chat_label_stays_in_current_profile(self, client):
         """model='chat' should NOT trigger a swap — it resolves within active profile."""
@@ -548,13 +629,10 @@ class TestSwapTaskManagement:
             app_module.orchestrator.switch_profile = original_switch
 
     @pytest.mark.asyncio
-    async def test_execute_swap_and_drain_clears_state(self):
-        """After _execute_swap_and_drain completes, tracking vars should be None."""
+    async def test_execute_swap_and_drain_clears_its_own_state(self):
+        """A swap task clears the tracking vars it owns when it finishes."""
         import gateway.app as app_module
         from tests.conftest import TEST_PROFILE_A
-
-        app_module._active_swap_task = MagicMock()
-        app_module._active_swap_target = "some_target"
 
         original_switch = app_module.orchestrator.switch_profile
         app_module.orchestrator.switch_profile = AsyncMock(return_value=True)
@@ -562,12 +640,52 @@ class TestSwapTaskManagement:
         app_module._drain_buffered_requests = AsyncMock()
 
         try:
-            result = await app_module._execute_swap_and_drain(TEST_PROFILE_A)
+            # Registered the way production does it, so the task can recognise
+            # itself as the owner of the tracking vars.
+            task = asyncio.create_task(
+                app_module._execute_swap_and_drain(TEST_PROFILE_A)
+            )
+            app_module._active_swap_task = task
+            app_module._active_swap_target = "test_a"
 
-            assert result is True
+            assert await task is True
             assert app_module._active_swap_task is None
             assert app_module._active_swap_target is None
         finally:
+            app_module.orchestrator.switch_profile = original_switch
+            app_module._drain_buffered_requests = original_drain
+
+    @pytest.mark.asyncio
+    async def test_finishing_swap_does_not_clear_a_newer_swaps_state(self):
+        """Regression: the finally block used to blank the tracking vars
+        unconditionally. When a swap to another profile had replaced them, the
+        newer swap was left untracked and a later request started a second,
+        redundant swap to the same target."""
+        import gateway.app as app_module
+        from tests.conftest import TEST_PROFILE_A
+
+        original_switch = app_module.orchestrator.switch_profile
+        app_module.orchestrator.switch_profile = AsyncMock(return_value=True)
+        original_drain = app_module._drain_buffered_requests
+        app_module._drain_buffered_requests = AsyncMock()
+
+        try:
+            old_task = asyncio.create_task(
+                app_module._execute_swap_and_drain(TEST_PROFILE_A)
+            )
+            # A swap to a different profile takes over the tracking slot while
+            # the first one is still finishing.
+            newer_task = MagicMock()
+            app_module._active_swap_task = newer_task
+            app_module._active_swap_target = "test_b"
+
+            await old_task
+
+            assert app_module._active_swap_task is newer_task
+            assert app_module._active_swap_target == "test_b"
+        finally:
+            app_module._active_swap_task = None
+            app_module._active_swap_target = None
             app_module.orchestrator.switch_profile = original_switch
             app_module._drain_buffered_requests = original_drain
 

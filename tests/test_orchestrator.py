@@ -464,3 +464,56 @@ class TestEnsureNetwork:
 
         orch._backend.ensure_network.assert_called_once_with("vllm-test-a")
         assert orch._container_states[TEST_MODEL_A.container_name] == ContainerState.STARTING
+
+
+# ──────────────────────────────────────────────────────
+#  Swap deduplication under the mutex
+# ──────────────────────────────────────────────────────
+
+class TestSwapRecheckUnderLock:
+
+    @staticmethod
+    def _stub_lifecycle(orch):
+        """Stub the slow parts so only the swap control flow is exercised."""
+        orch._teardown_current = AsyncMock()
+        orch._ensure_container_running = AsyncMock()
+        orch._wait_all_ready = AsyncMock()
+
+    @pytest.mark.asyncio
+    async def test_second_waiter_skips_a_swap_already_done_for_it(
+        self, mock_vram_monitor
+    ):
+        """Regression: the "already active" check only ran before acquiring the
+        mutex. A swap queued behind another swap to the SAME profile went ahead
+        and tore the model down to reload identical weights — minutes of work
+        for no change."""
+        orch = _make_orchestrator(mock_vram_monitor)
+        self._stub_lifecycle(orch)
+        set_vram_free(mock_vram_monitor, 131072)
+
+        first = asyncio.create_task(orch.switch_profile(TEST_PROFILE_A))
+        # Let the first swap take the lock before the second queues behind it.
+        await asyncio.sleep(0)
+        second = asyncio.create_task(orch.switch_profile(TEST_PROFILE_A))
+
+        assert await first is True
+        assert await second is True
+
+        assert orch._ensure_container_running.await_count == len(
+            TEST_PROFILE_A.primary_models + TEST_PROFILE_A.secondary_models
+        ), "the queued swap reloaded the model again"
+        assert orch._active_profile == orch._registry_key(TEST_PROFILE_A)
+
+    @pytest.mark.asyncio
+    async def test_force_still_reruns_the_swap(self, mock_vram_monitor):
+        """force=True must survive the new re-check: it exists precisely to
+        restart a profile that is already marked active but is unhealthy."""
+        orch = _make_orchestrator(mock_vram_monitor)
+        self._stub_lifecycle(orch)
+        set_vram_free(mock_vram_monitor, 131072)
+
+        assert await orch.switch_profile(TEST_PROFILE_A) is True
+        orch._ensure_container_running.reset_mock()
+
+        assert await orch.switch_profile(TEST_PROFILE_A, force=True) is True
+        assert orch._ensure_container_running.await_count >= 1

@@ -31,6 +31,10 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: blackwell-gateway
+    # The box has no UPS and has already been cut off mid-request. Without
+    # this the Gateway stays down after a power loss (it exited 255 and never
+    # came back), while ray-node-head returned on its own restart policy.
+    restart: unless-stopped
     ports:
       - "8000:8000"
     deploy:

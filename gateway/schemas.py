@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import time
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ──────────────────────────── Enums ────────────────────────────
@@ -89,7 +89,14 @@ class AgentRequest(BaseModel):
     """
     Unified request structure for the 9 agents.
     Compatible with the OpenAI Chat Completions API.
+
+    Unknown fields are kept rather than dropped: clients send a long tail of
+    sampling parameters (`logit_bias`, `response_format`, `n`, …) and silently
+    discarding them makes the backend answer a subtly different question than
+    the one that was asked. `forwarded_params()` hands them to vLLM.
     """
+    model_config = ConfigDict(extra="allow")
+
     model: str = "auto"
     messages: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -100,6 +107,13 @@ class AgentRequest(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 4096
     stream: bool = False
+    # Common sampling parameters, declared so they are validated rather than
+    # passed through blind.
+    top_p: float | None = None
+    stop: str | list[str] | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    seed: int | None = None
     # Extended fields for multimedia
     media_type: MediaType = MediaType.TEXT
     media_params: dict[str, Any] | None = Field(
@@ -117,6 +131,21 @@ class AgentRequest(BaseModel):
         le=10,
         description="Request priority (1=low, 10=critical)",
     )
+
+    # Gateway-internal: meaningless to the inference backend, so never forwarded.
+    _GATEWAY_ONLY = frozenset(
+        {"model", "media_type", "media_params", "agent_id", "priority"}
+    )
+
+    def forwarded_params(self) -> dict[str, Any]:
+        """Everything the backend should receive, minus gateway-only fields.
+
+        Unset optionals are omitted entirely so vLLM applies its own defaults
+        instead of receiving explicit nulls.
+        """
+        params = self.model_dump(exclude_none=True, exclude=set(self._GATEWAY_ONLY))
+        params.update(self.model_extra or {})
+        return params
 
 
 class ImageGenerationRequest(BaseModel):

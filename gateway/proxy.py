@@ -37,6 +37,8 @@ class InferenceProxy:
     ):
         self._session: aiohttp.ClientSession | None = None
         self._resolve = hostname_resolver or self._default_resolve
+        # Served-model-name per model, discovered from the backend.
+        self._served_names: dict[str, str] = {}
 
     @staticmethod
     def _default_resolve(name: str, engine: str) -> str:
@@ -72,8 +74,7 @@ class InferenceProxy:
         Retries on transient connection errors (model still loading).
         """
         url = f"http://{self._backend_host(model)}:{model.port}/v1/chat/completions"
-        # Use the served-model-name registered via --served-model-name
-        payload["model"] = model.name
+        payload["model"] = await self._served_model_name(model)
 
         if stream:
             return self._stream_response(url, payload)
@@ -152,6 +153,10 @@ class InferenceProxy:
         payload.setdefault("stream_options", {"include_usage": True})
         last_exc: Exception | None = None
         last_log: float = 0.0
+        # Retrying is only safe until the first chunk reaches the client:
+        # re-POSTing after that would replay the completion from the start and
+        # the client would see the answer twice, concatenated.
+        sent_any = False
 
         for attempt in range(1, self.CONNECT_RETRIES + 1):
             try:
@@ -177,6 +182,7 @@ class InferenceProxy:
                                             last_usage = data["usage"]
                             except Exception:
                                 pass
+                        sent_any = True
                         yield chunk
 
                     elapsed = (time.time() - stream_start) * 1000
@@ -201,6 +207,15 @@ class InferenceProxy:
 
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 last_exc = exc
+                if sent_any:
+                    # Mid-stream failure. The client already holds part of the
+                    # answer, so surface the break instead of replaying it.
+                    logger.error("Stream to %s broke after partial output: %s", url, exc)
+                    error_event = _json.dumps(
+                        {"error": {"message": f"Stream interrupted: {exc}", "code": 502}}
+                    )
+                    yield f"data: {error_event}\n\n".encode()
+                    return
                 now = time.time()
                 if attempt < self.CONNECT_RETRIES:
                     if now - last_log >= RETRY_LOG_INTERVAL_S:
@@ -216,6 +231,57 @@ class InferenceProxy:
         logger.error("Streaming connection error after %d retries: %s", self.CONNECT_RETRIES, last_exc)
         error_event = _json.dumps({"error": {"message": str(last_exc), "code": 502}})
         yield f"data: {error_event}\n\n".encode()
+
+    # ──────────── Served model name resolution ───────
+
+    async def _served_model_name(self, model: ModelDefinition) -> str:
+        """The id this backend actually answers to, cached per model.
+
+        The Gateway starts `vllm serve` with `--served-model-name <name>`, but
+        it also adopts processes started by the cluster launcher, whose recipes
+        do not pass that flag — vLLM then registers the bare HuggingFace id and
+        every request for `<name>` comes back 404. Asking the backend removes
+        the guesswork in both directions.
+        """
+        cached = self._served_names.get(model.name)
+        if cached:
+            return cached
+
+        url = f"http://{self._backend_host(model)}:{model.port}/v1/models"
+        try:
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    ids = [m["id"] for m in (await resp.json()).get("data", [])]
+                    # Prefer the configured name when the backend offers it,
+                    # so a correctly-started process keeps its stable alias.
+                    served = model.name if model.name in ids else (ids[0] if ids else None)
+                    if served:
+                        if served != model.name:
+                            logger.info(
+                                "Backend for '%s' serves as '%s' — using that.",
+                                model.name, served,
+                            )
+                        self._served_names[model.name] = served
+                        return served
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError, KeyError) as exc:
+            logger.debug("Could not read served model name for '%s': %s", model.name, exc)
+
+        # Backend not up yet: fall back to the configured name without caching,
+        # so the next call re-resolves once it is.
+        return model.name
+
+    def forget_served_names(self, model_name: str | None = None) -> None:
+        """Drop cached ids so they are re-resolved.
+
+        Call after a swap: the restarted process may register a different id
+        than the one it answered to before.
+        """
+        if model_name is None:
+            self._served_names.clear()
+        else:
+            self._served_names.pop(model_name, None)
 
     # ──────────── Generic Healthcheck ────────────────
 

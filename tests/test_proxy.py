@@ -227,3 +227,115 @@ class TestStreamRetry:
         assert "data:" in decoded
         error_data = json.loads(decoded.split("data: ")[1].strip())
         assert error_data["error"]["code"] == 502
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_failure_is_not_replayed(self):
+        """Regression: retrying after chunks were already yielded re-POSTed the
+        request, so the client received the completion twice, concatenated.
+        Once output is in flight the only safe move is to report the break."""
+        proxy = _make_proxy()
+        call_count = 0
+
+        class BreakingStream:
+            def __init__(self):
+                self.status = 200
+                self.content = self
+
+            async def iter_any(self):
+                yield b'data: {"choices":[{"delta":{"content":"Hola"}}]}\n\n'
+                raise aiohttp.ServerDisconnectedError()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        def _break_midway(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return BreakingStream()
+
+        proxy._session.post = _break_midway
+
+        chunks = []
+        async for chunk in proxy._stream_response(
+            "http://fake:8001/v1/chat/completions", {"messages": []}
+        ):
+            chunks.append(chunk)
+
+        assert call_count == 1, "must not re-POST once output has been sent"
+        assert b"Hola" in chunks[0]
+        assert chunks.count(chunks[0]) == 1, "content must not be duplicated"
+        error = json.loads(chunks[-1].decode().split("data: ")[1].strip())
+        assert error["error"]["code"] == 502
+        assert "interrupted" in error["error"]["message"].lower()
+
+
+# ──────────────────────────────────────────────────────
+#  Served-model-name resolution
+# ──────────────────────────────────────────────────────
+
+class TestServedModelName:
+    """The Gateway also adopts serve processes started by the cluster
+    launcher, whose recipes pass no --served-model-name. vLLM then registers
+    the bare HuggingFace id and every request 404s."""
+
+    @pytest.mark.asyncio
+    async def test_uses_backend_id_when_configured_name_is_absent(self):
+        proxy = _make_proxy()
+        proxy._session.get = MagicMock(
+            return_value=FakeResponse(
+                status=200,
+                json_data={"data": [{"id": "deepseek-ai/DeepSeek-V4-Flash-0731"}]},
+            )
+        )
+
+        name = await proxy._served_model_name(TEST_MODEL_A)
+        assert name == "deepseek-ai/DeepSeek-V4-Flash-0731"
+
+    @pytest.mark.asyncio
+    async def test_prefers_configured_name_when_backend_offers_it(self):
+        proxy = _make_proxy()
+        proxy._session.get = MagicMock(
+            return_value=FakeResponse(
+                status=200,
+                json_data={"data": [{"id": "other"}, {"id": TEST_MODEL_A.name}]},
+            )
+        )
+
+        assert await proxy._served_model_name(TEST_MODEL_A) == TEST_MODEL_A.name
+
+    @pytest.mark.asyncio
+    async def test_result_is_cached_and_forgettable(self):
+        proxy = _make_proxy()
+        calls = 0
+
+        def _get(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return FakeResponse(status=200, json_data={"data": [{"id": "hf/id"}]})
+
+        proxy._session.get = _get
+
+        assert await proxy._served_model_name(TEST_MODEL_A) == "hf/id"
+        assert await proxy._served_model_name(TEST_MODEL_A) == "hf/id"
+        assert calls == 1, "should not re-query the backend on every request"
+
+        proxy.forget_served_names()
+        assert await proxy._served_model_name(TEST_MODEL_A) == "hf/id"
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_unreachable_backend_falls_back_without_caching(self):
+        """While the model is still loading /v1/models refuses connections;
+        caching that answer would pin the wrong name for the whole run."""
+        proxy = _make_proxy()
+
+        def _fail(*args, **kwargs):
+            raise OSError("connection refused")
+
+        proxy._session.get = _fail
+
+        assert await proxy._served_model_name(TEST_MODEL_A) == TEST_MODEL_A.name
+        assert proxy._served_names == {}

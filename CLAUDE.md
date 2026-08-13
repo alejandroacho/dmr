@@ -51,7 +51,7 @@ The Gateway is a FastAPI middleware layer that routes requests from 9 external a
 2. **`gateway/router.py`** (`SmartRouter`) — Detects media type (text/image/video) from explicit fields, `tool_choice`, or prompt keywords. Selects the VRAM profile and target model.
 3. **`gateway/orchestrator.py`** (`ContainerOrchestrator`) — If the required profile differs from the active one, performs a container swap via the Docker SDK. Swap strategy is `pause/unpause` (fast, ~1-2s) for ≥512 GB RAM, otherwise `stop/start` (~3-5s).
 4. **`gateway/proxy.py`** (`InferenceProxy`) — Proxies the request to the backend container via `aiohttp`. Handles text (OpenAI-compatible), image (ComfyUI), and video (Diffusers) backends.
-5. **`gateway/request_buffer.py`** (`RequestBuffer`, `RadixPrefixCache`) — Holds incoming requests in an asyncio queue during swaps (long polling). `RadixPrefixCache` hashes system prompt prefixes to hint vLLM's prefix caching.
+5. **`gateway/request_buffer.py`** (`RequestBuffer`, `RadixPrefixCache`) — **Currently unwired.** The queue was superseded by the shielded-swap-task path in `chat_completions`, which holds the connection open and dispatches once the swap resolves. Nothing calls `enqueue()` in production (its only caller, `_handle_during_swap`, is itself unreferenced), so `drain_all()`/`reject_all()` always operate on an empty queue and `/status/swap` reports `queued_requests: 0` unconditionally. `RadixPrefixCache` is likewise decorative: `chat_completions` computes the prefix hash and discards it — the hint is never sent to vLLM, which does its own prefix caching. Wire them or delete them, but do not trust them as-is.
 
 ### Profile and model configuration
 
