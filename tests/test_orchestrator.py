@@ -97,7 +97,7 @@ class TestProfileClaimedAfterHealthcheck:
         assert result is True
         assert profile_during_wait is None
         assert orch._active_profile is not None
-        assert "gpt-oss-120b" in orch._active_profile
+        assert orch._active_profile == orch._registry_key(PROFILE_FOCUS)
 
     @pytest.mark.asyncio
     async def test_profile_set_even_on_healthcheck_timeout(self, mock_vram_monitor):
@@ -288,7 +288,7 @@ class TestSwapMutex:
     @pytest.mark.asyncio
     async def test_skip_if_same_profile(self, mock_vram_monitor):
         orch = _make_orchestrator(mock_vram_monitor)
-        orch._active_profile = orch._profile_key(PROFILE_FOCUS)
+        orch._active_profile = orch._registry_key(PROFILE_FOCUS)
         orch._teardown_current = AsyncMock()
 
         result = await orch.switch_profile(PROFILE_FOCUS)

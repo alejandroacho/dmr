@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from gateway import __version__
 from gateway.config import (
     ALL_MODELS,
+    EXEC_ENGINES,
     GATEWAY_HOST,
     GATEWAY_PORT,
     GATEWAY_PUBLIC_URL,
@@ -65,6 +66,10 @@ from gateway.vram_monitor import VRAMMonitor
 
 # ──────────────────── Swap Task Tracking ───────────────
 # Prevents duplicate swaps and shields from cancellation.
+# INVARIANT: reads and writes to the pair below must never straddle an
+# `await`. `_get_or_create_swap_task` and `_execute_swap_and_drain`'s
+# `finally` are both single-shot critical sections — the asyncio loop's
+# single-thread guarantee is what serializes them.
 
 _active_swap_task: asyncio.Task | None = None
 _active_swap_target: str | None = None
@@ -154,12 +159,15 @@ async def _ray_watchdog_loop() -> None:
                 for model in ALL_MODELS:
                     if model.engine == "ray_vllm":
                         orchestrator._container_states[model.container_name] = ContainerState.ERROR
-                continue
+                # spark_cluster models live in their own containers and do not
+                # depend on the Ray head, so keep checking them below.
 
             active_profile = orchestrator.active_vram_profile
             if active_profile:
                 for model in active_profile.primary_models + active_profile.secondary_models:
-                    if model.engine != "ray_vllm":
+                    if model.engine not in EXEC_ENGINES:
+                        continue
+                    if model.engine == "ray_vllm" and ray_head is None:
                         continue
                     healthy = await orchestrator._check_vllm_health(
                         model.container_name, model.port, model.engine
@@ -168,8 +176,8 @@ async def _ray_watchdog_loop() -> None:
                         model.container_name
                     ) == ContainerState.READY:
                         logger.error(
-                            "WATCHDOG: ray_vllm '%s' (port %d) failed health check. Marking ERROR.",
-                            model.name, model.port,
+                            "WATCHDOG: %s '%s' (port %d) failed health check. Marking ERROR.",
+                            model.engine, model.name, model.port,
                         )
                         orchestrator._container_states[model.container_name] = ContainerState.ERROR
         except asyncio.CancelledError:
@@ -221,7 +229,11 @@ async def health():
     profile_name = orchestrator.active_profile
     mode = None
     if profile_name:
-        mode = ProfileMode.FOCUS if "focus" in profile_name else ProfileMode.CREATIVE
+        # Read the declared mode instead of guessing from the key: profiles
+        # like "qwen36", "gemma4" or "deepseek" are FOCUS but have no "focus"
+        # in their name, and were all reported as CREATIVE.
+        profile = PROFILES.get(profile_name)
+        mode = profile.mode if profile else None
 
     return HealthResponse(
         status="ok" if report.healthy else "degraded",
@@ -281,37 +293,46 @@ async def profile_status():
     )
 
 
+def _build_profile_detail(key: str, profile, is_active: bool) -> ProfileDetail:
+    """Assemble a ProfileDetail from a registry entry.
+
+    Inactive profiles report their models as STOPPED even if a container
+    from a prior profile is still lingering — the profile-level view is
+    what the caller is asking for.
+    """
+    label_by_container = {m.container_name: lbl for lbl, m in profile.labels.items()}
+
+    slots: list[ModelSlot] = []
+    for m in profile.primary_models + profile.secondary_models:
+        state = (
+            orchestrator.container_states.get(m.container_name, ContainerState.STOPPED)
+            if is_active
+            else ContainerState.STOPPED
+        )
+        slot = m.to_slot(state)
+        slot.label = label_by_container.get(m.container_name, "")
+        slots.append(slot)
+
+    return ProfileDetail(
+        key=key,
+        mode=profile.mode,
+        description=profile.description,
+        total_vram_required_mb=profile.total_vram_required_mb,
+        is_active=is_active,
+        models=slots,
+    )
+
+
 @app.get("/v1/profiles", response_model=ProfilesOverviewResponse, tags=["System"])
 async def list_profiles():
     """Lists all available VRAM profiles and their models."""
-    from gateway.config import PROFILES, ALL_MODELS
+    from gateway.config import PROFILES
 
     active_key = orchestrator.active_profile
-
-    details: list[ProfileDetail] = []
-    for key, profile in PROFILES.items():
-        is_active = (key == active_key)
-        # Build label map for this profile
-        label_by_container: dict[str, str] = {}
-        for lbl, m in profile.labels.items():
-            label_by_container[m.container_name] = lbl
-
-        slots: list[ModelSlot] = []
-        for m in profile.primary_models + profile.secondary_models:
-            state = orchestrator.container_states.get(m.container_name, ContainerState.STOPPED)
-            slot = m.to_slot(state if is_active else ContainerState.STOPPED)
-            slot.label = label_by_container.get(m.container_name, "")
-            slots.append(slot)
-
-        details.append(ProfileDetail(
-            key=key,
-            mode=profile.mode,
-            description=profile.description,
-            total_vram_required_mb=profile.total_vram_required_mb,
-            is_active=is_active,
-            models=slots,
-        ))
-
+    details = [
+        _build_profile_detail(key, profile, is_active=(key == active_key))
+        for key, profile in PROFILES.items()
+    ]
     return ProfilesOverviewResponse(
         active_profile=active_key,
         profiles=details,
@@ -327,32 +348,14 @@ async def active_profile():
     if not active_key:
         raise HTTPException(status_code=404, detail="No active profile found")
 
-    # active_key is now the PROFILES dict key (e.g. "gemma4_fp8_vllm")
     profile = PROFILES.get(active_key)
-    dict_key = active_key
-
     if not profile:
-        raise HTTPException(status_code=404, detail=f"Active profile '{active_key}' not in registry")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Active profile '{active_key}' not in registry",
+        )
 
-    label_by_container: dict[str, str] = {}
-    for lbl, m in profile.labels.items():
-        label_by_container[m.container_name] = lbl
-
-    slots: list[ModelSlot] = []
-    for m in profile.primary_models + profile.secondary_models:
-        state = orchestrator.container_states.get(m.container_name, ContainerState.STOPPED)
-        slot = m.to_slot(state)
-        slot.label = label_by_container.get(m.container_name, "")
-        slots.append(slot)
-
-    return ProfileDetail(
-        key=dict_key,
-        mode=profile.mode,
-        description=profile.description,
-        total_vram_required_mb=profile.total_vram_required_mb,
-        is_active=True,
-        models=slots,
-    )
+    return _build_profile_detail(active_key, profile, is_active=True)
 
 
 @app.get("/status/cache", tags=["System"])

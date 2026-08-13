@@ -85,6 +85,18 @@ class TestHealthEndpoint:
         data = resp.json()
         assert "vram" in data
 
+    @pytest.mark.asyncio
+    async def test_health_reports_declared_mode_not_key_substring(
+        self, client, patched_app
+    ):
+        """Regression: the mode used to be guessed with `"focus" in key`, so
+        FOCUS profiles without "focus" in their name reported as CREATIVE."""
+        import gateway.app as app_module
+
+        app_module.orchestrator._active_profile = "deepseek"
+        resp = await client.get("/health")
+        assert resp.json()["active_profile"] == "focus"
+
 
 # ──────────────────────────────────────────────────────
 #  Swap status endpoint
@@ -146,7 +158,7 @@ class TestChatCompletionsSwap:
         from gateway.config import PROFILE_FOCUS, GPT_OSS_120B
 
         # Set active profile to focus with model READY
-        key = app_module.orchestrator._profile_key(PROFILE_FOCUS)
+        key = app_module.orchestrator._registry_key(PROFILE_FOCUS)
         app_module.orchestrator._active_profile = key
         app_module.orchestrator._container_states[GPT_OSS_120B.container_name] = (
             ContainerState.READY
@@ -192,7 +204,7 @@ class TestModelListing:
         import gateway.app as app_module
         from gateway.config import PROFILE_FOCUS
 
-        key = app_module.orchestrator._profile_key(PROFILE_FOCUS)
+        key = app_module.orchestrator._registry_key(PROFILE_FOCUS)
         app_module.orchestrator._active_profile = key
 
         resp = await client.get("/v1/models")
@@ -210,7 +222,7 @@ class TestModelListing:
         import gateway.app as app_module
         from gateway.config import PROFILE_FOCUS_CODE
 
-        key = app_module.orchestrator._profile_key(PROFILE_FOCUS_CODE)
+        key = app_module.orchestrator._registry_key(PROFILE_FOCUS_CODE)
         app_module.orchestrator._active_profile = key
 
         resp = await client.get("/v1/models")
@@ -238,7 +250,7 @@ class TestLabelRouting:
         import gateway.app as app_module
         from gateway.config import PROFILE_FOCUS_CODE, QWEN3_5_4B
 
-        key = app_module.orchestrator._profile_key(PROFILE_FOCUS_CODE)
+        key = app_module.orchestrator._registry_key(PROFILE_FOCUS_CODE)
         app_module.orchestrator._active_profile = key
         app_module.orchestrator._container_states[QWEN3_5_4B.container_name] = (
             ContainerState.READY
@@ -264,7 +276,7 @@ class TestLabelRouting:
         import gateway.app as app_module
         from gateway.config import PROFILE_FOCUS, GPT_OSS_120B
 
-        key = app_module.orchestrator._profile_key(PROFILE_FOCUS)
+        key = app_module.orchestrator._registry_key(PROFILE_FOCUS)
         app_module.orchestrator._active_profile = key
         app_module.orchestrator._container_states[GPT_OSS_120B.container_name] = (
             ContainerState.READY

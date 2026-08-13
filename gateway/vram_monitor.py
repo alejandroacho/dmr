@@ -1,15 +1,25 @@
 """
 VRAM monitoring module.
-Queries GPU state via NVML (pynvml) and generates GPU status reports.
+Queries GPU state via NVML (nvidia-ml-py) and generates GPU status reports.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import warnings
 from typing import Optional
 
-import pynvml
+# The `nvidia-ml-py` package exposes its module as `pynvml`. A legacy
+# `pynvml` shim installs a redirector that emits a FutureWarning on import
+# — suppress it since we already depend on the recommended package.
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*pynvml package is deprecated.*",
+        category=FutureWarning,
+    )
+    import pynvml  # noqa: E402
 
 from gateway.schemas import GPUInfo, VRAMReport
 from gateway.config import VRAM_POLL_INTERVAL_S, VRAM_SAFETY_MARGIN_MB, SYSTEM_RAM_GB

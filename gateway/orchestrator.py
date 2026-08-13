@@ -10,6 +10,7 @@ OrchestrationBackend (Docker or Kubernetes).
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -19,8 +20,14 @@ from typing import Optional
 
 from gateway.backends.base import OrchestrationBackend
 from gateway.config import (
+    EXEC_ENGINES,
     MODELS_PATH,
     RAY_HEAD_HOST,
+    SPARK_CLUSTER_CONTAINER,
+    SPARK_MASTER_PORT,
+    SPARK_SSH_KEY,
+    SPARK_SSH_USER,
+    SPARK_WORKER_HOSTS,
     SWAP_TIMEOUT_S,
     RETRY_LOG_INTERVAL_S,
     ALL_MODELS,
@@ -122,6 +129,12 @@ class ContainerOrchestrator:
         ray_cleaned = False
 
         for model in ALL_MODELS:
+            if model.engine == "spark_cluster":
+                # Never remove the cluster container: launch-cluster.sh owns it
+                # (and applies the mods it needs). Only kill a stale serve.
+                await self._stop_spark_serve(model)
+                continue
+
             if model.engine == "ray_vllm":
                 if not ray_cleaned:
                     await self._kill_all_ray_vllm()
@@ -151,9 +164,11 @@ class ContainerOrchestrator:
         """
         # Build a map of container_name → status for all known models
         running: dict[str, str] = {}
+        exec_managed: set[str] = set()
         for model in ALL_MODELS:
             name = model.container_name
-            if model.engine == "ray_vllm":
+            if model.engine in EXEC_ENGINES:
+                exec_managed.add(name)
                 healthy = await self._check_vllm_health(name, model.port, model.engine)
                 if healthy:
                     running[name] = "running"
@@ -183,7 +198,10 @@ class ContainerOrchestrator:
                         if status == "running"
                         else ContainerState.STARTING
                     )
-                    source = "Ray cluster" if model.engine == "ray_vllm" else "backend"
+                    source = {
+                        "ray_vllm": "Ray cluster",
+                        "spark_cluster": "Spark cluster",
+                    }.get(model.engine, "backend")
                     logger.info(
                         "Autodetect: adopted '%s' (%s, status: %s).",
                         name, source, status,
@@ -192,6 +210,20 @@ class ContainerOrchestrator:
                 # Remove workloads that don't belong to this profile
                 orphans = set(running) - required
                 for name in orphans:
+                    if name in exec_managed:
+                        # The container is shared infrastructure (Ray head or
+                        # Spark cluster node) — removing it would tear down the
+                        # cluster. Stop the serve process instead.
+                        orphan_def = next(
+                            (m for m in ALL_MODELS if m.container_name == name), None
+                        )
+                        if orphan_def is not None:
+                            await self._stop_exec_model(orphan_def)
+                        logger.info(
+                            "Autodetect: stopped orphan process for '%s' "
+                            "(container preserved).", name,
+                        )
+                        continue
                     await self._backend.remove_workload(name)
                     logger.info("Autodetect: removed orphan '%s'.", name)
 
@@ -246,29 +278,13 @@ class ContainerOrchestrator:
                 await self._teardown_current(strategy, preserve=target_names)
 
                 # 2. Verify available VRAM
-                vram_report = await self._vram.query_gpus()
-                needed = target_profile.total_vram_required_mb
                 if target_profile.skip_vram_check:
                     logger.info("Skipping VRAM check for Ray cluster profile '%s'.", profile_key)
-                elif not self._vram.has_enough_vram(needed, vram_report):
-                    logger.warning(
-                        "Insufficient VRAM (%d MB free, %d MB required). "
-                        "Forcing deep cleanup...",
-                        vram_report.total_free_mb, needed,
+                else:
+                    await self._ensure_vram_available(
+                        target_profile.total_vram_required_mb,
+                        target_names,
                     )
-                    await self._teardown_current(SwapStrategy.STOP_START, preserve=target_names)
-
-                    for _attempt in range(15):
-                        await asyncio.sleep(1)
-                        vram_report = await self._vram.query_gpus()
-                        if self._vram.has_enough_vram(needed, vram_report):
-                            logger.info("VRAM freed: %d MB available.", vram_report.total_free_mb)
-                            break
-                    else:
-                        logger.warning(
-                            "VRAM still not fully freed after 15s (%d MB free). Proceeding anyway...",
-                            vram_report.total_free_mb,
-                        )
 
                 # 3. Start workloads for the target profile
                 for model_def in all_models:
@@ -305,6 +321,40 @@ class ContainerOrchestrator:
             finally:
                 self._swap_in_progress = False
 
+    async def _ensure_vram_available(
+        self,
+        needed_mb: int,
+        preserve: set[str],
+        wait_seconds: int = 15,
+    ) -> None:
+        """Verify VRAM budget and, if insufficient, force a full teardown
+        and wait up to `wait_seconds` for memory to be released.
+
+        Never raises: if VRAM still isn't freed after the wait, logs a
+        warning and returns — the caller decides whether to proceed.
+        """
+        report = await self._vram.query_gpus()
+        if self._vram.has_enough_vram(needed_mb, report):
+            return
+
+        logger.warning(
+            "Insufficient VRAM (%d MB free, %d MB required). Forcing deep cleanup...",
+            report.total_free_mb, needed_mb,
+        )
+        await self._teardown_current(SwapStrategy.STOP_START, preserve=preserve)
+
+        for _ in range(wait_seconds):
+            await asyncio.sleep(1)
+            report = await self._vram.query_gpus()
+            if self._vram.has_enough_vram(needed_mb, report):
+                logger.info("VRAM freed: %d MB available.", report.total_free_mb)
+                return
+
+        logger.warning(
+            "VRAM still not fully freed after %ds (%d MB free). Proceeding anyway...",
+            wait_seconds, report.total_free_mb,
+        )
+
     # ────────────── Individual Workloads ───────
 
     async def _ensure_container_running(
@@ -316,6 +366,16 @@ class ContainerOrchestrator:
         as a vllm serve process inside the Ray cluster."""
         name = model.container_name
         self._container_states[name] = ContainerState.STARTING
+
+        if model.engine == "spark_cluster":
+            logger.info(
+                "Starting Spark cluster model '%s' on port %d (%d node(s))...",
+                model.name, model.port, model.cluster_nodes,
+            )
+            await self._verify_spark_cluster_ready(model)
+            await self._start_spark_serve(model)
+            self._container_states[name] = ContainerState.STARTING
+            return
 
         if model.engine == "ray_vllm":
             logger.info("Starting Ray vllm model '%s' on port %d...", model.name, model.port)
@@ -408,10 +468,11 @@ class ContainerOrchestrator:
 
             self._container_states[name] = ContainerState.STOPPING
 
-            # Check if this is a Ray vllm model
+            # Exec-managed models (Ray head / Spark cluster): stop the serve
+            # process, never the shared container.
             model_def = next((m for m in ALL_MODELS if m.container_name == name), None)
-            if model_def and model_def.engine == "ray_vllm":
-                await self._stop_ray_vllm(model_def)
+            if model_def and model_def.engine in EXEC_ENGINES:
+                await self._stop_exec_model(model_def)
                 self._container_states[name] = ContainerState.STOPPED
                 continue
 
@@ -448,16 +509,16 @@ class ContainerOrchestrator:
                 now = time.time()
                 should_log = (now - last_log) >= RETRY_LOG_INTERVAL_S
 
-                if model.engine == "ray_vllm":
+                if model.engine in EXEC_ENGINES:
                     healthy = await self._check_vllm_health(name, model.port, model.engine)
                     if healthy:
                         self._container_states[name] = ContainerState.READY
-                        logger.info("Ray vllm '%s' READY (%.0fs).", name, elapsed)
+                        logger.info("%s '%s' READY (%.0fs).", model.engine, name, elapsed)
                         break
                     elif should_log:
                         logger.info(
-                            "Waiting for Ray vllm '%s' healthcheck... (%.0fs elapsed)",
-                            name, elapsed,
+                            "Waiting for %s '%s' healthcheck... (%.0fs elapsed)",
+                            model.engine, name, elapsed,
                         )
                 else:
                     workload = await self._backend.get_workload(name)
@@ -534,7 +595,7 @@ class ContainerOrchestrator:
     @staticmethod
     def _build_cmd(model: ModelDefinition) -> str | list[str] | None:
         """Builds the workload startup command."""
-        if model.engine in ("vllm", "ray_vllm"):
+        if model.engine in ("vllm", "ray_vllm", "spark_cluster"):
             model_arg = model.hf_model_id if model.hf_model_id else "/models"
             cmd_parts = [
                 *model.cmd_prefix,
@@ -615,6 +676,180 @@ class ContainerOrchestrator:
                 return w.name
         logger.warning("No Ray head workload found. Run ray-cluster/reset_ray_node.sh --head first.")
         return None
+
+    # ──────────── Spark Cluster Management ────────────
+    #
+    # Multi-node vLLM on DGX Spark runs one `vllm serve` per node inside the
+    # `vllm_node` containers that launch-cluster.sh leaves running: rank 0 owns
+    # the HTTP port, ranks >= 1 run --headless. Rank 0 lives on this host and is
+    # reached through the Docker socket; the workers live on other machines and
+    # are reached over SSH.
+
+    async def _stop_exec_model(self, model: ModelDefinition) -> None:
+        """Stops an exec-managed model, dispatching on its engine."""
+        if model.engine == "spark_cluster":
+            await self._stop_spark_serve(model)
+        else:
+            await self._stop_ray_vllm(model)
+
+    @staticmethod
+    def _spark_process_tag(model: ModelDefinition, rank: int) -> str:
+        """Unique argv[0] tag so the process can be found and killed by rank."""
+        return f"spark-serve-{model.name}-r{rank}"
+
+    async def _run_on_worker(self, host: str, command: str) -> str:
+        """Runs a shell command on a worker node over SSH.
+
+        Raises RuntimeError with stderr attached when SSH or the remote command
+        fails, so callers can surface a useful message during a swap.
+        """
+        argv = [
+            "ssh",
+            "-i", SPARK_SSH_KEY,
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10",
+            f"{SPARK_SSH_USER}@{host}",
+            command,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"SSH command on {host} failed (rc={proc.returncode}): "
+                f"{stderr.decode(errors='replace').strip()}"
+            )
+        return stdout.decode(errors="replace").strip()
+
+    async def _exec_shell_script(
+        self,
+        model: ModelDefinition,
+        script: str,
+        rank: int,
+    ) -> None:
+        """Runs a bash script inside this model's cluster container on `rank`.
+
+        The script is base64-encoded so it survives the docker/SSH quoting
+        layers untouched (it contains JSON with quotes and braces).
+        """
+        container = model.exec_container or SPARK_CLUSTER_CONTAINER
+        payload = base64.b64encode(script.encode()).decode()
+        runner = f"echo {payload} | base64 -d | bash"
+
+        if rank == 0:
+            await self._backend.exec_in_workload(container, ["bash", "-c", runner])
+            return
+
+        host = SPARK_WORKER_HOSTS[rank - 1]
+        # payload is [A-Za-z0-9+/=] only, so double quotes are safe here.
+        await self._run_on_worker(host, f'docker exec {container} bash -c "{runner}"')
+
+    async def _verify_spark_cluster_ready(self, model: ModelDefinition) -> None:
+        """Ensures the cluster container is running on every required node."""
+        container = model.exec_container or SPARK_CLUSTER_CONTAINER
+        required_workers = model.cluster_nodes - 1
+
+        if required_workers > len(SPARK_WORKER_HOSTS):
+            raise RuntimeError(
+                f"Model '{model.name}' needs {model.cluster_nodes} nodes but only "
+                f"{len(SPARK_WORKER_HOSTS) + 1} are configured (SPARK_WORKER_HOSTS)."
+            )
+
+        workload = await self._backend.get_workload(container)
+        if workload is None or workload.status != "running":
+            status = workload.status if workload else "not found"
+            raise RuntimeError(
+                f"Cannot start '{model.name}': cluster container '{container}' is "
+                f"{status} on this node. Bring it up with "
+                f"`cd ~/spark-vllm-docker && HF_HOME=~/hf-cache "
+                f"./run-recipe.sh deepseek-v4-flash-0731 -d`."
+            )
+
+        for host in SPARK_WORKER_HOSTS[:required_workers]:
+            try:
+                state = await self._run_on_worker(
+                    host,
+                    f"docker inspect -f '{{{{.State.Running}}}}' {container}",
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"Cannot start '{model.name}': worker {host} unreachable. {exc}"
+                ) from exc
+            if state.strip() != "true":
+                raise RuntimeError(
+                    f"Cannot start '{model.name}': cluster container '{container}' "
+                    f"is not running on worker {host}."
+                )
+
+    async def _start_spark_serve(self, model: ModelDefinition) -> None:
+        """Starts one vllm serve process per node for a Spark cluster model."""
+        await self._stop_spark_serve(model)
+
+        base_cmd = ["vllm", "serve"] + [str(p) for p in self._build_cmd(model)]
+        exports = "\n".join(
+            f"export {key}={shlex.quote(str(val))}"
+            for key, val in model.extra_env.items()
+        )
+
+        # Workers first: rank 0 owns the process group and expects the headless
+        # ranks to be reachable, which is also the order launch-cluster.sh uses.
+        for rank in range(model.cluster_nodes - 1, -1, -1):
+            cmd = list(base_cmd) + [
+                "--nnodes", str(model.cluster_nodes),
+                "--node-rank", str(rank),
+                "--master-addr", RAY_HEAD_HOST,
+                "--master-port", str(SPARK_MASTER_PORT),
+            ]
+            if rank > 0:
+                cmd.append("--headless")
+
+            tag = self._spark_process_tag(model, rank)
+            cmd_str = " ".join(shlex.quote(part) for part in cmd)
+            log_file = f"/tmp/vllm_{model.name}_r{rank}.log"
+            runner = f"/tmp/start_{model.name}_r{rank}.sh"
+            # The serve command carries JSON values whose quoting must survive
+            # verbatim. Writing it to a file through a quoted heredoc keeps it
+            # out of any nested `bash -c '...'`, where shlex's single quotes
+            # would collide with the wrapper's and the shell would eat the
+            # braces (as --reasoning-config once did).
+            script = (
+                f"cat > {runner} <<'SPARK_LAUNCH_EOF'\n"
+                f"{exports}\n"
+                f"exec -a {tag} {cmd_str}\n"
+                f"SPARK_LAUNCH_EOF\n"
+                f"nohup bash {runner} > {log_file} 2>&1 &\n"
+            )
+            await self._exec_shell_script(model, script, rank)
+            logger.info(
+                "Started '%s' rank %d (%s), log: %s",
+                model.name, rank,
+                "headless" if rank else f"serving :{model.port}",
+                log_file,
+            )
+
+    async def _stop_spark_serve(self, model: ModelDefinition) -> None:
+        """Kills every rank of a Spark cluster model, on all its nodes."""
+        for rank in range(model.cluster_nodes):
+            tag = self._spark_process_tag(model, rank)
+            kill_cmd = (
+                f"pkill -TERM -f {shlex.quote(tag)} 2>/dev/null; "
+                f"sleep 2; "
+                f"pkill -KILL -f {shlex.quote(tag)} 2>/dev/null; "
+                f"true\n"
+            )
+            try:
+                await self._exec_shell_script(model, kill_cmd, rank)
+            except Exception as exc:
+                # A node being unreachable must not abort a teardown: the swap
+                # still needs to release whatever it can.
+                logger.warning(
+                    "Could not stop '%s' rank %d: %s", model.name, rank, exc
+                )
+        logger.info("Stopped Spark cluster model '%s' on all ranks.", model.name)
 
     async def _start_ray_vllm(self, model: ModelDefinition) -> None:
         """Starts vllm serve inside the Ray head as a background process."""

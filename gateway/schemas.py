@@ -78,7 +78,8 @@ class ModelSlot(BaseModel):
     port: int
     quantization: str = "Q8_0"
     tensor_parallel_size: int = 2
-    max_model_len: int = 128000
+    # "auto" when vLLM derives the context length from the checkpoint.
+    max_model_len: int | str = 128000
     kv_cache_dtype: str = "fp8"
 
 

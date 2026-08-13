@@ -25,6 +25,38 @@ GATEWAY_PORT: int = int(os.getenv("GATEWAY_PORT", "8000"))
 # IP of the Ray head node — used to reach vllm serve running inside the Ray cluster
 RAY_HEAD_HOST: str = os.getenv("RAY_HEAD_HOST", "192.168.200.12")
 
+# ─── Spark cluster (spark_vllm_docker) ───
+# Container that eugr/spark-vllm-docker's launch-cluster.sh leaves running on
+# every node. Its foreground process is `sleep infinity`, so vllm serve runs as
+# an exec'd child: the Gateway starts/stops that process, never the container.
+# Bring the containers up out-of-band with:
+#   cd ~/spark-vllm-docker && HF_HOME=~/hf-cache ./run-recipe.sh <recipe> -d
+SPARK_CLUSTER_CONTAINER: str = os.getenv("SPARK_CLUSTER_CONTAINER", "vllm_node")
+
+# Worker nodes of the Spark cluster (rank >= 1), comma-separated.
+# Multi-node vLLM needs one `vllm serve --headless` per worker, and those live
+# on another machine's Docker daemon, so they are reached over SSH.
+SPARK_WORKER_HOSTS: list[str] = [
+    h.strip()
+    for h in os.getenv("SPARK_WORKER_HOSTS", "192.168.200.13").split(",")
+    if h.strip()
+]
+
+# SSH identity used to reach the worker nodes. Mounted read-only into the
+# Gateway container; grants docker access on the workers, so keep it scoped.
+SPARK_SSH_USER: str = os.getenv("SPARK_SSH_USER", "alejandroacho")
+SPARK_SSH_KEY: str = os.getenv("SPARK_SSH_KEY", "/ssh/id_spark")
+
+# Port used to coordinate the multi-node vLLM group (matches the launcher's
+# MASTER_PORT in ~/spark-vllm-docker/.env).
+SPARK_MASTER_PORT: int = int(os.getenv("SPARK_MASTER_PORT", "29501"))
+
+# Engines whose backend is a process exec'd inside an already-running
+# container rather than a workload the Gateway itself creates. For these the
+# Gateway manages the *process*; removing or recreating the container is never
+# correct.
+EXEC_ENGINES: tuple[str, ...] = ("ray_vllm", "spark_cluster")
+
 # Public base URL for generated assets (images, videos).
 # Must be reachable from clients like OpenWebUI.
 GATEWAY_PUBLIC_URL: str = os.getenv("GATEWAY_PUBLIC_URL", "http://192.168.1.125:8000")
@@ -119,11 +151,18 @@ class ModelDefinition:
     port: int
     quantization: str = "Q8_0"
     tensor_parallel_size: int = 2
-    max_model_len: int = 128000
+    # Either a token budget or "auto" to let vLLM derive it from the checkpoint.
+    max_model_len: int | str = 128000
     kv_cache_dtype: str = "fp8"
     model_path: str = ""           # Path within MODELS_PATH (local)
     hf_model_id: str = ""          # HuggingFace model ID (overrides model_path)
-    engine: str = "vllm"           # vllm | comfyui | diffusers
+    engine: str = "vllm"           # vllm | ray_vllm | spark_cluster | comfyui | diffusers
+    # For EXEC_ENGINES: container to exec the serve process into. Empty means
+    # "the Ray head", resolved at runtime.
+    exec_container: str = ""
+    # For spark_cluster: total nodes in the vLLM group. >1 means the Gateway
+    # also starts a headless rank on each SPARK_WORKER_HOSTS entry.
+    cluster_nodes: int = 1
     extra_args: dict[str, Any] = field(default_factory=dict)
     # Prefix injected before model path in the container command.
     # Needed when the image ENTRYPOINT is a generic shell (e.g. entrypoint.sh
@@ -439,6 +478,140 @@ QWEN3_5_122B_VLLM = ModelDefinition(
     },
 )
 
+QWEN3_6_35B_A3B_FP8 = ModelDefinition(
+    name="qwen3.6-35b-a3b",
+    container_image="blackwell-vllm:latest",
+    container_name="vllm-qwen3-6-35b-a3b-fp8",
+    # FP8 weights ~35 GB on a single GB10 (96 GB VRAM). MoE with 3B active params.
+    # At 0.85 utilization leaves ~46 GB for KV cache — comfortable for 256K context.
+    # Hybrid Gated DeltaNet + Gated Attention (same family as Qwen3.5-122B).
+    vram_required_mb=36_000,
+    port=8012,
+    quantization="fp8",
+    tensor_parallel_size=2,
+    max_model_len=262144,            # 256K native context
+    kv_cache_dtype="fp8",
+    hf_model_id="Qwen/Qwen3.6-35B-A3B-FP8",
+    engine="ray_vllm",
+    extra_args={
+        "--gpu-memory-utilization": "0.85",
+        # Mamba cache block_size (2128) requires max_num_batched_tokens >= 2128
+        # in this hybrid Gated-DeltaNet + attention arch; default 2048 trips
+        # the alignment assertion at engine init.
+        "--max-num-batched-tokens": "8192",
+        "--reasoning-parser": "qwen3",
+        "--enable-auto-tool-choice": True,
+        "--tool-call-parser": "qwen3_coder",
+        "--language-model-only": True,   # Skip vision encoder — conv3d lacks SM121 kernels
+        "--distributed-executor-backend": "ray",
+        # MTP speculative decoding for +30-50% throughput
+        "--speculative-config": '{"method":"qwen3_next_mtp","num_speculative_tokens":2}',
+    },
+)
+
+QWEN3_5_122B_FP8 = ModelDefinition(
+    name="qwen3.5-122b",
+    container_image="blackwell-vllm:latest",
+    container_name="vllm-qwen3-5-122b-fp8",
+    # TP=2: ~127 GB FP8 weights split across both GB10s (~63.5 GB each).
+    # At 0.90 utilization leaves ~35.5 GB/node for KV cache — enough for 128K.
+    # Near-lossless quality vs BF16; significant upgrade over GPTQ-Int4.
+    vram_required_mb=130_000,
+    port=8008,
+    quantization="fp8",
+    tensor_parallel_size=2,
+    max_model_len=131072,
+    kv_cache_dtype="fp8",
+    hf_model_id="Qwen/Qwen3.5-122B-A10B-FP8",
+    engine="ray_vllm",
+    extra_args={
+        "--gpu-memory-utilization": "0.90",
+        "--reasoning-parser": "qwen3",
+        "--enable-auto-tool-choice": True,
+        "--tool-call-parser": "qwen3_coder",
+        "--language-model-only": True,
+        "--distributed-executor-backend": "ray",
+    },
+)
+
+
+DEEPSEEK_V4_FLASH = ModelDefinition(
+    name="deepseek-v4-flash",
+    # Community B12X build for DGX Spark: eugr/spark-vllm-b12x, tagged locally
+    # as vllm-node-b12x by `build-and-copy.sh --exp-b12x`.
+    # The image is NOT started by the Gateway — launch-cluster.sh brings up one
+    # `vllm_node` container per node (Ray + mods + host networking) and the
+    # Gateway only starts/stops the vllm serve processes inside them.
+    container_image="vllm-node-b12x:latest",
+    container_name=SPARK_CLUSTER_CONTAINER,
+    # 284B total / 13B active MoE, FP4 experts + FP8 dense, sharded TP=2 across
+    # both Sparks. Not visible to local NVML, hence skip_vram_check below.
+    vram_required_mb=220_000,
+    # 8020 deliberately sits outside the 8001-8012 range used by the
+    # Docker-managed models (8010 belongs to GEMMA4_31B_FP8_VLLM).
+    port=8020,
+    quantization="auto",           # native FP4/FP8 checkpoint, never --quantization
+    tensor_parallel_size=2,
+    max_model_len="auto",          # resolves to 1,048,576 tokens
+    kv_cache_dtype="fp8",
+    hf_model_id="deepseek-ai/DeepSeek-V4-Flash-0731",
+    engine="spark_cluster",
+    exec_container=SPARK_CLUSTER_CONTAINER,
+    cluster_nodes=2,
+    # launch-cluster.sh exports these inside its launch script rather than via
+    # `docker run -e`, so the container env does NOT carry them and the exec'd
+    # serve process must set them itself.
+    extra_env={
+        "CUTE_DSL_ARCH": "sm_121a",
+        "VLLM_USE_AOT_COMPILE": "1",
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "0",
+        "VLLM_USE_MEGA_AOT_ARTIFACT": "-1",
+        "VLLM_MEMORY_PROFILE_INCLUDE_ATTN": "1",
+        "VLLM_USE_FLASHINFER_SAMPLER": "1",
+        "VLLM_USE_B12X_WO_PROJECTION": "1",
+        "VLLM_USE_B12X_MHC": "1",
+        "VLLM_USE_B12X_FP8_GEMM": "1",
+        "VLLM_USE_B12X_MOE": "1",
+        "VLLM_USE_B12X_SPARSE_INDEXER": "1",
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "B12X_MLA_SM120_UNIFIED": "1",
+        "B12X_MOE_FORCE_A8": "1",
+    },
+    extra_args={
+        "--host": "0.0.0.0",
+        "--block-size": 256,
+        "--max-num-seqs": 8,
+        "--max-num-batched-tokens": 8192,
+        "--gpu-memory-utilization": "0.85",
+        "--tokenizer-mode": "deepseek_v4",
+        "--tool-call-parser": "deepseek_v4",
+        "--enable-auto-tool-choice": True,
+        "--reasoning-parser": "deepseek_v4",
+        "--reasoning-config": (
+            '{"reasoning_parser":"deepseek_v4",'
+            '"reasoning_start_str":"","reasoning_end_str":""}'
+        ),
+        # Passed as single tokens: vLLM parses the dotted nested form with "=".
+        "--default-chat-template-kwargs.thinking=true": True,
+        "--default-chat-template-kwargs.reasoning_effort=high": True,
+        # Needs the instanttensor-hybrid-draft-loader mod, applied to the
+        # container by launch-cluster.sh at launch time.
+        "--load-format": "instanttensor",
+        "--moe-backend": "b12x",
+        "--linear-backend": "b12x",
+        "--attention-backend": "B12X_MLA_SPARSE",
+        "--max-cudagraph-capture-size": 64,
+        "--compilation-config": (
+            '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+        ),
+        "--speculative-config": (
+            '{"method":"dspark","num_speculative_tokens":5,'
+            '"draft_sample_method":"probabilistic",'
+            '"attention_backend":"B12X_MLA_SPARSE"}'
+        ),
+    },
+)
+
 
 # ────── Load Profiles ──────
 
@@ -542,16 +715,50 @@ PROFILE_FOCUS_LARGE_VLLM = VRAMProfile(
     skip_vram_check=False,
 )
 
+PROFILE_QWEN36 = VRAMProfile(
+    mode=ProfileMode.FOCUS,
+    description="Qwen3.6 35B-A3B FP8 single-GPU 256K + MTP speculative (~36 GB)",
+    primary_models=[QWEN3_6_35B_A3B_FP8],
+    secondary_models=[],
+    labels={"chat": QWEN3_6_35B_A3B_FP8},
+    skip_vram_check=True,
+)
+
+PROFILE_FOCUS_LARGE_FP8 = VRAMProfile(
+    mode=ProfileMode.FOCUS,
+    description="Large Reasoning Mode: Qwen3.5-122B FP8 TP=2 Ray 128K (~130 GB across cluster)",
+    primary_models=[QWEN3_5_122B_FP8],
+    secondary_models=[],
+    labels={"chat": QWEN3_5_122B_FP8},
+    skip_vram_check=True,
+)
+
+PROFILE_DEEPSEEK = VRAMProfile(
+    mode=ProfileMode.FOCUS,
+    description=(
+        "DeepSeek-V4-Flash 284B-A13B FP4 experts, TP=2 across both Sparks, "
+        "1M context + dspark speculative decoding (~220 GB cluster-wide)"
+    ),
+    primary_models=[DEEPSEEK_V4_FLASH],
+    secondary_models=[],
+    labels={"chat": DEEPSEEK_V4_FLASH, "code": DEEPSEEK_V4_FLASH},
+    # Weights are sharded across two nodes; local NVML sees only half.
+    skip_vram_check=True,
+)
+
 PROFILES: dict[str, VRAMProfile] = {
     "focus": PROFILE_FOCUS,
     "focus_code": PROFILE_FOCUS_CODE,
     "focus_large": PROFILE_FOCUS_LARGE,
+    "focus_large_fp8": PROFILE_FOCUS_LARGE_FP8,
+    "qwen36": PROFILE_QWEN36,
     "gemma4": PROFILE_GEMMA4,
     "gemma4_fp8": PROFILE_GEMMA4_FP8,
     "gemma4_fp8_vllm": PROFILE_GEMMA4_FP8_VLLM,
     "focus_large_vllm": PROFILE_FOCUS_LARGE_VLLM,
     "creative_image": PROFILE_CREATIVE_IMAGE,
     "creative_video": PROFILE_CREATIVE_VIDEO,
+    "deepseek": PROFILE_DEEPSEEK,
 }
 
 # Flat list of every model in the catalog (used for orphan cleanup)
@@ -564,10 +771,13 @@ ALL_MODELS: list[ModelDefinition] = [
     LTX_VIDEO_2,
     QWEN3_5_4B,
     QWEN3_5_122B,
+    QWEN3_5_122B_FP8,
     GEMMA4_31B,
     GEMMA4_31B_FP8,
     GEMMA4_31B_FP8_VLLM,
     QWEN3_5_122B_VLLM,
+    QWEN3_6_35B_A3B_FP8,
+    DEEPSEEK_V4_FLASH,
 ]
 
 

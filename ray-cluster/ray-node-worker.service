@@ -7,13 +7,13 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStartPre=-/usr/bin/docker stop ray-node-worker
-ExecStartPre=-/usr/bin/docker rm ray-node-worker
-ExecStart=/bin/bash /home/alejandroacho/Server/ray-cluster/reset_ray_node.sh --worker 192.168.200.12
-ExecStop=/usr/bin/docker stop ray-node-worker
+# reset_ray_node.sh already stops & removes any stale ray-node-* container,
+# so we don't need ExecStartPre — those just killed manually-started containers.
+ExecStart=/bin/bash /home/alejandroacho/reset_ray_node.sh --worker 192.168.200.12
+ExecStop=-/usr/bin/docker stop ray-node-worker
 Restart=on-failure
-RestartSec=30s
-TimeoutStartSec=120s
+RestartSec=60s
+TimeoutStartSec=180s
 TimeoutStopSec=60s
 
 [Install]

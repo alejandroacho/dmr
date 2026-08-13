@@ -17,7 +17,7 @@ import docker
 from docker.errors import APIError, NotFound
 
 from gateway.backends.base import ExecResult, WorkloadInfo
-from gateway.config import DOCKER_NETWORK, DOCKER_SOCKET, RAY_HEAD_HOST
+from gateway.config import DOCKER_NETWORK, DOCKER_SOCKET, EXEC_ENGINES, RAY_HEAD_HOST
 
 logger = logging.getLogger("gateway.backends.docker")
 
@@ -231,7 +231,11 @@ class DockerBackend:
             logger.error("Could not ensure network for '%s': %s", workload_name, exc)
 
     def resolve_hostname(self, name: str, engine: str) -> str:
-        """Docker bridge DNS for local containers, Ray head IP for ray_vllm."""
-        if engine == "ray_vllm":
+        """Docker bridge DNS for local containers, head-node IP for exec engines.
+
+        ray_vllm and spark_cluster backends listen on the head node's host
+        network, so they are not reachable through the bridge DNS name.
+        """
+        if engine in EXEC_ENGINES:
             return RAY_HEAD_HOST
         return name

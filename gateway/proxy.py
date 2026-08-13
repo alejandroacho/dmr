@@ -12,7 +12,12 @@ from typing import Any, AsyncIterator, Callable
 
 import aiohttp
 
-from gateway.config import ModelDefinition, RAY_HEAD_HOST, RETRY_LOG_INTERVAL_S
+from gateway.config import (
+    EXEC_ENGINES,
+    ModelDefinition,
+    RAY_HEAD_HOST,
+    RETRY_LOG_INTERVAL_S,
+)
 
 logger = logging.getLogger("gateway.proxy")
 
@@ -35,8 +40,8 @@ class InferenceProxy:
 
     @staticmethod
     def _default_resolve(name: str, engine: str) -> str:
-        """Fallback resolver: Ray head IP for ray_vllm, container name for others."""
-        return RAY_HEAD_HOST if engine == "ray_vllm" else name
+        """Fallback resolver: head-node IP for exec engines, container name otherwise."""
+        return RAY_HEAD_HOST if engine in EXEC_ENGINES else name
 
     def _backend_host(self, model: ModelDefinition) -> str:
         """Returns the hostname used to reach a model's HTTP backend."""

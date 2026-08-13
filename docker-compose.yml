@@ -78,10 +78,20 @@ services:
       - RETRY_AFTER_SECONDS=5
       - RETRY_LOG_INTERVAL_S=10
       - RAY_WATCHDOG_INTERVAL_S=30
+      # ── Spark cluster models (engine=spark_cluster) ──
+      - RAY_HEAD_HOST=192.168.200.12
+      - SPARK_CLUSTER_CONTAINER=vllm_node
+      - SPARK_WORKER_HOSTS=192.168.200.13
+      - SPARK_SSH_USER=alejandroacho
+      - SPARK_SSH_KEY=/ssh/id_spark
+      - SPARK_MASTER_PORT=29501
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /home/alejandroacho/Models:/home/alejandroacho/Models:ro
       - /home/alejandroacho/Server/.gateway-state:/data
+      # Dedicated key (not the user's personal one) so the Gateway can start
+      # the headless vLLM ranks on the worker node. Grants docker access there.
+      - /home/alejandroacho/.ssh/id_spark_gateway:/ssh/id_spark:ro
     networks:
       - blackwell_net
     healthcheck:

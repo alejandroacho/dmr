@@ -18,9 +18,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # ─── System dependencies ─────────────────────────
+# openssh-client: multi-node models (engine=spark_cluster) run one vllm serve
+# per node, and the worker nodes' Docker daemons are only reachable over SSH.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
+        openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # ─── Python dependencies ──────────────────────────
