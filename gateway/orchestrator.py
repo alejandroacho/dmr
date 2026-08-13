@@ -36,7 +36,13 @@ from gateway.config import (
     VRAMProfile,
     get_swap_strategy,
 )
-from gateway.schemas import ContainerState, ProfileMode, SwapStrategy
+from gateway.schemas import (
+    ContainerState,
+    ProfileMode,
+    RayClusterStatus,
+    RayStatus,
+    SwapStrategy,
+)
 from gateway.vram_monitor import VRAMMonitor
 
 logger = logging.getLogger("gateway.orchestrator")
@@ -62,6 +68,11 @@ class ContainerOrchestrator:
         self._active_profile: Optional[str] = None
         self._swap_in_progress = False
         self._swap_start_time: float = 0.0
+        # Ray health is polled by the watchdog, not on every /health call:
+        # counting nodes means an exec into a container (~100-300 ms).
+        self._ray_status: Optional[RayStatus] = None
+        self._ray_status_profile: Optional[str] = None
+        self._ray_status_at: float = 0.0
 
     # ──────────────── State persistence ────────────────
 
@@ -111,6 +122,22 @@ class ContainerOrchestrator:
     @property
     def container_states(self) -> dict[str, ContainerState]:
         return dict(self._container_states)
+
+    @property
+    def ray_status(self) -> Optional[RayStatus]:
+        """Last polled Ray status, or None if Ray is irrelevant right now.
+
+        Returns None when the active profile needs no Ray, and also when the
+        cached reading belongs to a profile we have since swapped away from —
+        a stale verdict is worse than no verdict.
+        """
+        if self._ray_status is None:
+            return None
+        if self._ray_status_profile != self._active_profile:
+            return None
+        return self._ray_status.model_copy(
+            update={"checked_seconds_ago": time.time() - self._ray_status_at}
+        )
 
     def is_model_ready(self, container_name: str) -> bool:
         """Returns True only if the container is in READY state."""
@@ -652,21 +679,106 @@ class ContainerOrchestrator:
 
     # ──────────── Ray Cluster Management ──────────────
 
+    async def _count_ray_nodes(self, container: str) -> int:
+        """Active node count reported by `ray status` inside `container`.
+
+        Returns 0 when the cluster cannot be queried at all, which callers
+        treat the same as "not enough nodes".
+        """
+        try:
+            result = await self._backend.exec_in_workload(
+                container,
+                ["bash", "-c", "ray status 2>/dev/null | grep -c ' node_'"],
+            )
+            return int(result.output.strip() or 0)
+        except Exception as exc:
+            logger.warning("Could not read Ray node count in '%s': %s", container, exc)
+            return 0
+
     async def _verify_ray_cluster_ready(self, required_nodes: int = 2) -> bool:
         """Returns True if the Ray cluster has at least `required_nodes` active nodes."""
         ray_workload = await self._find_ray_head()
         if not ray_workload:
             return False
-        try:
-            result = await self._backend.exec_in_workload(
-                ray_workload,
-                ["bash", "-c", "ray status 2>&1 | grep -c ' node_'"],
+        return await self._count_ray_nodes(ray_workload) >= required_nodes
+
+    async def check_ray_requirement(self) -> Optional[RayStatus]:
+        """Check the Ray clusters the *currently loaded* models depend on.
+
+        Returns None when nothing in the active profile uses Ray, so a stopped
+        `ray-node-head` is not reported as a problem while serving a model that
+        never needed it.
+        """
+        profile = self.active_vram_profile
+        if profile is None:
+            return None
+
+        models = [
+            m for m in profile.primary_models + profile.secondary_models
+            if m.required_ray_nodes > 0
+        ]
+        if not models:
+            return None
+
+        head: Optional[str] = None
+        if any(m.engine == "ray_vllm" for m in models):
+            head = await self._find_ray_head()
+
+        # Group by the container whose `ray status` describes the cluster:
+        # ray_vllm models all share the head, while Ray-sharded spark models
+        # each see the cluster from their own container.
+        grouped: dict[str, list[ModelDefinition]] = {}
+        for model in models:
+            if model.engine == "ray_vllm":
+                container = head or RAY_HEAD_NAME
+            else:
+                container = model.container_name
+            grouped.setdefault(container, []).append(model)
+
+        clusters: list[RayClusterStatus] = []
+        for container, group in grouped.items():
+            required = max(m.required_ray_nodes for m in group)
+            head_down = head is None and any(m.engine == "ray_vllm" for m in group)
+            active = 0 if head_down else await self._count_ray_nodes(container)
+
+            if head_down:
+                detail = (
+                    f"Ray head workload '{RAY_HEAD_NAME}' is not running. "
+                    f"Run ray-cluster/reset_ray_node.sh --head."
+                )
+            elif active == 0:
+                detail = f"'{container}' reports no Ray nodes."
+            elif active < required:
+                detail = (
+                    f"Ray cluster has {active} of {required} nodes. "
+                    f"Run ray-cluster/reset_ray_node.sh --worker on the missing node."
+                )
+            else:
+                detail = None
+
+            clusters.append(
+                RayClusterStatus(
+                    container=container,
+                    nodes_active=active,
+                    nodes_required=required,
+                    models=[m.name for m in group],
+                    healthy=active >= required,
+                    detail=detail,
+                )
             )
-            count_str = result.output.strip()
-            return int(count_str) >= required_nodes
-        except Exception as exc:
-            logger.warning("Could not verify Ray cluster node count: %s", exc)
-            return False
+
+        return RayStatus(
+            healthy=all(c.healthy for c in clusters),
+            clusters=clusters,
+        )
+
+    async def refresh_ray_status(self) -> Optional[RayStatus]:
+        """Poll Ray and cache the result so /health can answer without an exec."""
+        status = await self.check_ray_requirement()
+        self._ray_status = status
+        self._ray_status_profile = self._active_profile
+        self._ray_status_at = time.time()
+        return status
 
     async def _find_ray_head(self) -> Optional[str]:
         """Find the running Ray head workload name."""
@@ -785,6 +897,19 @@ class ContainerOrchestrator:
                     f"is not running on worker {host}."
                 )
 
+        if model.requires_ray_cluster:
+            # Ray-sharded models need the cluster inside the containers, which
+            # only exists when they were launched in Ray mode.
+            nodes = await self._count_ray_nodes(container)
+            if nodes < model.tensor_parallel_size:
+                raise RuntimeError(
+                    f"Cannot start '{model.name}': it shards through Ray but "
+                    f"'{container}' sees {nodes} Ray node(s), not "
+                    f"{model.tensor_parallel_size}. Relaunch the cluster in Ray "
+                    f"mode: `cd ~/spark-vllm-docker && HF_HOME=~/hf-cache "
+                    f"./run-recipe.sh qwen3.5-122b-fp8 -d`."
+                )
+
     async def _start_spark_serve(self, model: ModelDefinition) -> None:
         """Starts one vllm serve process per node for a Spark cluster model."""
         await self._stop_spark_serve(model)
@@ -798,14 +923,18 @@ class ContainerOrchestrator:
         # Workers first: rank 0 owns the process group and expects the headless
         # ranks to be reachable, which is also the order launch-cluster.sh uses.
         for rank in range(model.cluster_nodes - 1, -1, -1):
-            cmd = list(base_cmd) + [
-                "--nnodes", str(model.cluster_nodes),
-                "--node-rank", str(rank),
-                "--master-addr", RAY_HEAD_HOST,
-                "--master-port", str(SPARK_MASTER_PORT),
-            ]
-            if rank > 0:
-                cmd.append("--headless")
+            cmd = list(base_cmd)
+            # Native multi-node mode only. Ray-sharded models run as a single
+            # process and must not receive these arguments.
+            if model.cluster_nodes > 1:
+                cmd += [
+                    "--nnodes", str(model.cluster_nodes),
+                    "--node-rank", str(rank),
+                    "--master-addr", RAY_HEAD_HOST,
+                    "--master-port", str(SPARK_MASTER_PORT),
+                ]
+                if rank > 0:
+                    cmd.append("--headless")
 
             tag = self._spark_process_tag(model, rank)
             cmd_str = " ".join(shlex.quote(part) for part in cmd)

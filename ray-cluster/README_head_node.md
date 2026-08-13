@@ -3,7 +3,7 @@
 ## Requisitos previos
 
 - Docker instalado y con acceso a GPU
-- Imagen `blackwell-vllm:latest` construida (`just build-blackwell` desde `Server/`)
+- Imagen `blackwell-vllm:latest` construida (`make build-blackwell` desde `Server/`)
 - Node 2 (worker) accesible en `192.168.200.13`
 
 ---

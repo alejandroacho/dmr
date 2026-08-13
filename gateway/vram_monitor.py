@@ -22,7 +22,12 @@ with warnings.catch_warnings():
     import pynvml  # noqa: E402
 
 from gateway.schemas import GPUInfo, VRAMReport
-from gateway.config import VRAM_POLL_INTERVAL_S, VRAM_SAFETY_MARGIN_MB, SYSTEM_RAM_GB
+from gateway.config import (
+    HOST_MEMINFO_PATH,
+    VRAM_POLL_INTERVAL_S,
+    VRAM_SAFETY_MARGIN_MB,
+    SYSTEM_RAM_GB,
+)
 
 logger = logging.getLogger("gateway.vram_monitor")
 
@@ -114,30 +119,42 @@ class VRAMMonitor:
 
                 # --- Memory ---
                 cap_mb = SYSTEM_RAM_GB * 1024  # Configured addressable GPU memory
-                try:
-                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                    total_mb = mem_info.total // (1024 * 1024)
-                    used_mb = mem_info.used // (1024 * 1024)
-                    free_mb = mem_info.free // (1024 * 1024)
+                host_mem = VRAMMonitor._read_host_memory()
+                if host_mem is not None:
+                    # Unified memory: the shared pool is what actually limits
+                    # what fits, so it outranks anything NVML reports. It also
+                    # accounts for page cache, other containers and the OS,
+                    # which per-process GPU accounting never sees.
+                    total_mb, free_mb = host_mem
+                    used_mb = max(total_mb - free_mb, 0)
+                else:
+                    try:
+                        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                        total_mb = mem_info.total // (1024 * 1024)
+                        used_mb = mem_info.used // (1024 * 1024)
+                        free_mb = mem_info.free // (1024 * 1024)
 
-                    # On unified memory systems (GB10/ATS) NVML reports
-                    # the full system RAM as GPU memory.  Cap to the
-                    # configured addressable pool so VRAM budgets are
-                    # meaningful.
-                    if total_mb > cap_mb:
+                        # On unified memory systems (GB10/ATS) NVML reports
+                        # the full system RAM as GPU memory.  Cap to the
+                        # configured addressable pool so VRAM budgets are
+                        # meaningful.
+                        if total_mb > cap_mb:
+                            total_mb = cap_mb
+                            free_mb = max(total_mb - used_mb, 0)
+                    except pynvml.NVMLError:
+                        # NVML cannot report memory at all — fall back to
+                        # process accounting. Note this only sees processes in
+                        # our own PID namespace, so in a container it usually
+                        # reports 0 used; the host meminfo path above is the
+                        # one that gives a truthful answer.
                         total_mb = cap_mb
+                        used_mb = VRAMMonitor._sum_process_memory_nvml(handle)
                         free_mb = max(total_mb - used_mb, 0)
-                except pynvml.NVMLError:
-                    # NVML cannot report memory at all — fall back to
-                    # process accounting.
-                    total_mb = cap_mb
-                    used_mb = VRAMMonitor._sum_process_memory_nvml(handle)
-                    free_mb = max(total_mb - used_mb, 0)
-                    logger.debug(
-                        "Unified memory (%s): total=%d MiB, "
-                        "process_used=%d MiB, free=%d MiB",
-                        name, total_mb, used_mb, free_mb,
-                    )
+                        logger.debug(
+                            "Unified memory (%s): total=%d MiB, "
+                            "process_used=%d MiB, free=%d MiB",
+                            name, total_mb, used_mb, free_mb,
+                        )
 
                 # --- Temperature ---
                 try:
@@ -177,6 +194,35 @@ class VRAMMonitor:
             total_free_mb=total_free,
             healthy=True,
         )
+
+    @staticmethod
+    def _read_host_memory() -> Optional[tuple[int, int]]:
+        """(total_mb, available_mb) from the host's meminfo, or None if absent.
+
+        Uses MemAvailable rather than MemFree: most of what `free` calls used
+        is reclaimable page cache, and MemAvailable is the kernel's own
+        estimate of what a new allocation can actually get.
+
+        Swap is deliberately excluded. Serving a model from swap is far worse
+        than refusing to load it, so it must not count as headroom.
+        """
+        total_kb = avail_kb = None
+        try:
+            with open(HOST_MEMINFO_PATH) as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        total_kb = int(line.split()[1])
+                    elif line.startswith("MemAvailable:"):
+                        avail_kb = int(line.split()[1])
+                    if total_kb is not None and avail_kb is not None:
+                        break
+        except (OSError, ValueError, IndexError) as exc:
+            logger.debug("Host meminfo unavailable (%s): falling back to NVML.", exc)
+            return None
+
+        if total_kb is None or avail_kb is None:
+            return None
+        return total_kb // 1024, avail_kb // 1024
 
     @staticmethod
     def _sum_process_memory_nvml(handle) -> int:

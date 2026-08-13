@@ -15,16 +15,18 @@ import pytest
 
 from gateway.backends.base import ExecResult, WorkloadInfo
 from gateway.config import (
-    PROFILE_FOCUS,
-    PROFILE_FOCUS_CODE,
-    GPT_OSS_120B,
-    QWEN3_CODER_NEXT_80B,
     VRAMProfile,
     VRAM_SAFETY_MARGIN_MB,
 )
 from gateway.schemas import ContainerState, ProfileMode, SwapStrategy
 from gateway.orchestrator import ContainerOrchestrator
-from tests.conftest import set_vram_free
+from tests.conftest import (
+    TEST_MODEL_A,
+    TEST_MODEL_B,
+    TEST_PROFILE_A,
+    TEST_PROFILE_B,
+    set_vram_free,
+)
 
 
 # ──────────────────────────────────────────────────────
@@ -92,12 +94,12 @@ class TestProfileClaimedAfterHealthcheck:
 
         set_vram_free(mock_vram_monitor, 131072)
 
-        result = await orch.switch_profile(PROFILE_FOCUS)
+        result = await orch.switch_profile(TEST_PROFILE_A)
 
         assert result is True
         assert profile_during_wait is None
         assert orch._active_profile is not None
-        assert orch._active_profile == orch._registry_key(PROFILE_FOCUS)
+        assert orch._active_profile == orch._registry_key(TEST_PROFILE_A)
 
     @pytest.mark.asyncio
     async def test_profile_set_even_on_healthcheck_timeout(self, mock_vram_monitor):
@@ -115,7 +117,7 @@ class TestProfileClaimedAfterHealthcheck:
         orch._ensure_container_running = AsyncMock()
         set_vram_free(mock_vram_monitor, 131072)
 
-        result = await orch.switch_profile(PROFILE_FOCUS)
+        result = await orch.switch_profile(TEST_PROFILE_A)
 
         assert result is True
         assert orch._active_profile is not None
@@ -138,9 +140,9 @@ class TestContainerStateStarting:
         orch = _make_orchestrator(mock_vram_monitor)
 
         # Backend returns None → workload not found → create_and_start called
-        await orch._ensure_container_running(GPT_OSS_120B, SwapStrategy.STOP_START)
+        await orch._ensure_container_running(TEST_MODEL_A, SwapStrategy.STOP_START)
 
-        state = orch._container_states[GPT_OSS_120B.container_name]
+        state = orch._container_states[TEST_MODEL_A.container_name]
         assert state == ContainerState.STARTING, (
             f"Expected STARTING, got {state}. "
             "Container should not be READY until healthcheck passes."
@@ -154,16 +156,16 @@ class TestContainerStateStarting:
 
         # Backend finds an exited workload
         orch._backend.get_workload = AsyncMock(
-            return_value=WorkloadInfo(name="vllm-gpt-oss-120b", status="exited")
+            return_value=WorkloadInfo(name="vllm-test-a", status="exited")
         )
 
-        await orch._ensure_container_running(GPT_OSS_120B, SwapStrategy.STOP_START)
+        await orch._ensure_container_running(TEST_MODEL_A, SwapStrategy.STOP_START)
 
         # Old workload should be removed
-        orch._backend.remove_workload.assert_called_once_with("vllm-gpt-oss-120b")
+        orch._backend.remove_workload.assert_called_once_with("vllm-test-a")
         # A new workload should be created
         orch._backend.create_and_start.assert_called_once()
-        state = orch._container_states[GPT_OSS_120B.container_name]
+        state = orch._container_states[TEST_MODEL_A.container_name]
         assert state == ContainerState.STARTING
 
     @pytest.mark.asyncio
@@ -173,12 +175,12 @@ class TestContainerStateStarting:
         orch = _make_orchestrator(mock_vram_monitor)
 
         orch._backend.get_workload = AsyncMock(
-            return_value=WorkloadInfo(name="vllm-gpt-oss-120b", status="running")
+            return_value=WorkloadInfo(name="vllm-test-a", status="running")
         )
 
-        await orch._ensure_container_running(GPT_OSS_120B, SwapStrategy.STOP_START)
+        await orch._ensure_container_running(TEST_MODEL_A, SwapStrategy.STOP_START)
 
-        state = orch._container_states[GPT_OSS_120B.container_name]
+        state = orch._container_states[TEST_MODEL_A.container_name]
         assert state == ContainerState.STARTING
 
 
@@ -253,7 +255,7 @@ class TestVRAMFreshCheck:
 
         orch._wait_all_ready = _noop_wait
 
-        result = await orch.switch_profile(PROFILE_FOCUS)
+        result = await orch.switch_profile(TEST_PROFILE_A)
 
         assert result is True
         assert query_count >= 3
@@ -280,7 +282,7 @@ class TestSwapMutex:
         orch._ensure_container_running = AsyncMock()
         set_vram_free(mock_vram_monitor, 131072)
 
-        await orch.switch_profile(PROFILE_FOCUS)
+        await orch.switch_profile(TEST_PROFILE_A)
 
         assert was_swapping is True
         assert orch.is_swapping is False
@@ -288,10 +290,10 @@ class TestSwapMutex:
     @pytest.mark.asyncio
     async def test_skip_if_same_profile(self, mock_vram_monitor):
         orch = _make_orchestrator(mock_vram_monitor)
-        orch._active_profile = orch._registry_key(PROFILE_FOCUS)
+        orch._active_profile = orch._registry_key(TEST_PROFILE_A)
         orch._teardown_current = AsyncMock()
 
-        result = await orch.switch_profile(PROFILE_FOCUS)
+        result = await orch.switch_profile(TEST_PROFILE_A)
 
         assert result is True
         orch._teardown_current.assert_not_called()
@@ -306,7 +308,7 @@ class TestSwapMutex:
         orch._teardown_current = _explode
         set_vram_free(mock_vram_monitor, 131072)
 
-        result = await orch.switch_profile(PROFILE_FOCUS)
+        result = await orch.switch_profile(TEST_PROFILE_A)
 
         assert result is False
         assert orch.is_swapping is False
@@ -323,17 +325,17 @@ class TestTeardownPreserve:
         orch = _make_orchestrator(mock_vram_monitor)
 
         orch._container_states = {
-            "vllm-qwen3-coder-next-80b": ContainerState.READY,
-            "vllm-gpt-oss-120b": ContainerState.STARTING,
+            "vllm-test-b": ContainerState.READY,
+            "vllm-test-a": ContainerState.STARTING,
         }
 
         await orch._teardown_current(
             SwapStrategy.STOP_START,
-            preserve={"vllm-gpt-oss-120b"},
+            preserve={"vllm-test-a"},
         )
 
-        assert orch._container_states["vllm-qwen3-coder-next-80b"] == ContainerState.STOPPED
-        assert orch._container_states["vllm-gpt-oss-120b"] == ContainerState.STARTING
+        assert orch._container_states["vllm-test-b"] == ContainerState.STOPPED
+        assert orch._container_states["vllm-test-a"] == ContainerState.STARTING
 
     @pytest.mark.asyncio
     async def test_teardown_without_preserve_stops_all(self, mock_vram_monitor):
@@ -366,11 +368,11 @@ class TestTeardownPreserve:
 
         set_vram_free(mock_vram_monitor, 131072)
 
-        await orch.switch_profile(PROFILE_FOCUS)
+        await orch.switch_profile(TEST_PROFILE_A)
 
         assert len(teardown_calls) >= 1
         preserve_set = teardown_calls[0]["preserve"]
-        assert GPT_OSS_120B.container_name in preserve_set
+        assert TEST_MODEL_A.container_name in preserve_set
 
 
 # ──────────────────────────────────────────────────────
@@ -379,13 +381,13 @@ class TestTeardownPreserve:
 
 class TestProfileKey:
     def test_profile_key_deterministic(self):
-        key = ContainerOrchestrator._profile_key(PROFILE_FOCUS)
+        key = ContainerOrchestrator._profile_key(TEST_PROFILE_A)
         assert "focus:" in key
-        assert "gpt-oss-120b" in key
+        assert "test-model-a" in key
 
     def test_different_profiles_different_keys(self):
-        key1 = ContainerOrchestrator._profile_key(PROFILE_FOCUS)
-        key2 = ContainerOrchestrator._profile_key(PROFILE_FOCUS_CODE)
+        key1 = ContainerOrchestrator._profile_key(TEST_PROFILE_A)
+        key2 = ContainerOrchestrator._profile_key(TEST_PROFILE_B)
         assert key1 != key2
 
 
@@ -455,10 +457,10 @@ class TestEnsureNetwork:
         orch = _make_orchestrator(mock_vram_monitor)
 
         orch._backend.get_workload = AsyncMock(
-            return_value=WorkloadInfo(name="vllm-gpt-oss-120b", status="running")
+            return_value=WorkloadInfo(name="vllm-test-a", status="running")
         )
 
-        await orch._ensure_container_running(GPT_OSS_120B, SwapStrategy.STOP_START)
+        await orch._ensure_container_running(TEST_MODEL_A, SwapStrategy.STOP_START)
 
-        orch._backend.ensure_network.assert_called_once_with("vllm-gpt-oss-120b")
-        assert orch._container_states[GPT_OSS_120B.container_name] == ContainerState.STARTING
+        orch._backend.ensure_network.assert_called_once_with("vllm-test-a")
+        assert orch._container_states[TEST_MODEL_A.container_name] == ContainerState.STARTING

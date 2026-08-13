@@ -12,15 +12,12 @@ import asyncio
 import logging
 import os
 import time
-import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 
 from gateway import __version__
 from gateway.config import (
@@ -28,12 +25,10 @@ from gateway.config import (
     EXEC_ENGINES,
     GATEWAY_HOST,
     GATEWAY_PORT,
-    GATEWAY_PUBLIC_URL,
     LONG_POLLING_ENABLED,
     LONG_POLLING_TIMEOUT_S,
     PROFILES,
-    PROFILE_FOCUS,
-    PROFILE_FOCUS_CODE,
+    PROFILE_DEEPSEEK,
     RETRY_AFTER_SECONDS,
 )
 
@@ -52,14 +47,13 @@ from gateway.schemas import (
     ContainerState,
     GatewayResponse,
     HealthResponse,
-    ImageGenerationRequest,
     MediaType,
+    ModelSlot,
     ProfileMode,
     ProfileDetail,
     ProfilesOverviewResponse,
     ProfileStatusResponse,
     SwapStatusResponse,
-    VideoGenerationRequest,
     VRAMReport,
 )
 from gateway.vram_monitor import VRAMMonitor
@@ -117,7 +111,7 @@ async def lifespan(app: FastAPI):
         # No usable containers found — restore last known profile or fall back to default
         await orchestrator.cleanup_orphaned_containers()
         last_profile_key = ContainerOrchestrator.load_persisted_profile()
-        default_profile = PROFILES.get("focus_large_vllm", PROFILE_FOCUS_CODE)
+        default_profile = PROFILES.get("deepseek", PROFILE_DEEPSEEK)
         startup_profile = PROFILES.get(last_profile_key, default_profile) if last_profile_key else default_profile
         if last_profile_key and last_profile_key in PROFILES:
             logger.info("Restoring last active profile: '%s'", last_profile_key)
@@ -145,41 +139,79 @@ async def lifespan(app: FastAPI):
     logger.info("━━━ Gateway shut down successfully ━━━")
 
 
+async def _ray_watchdog_tick() -> None:
+    """One watchdog pass: check Ray, then health-check the exec-managed models."""
+    ray_head = await orchestrator._find_ray_head()
+    if ray_head is None:
+        # Only an error if something loaded actually needs the head: otherwise
+        # a stopped ray-node-head would log ERROR every tick while the gateway
+        # happily serves a profile that never touches Ray.
+        active = orchestrator.active_vram_profile
+        head_needed = active is not None and any(
+            m.engine == "ray_vllm"
+            for m in active.primary_models + active.secondary_models
+        )
+        logger.log(
+            logging.ERROR if head_needed else logging.DEBUG,
+            "WATCHDOG: Ray head container missing. Marking all ray_vllm models as ERROR.",
+        )
+        for model in ALL_MODELS:
+            if model.engine == "ray_vllm":
+                orchestrator._container_states[model.container_name] = ContainerState.ERROR
+        # spark_cluster models live in their own containers and do not
+        # depend on the Ray head, so keep checking them below.
+
+    # Poll the Ray clusters the loaded models actually depend on and cache the
+    # verdict for /health. Returns None when none of them use Ray.
+    ray_status = await orchestrator.refresh_ray_status()
+    ray_degraded: set[str] = set()
+    if ray_status and not ray_status.healthy:
+        for cluster in ray_status.clusters:
+            if cluster.healthy:
+                continue
+            logger.error(
+                "WATCHDOG: Ray degraded for %s — %s",
+                ", ".join(cluster.models), cluster.detail,
+            )
+            ray_degraded.update(cluster.models)
+
+    active_profile = orchestrator.active_vram_profile
+    if not active_profile:
+        return
+
+    for model in active_profile.primary_models + active_profile.secondary_models:
+        # A model whose Ray cluster lost nodes cannot serve, even if its own
+        # container is still up and answering.
+        if model.name in ray_degraded:
+            if orchestrator._container_states.get(
+                model.container_name
+            ) == ContainerState.READY:
+                orchestrator._container_states[model.container_name] = ContainerState.ERROR
+            continue
+        if model.engine not in EXEC_ENGINES:
+            continue
+        if model.engine == "ray_vllm" and ray_head is None:
+            continue
+        healthy = await orchestrator._check_vllm_health(
+            model.container_name, model.port, model.engine
+        )
+        if not healthy and orchestrator._container_states.get(
+            model.container_name
+        ) == ContainerState.READY:
+            logger.error(
+                "WATCHDOG: %s '%s' (port %d) failed health check. Marking ERROR.",
+                model.engine, model.name, model.port,
+            )
+            orchestrator._container_states[model.container_name] = ContainerState.ERROR
+
+
 async def _ray_watchdog_loop() -> None:
-    """Proactively monitors the Ray head container and active ray_vllm models every RAY_WATCHDOG_INTERVAL_S seconds."""
+    """Runs _ray_watchdog_tick every RAY_WATCHDOG_INTERVAL_S seconds."""
     logger.info("Ray watchdog started (interval=%ds)", RAY_WATCHDOG_INTERVAL_S)
     while True:
         await asyncio.sleep(RAY_WATCHDOG_INTERVAL_S)
         try:
-            ray_head = await orchestrator._find_ray_head()
-            if ray_head is None:
-                logger.error(
-                    "WATCHDOG: Ray head container missing. Marking all ray_vllm models as ERROR."
-                )
-                for model in ALL_MODELS:
-                    if model.engine == "ray_vllm":
-                        orchestrator._container_states[model.container_name] = ContainerState.ERROR
-                # spark_cluster models live in their own containers and do not
-                # depend on the Ray head, so keep checking them below.
-
-            active_profile = orchestrator.active_vram_profile
-            if active_profile:
-                for model in active_profile.primary_models + active_profile.secondary_models:
-                    if model.engine not in EXEC_ENGINES:
-                        continue
-                    if model.engine == "ray_vllm" and ray_head is None:
-                        continue
-                    healthy = await orchestrator._check_vllm_health(
-                        model.container_name, model.port, model.engine
-                    )
-                    if not healthy and orchestrator._container_states.get(
-                        model.container_name
-                    ) == ContainerState.READY:
-                        logger.error(
-                            "WATCHDOG: %s '%s' (port %d) failed health check. Marking ERROR.",
-                            model.engine, model.name, model.port,
-                        )
-                        orchestrator._container_states[model.container_name] = ContainerState.ERROR
+            await _ray_watchdog_tick()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -209,11 +241,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ──────────── Static file serving for generated images ────
-GENERATED_IMAGES_DIR = Path(os.getenv("GENERATED_IMAGES_DIR", "/tmp/gateway_images"))
-GENERATED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/generated", StaticFiles(directory=str(GENERATED_IMAGES_DIR)), name="generated")
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MAIN ENDPOINTS
@@ -235,12 +262,18 @@ async def health():
         profile = PROFILES.get(profile_name)
         mode = profile.mode if profile else None
 
+    # Only present when a loaded model needs Ray; a stopped ray-node-head is
+    # not a gateway problem while serving a profile that never uses it.
+    ray = orchestrator.ray_status
+    healthy = report.healthy and (ray is None or ray.healthy)
+
     return HealthResponse(
-        status="ok" if report.healthy else "degraded",
+        status="ok" if healthy else "degraded",
         version=__version__,
         active_profile=mode,
         vram=report,
         containers=orchestrator.container_states,
+        ray=ray,
         uptime_seconds=time.time() - _start_time,
     )
 
@@ -265,29 +298,24 @@ async def swap_status():
 @app.get("/status/profile", response_model=ProfileStatusResponse, tags=["System"])
 async def profile_status():
     """Detailed status of the active profile and loaded models."""
-    profile_key = orchestrator.active_profile or "focus"
-    mode = ProfileMode.FOCUS if "focus" in profile_key else ProfileMode.CREATIVE
-
-    # Get slots for the active profile
-    from gateway.config import ALL_MODELS
-    model_map = {m.container_name: m for m in ALL_MODELS}
-
-    # Build reverse label map for the active profile
+    profile_key = orchestrator.active_profile
     active = orchestrator.active_vram_profile
-    label_by_name: dict[str, str] = {}
-    if active:
-        for lbl, m in active.labels.items():
-            label_by_name[m.name] = lbl
 
-    models = []
-    for name, state in orchestrator.container_states.items():
-        if name in model_map:
-            slot = model_map[name].to_slot(state)
-            slot.label = label_by_name.get(model_map[name].name, "")
-            models.append(slot)
+    # Build the slots from the active profile's own models. Mapping
+    # container_states back to models cannot work: cluster models share one
+    # container ("vllm_node"), so the reverse map keeps only the last one and
+    # reported whichever model was defined last, not the loaded one.
+    models = (
+        _build_profile_detail(profile_key, active, is_active=True).models
+        if active
+        else []
+    )
 
     return ProfileStatusResponse(
-        active_profile=mode,
+        # Read the declared mode instead of guessing from the key — same bug
+        # /health had: FOCUS profiles without "focus" in their name (deepseek,
+        # qwen35) were all reported as CREATIVE.
+        active_profile=active.mode if active else ProfileMode.FOCUS,
         models=models,
         vram=vram_monitor.latest,
     )
@@ -515,149 +543,6 @@ async def chat_completions(request: AgentRequest):
     )
 
 
-# ──────────── Specific Multimedia Endpoints ────────
-
-@app.post("/v1/images/generate", tags=["Multimedia"])
-async def generate_image(request: ImageGenerationRequest):
-    """
-    Generates an image with FLUX.2 Pro.
-    Automatically triggers the switch to Creative Mode if needed.
-    """
-    start_time = time.time()
-
-    # Force creative image profile
-    from gateway.config import PROFILE_CREATIVE_IMAGE, FLUX2_PRO
-
-    current = orchestrator.active_profile or ""
-    target_key = orchestrator._registry_key(PROFILE_CREATIVE_IMAGE)
-    model_ready = orchestrator.is_model_ready(FLUX2_PRO.container_name)
-
-    if current != target_key or not model_ready:
-        if not model_ready and current == target_key:
-            logger.warning(
-                "Model '%s' is not ready (state=%s). Forcing restart.",
-                FLUX2_PRO.container_name,
-                orchestrator.container_states.get(FLUX2_PRO.container_name),
-            )
-        if orchestrator.is_swapping:
-            raise HTTPException(
-                status_code=503,
-                detail="Swap in progress",
-                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
-            )
-        force_swap = current == target_key and not model_ready
-        success = await orchestrator.switch_profile(PROFILE_CREATIVE_IMAGE, force=force_swap)
-        if not success:
-            raise HTTPException(status_code=503, detail="Could not activate creative mode")
-
-    payload = request.model_dump()
-    result = await inference_proxy.generate_image(FLUX2_PRO, payload)
-    elapsed = (time.time() - start_time) * 1000
-
-    return GatewayResponse(
-        success="error" not in result,
-        data=result,
-        profile=ProfileMode.CREATIVE,
-        processing_time_ms=elapsed,
-        model_used="flux2-pro",
-    )
-
-
-@app.post("/v1/images/generations", tags=["Multimedia"])
-async def dalle_generate_image(request: Request):
-    """
-    DALL-E compatible image generation endpoint.
-    Open WebUI and other clients use this format.
-    """
-    import time as _time
-    body = await request.json()
-    start_time = _time.time()
-
-    from gateway.config import PROFILE_CREATIVE_IMAGE, FLUX2_PRO
-    current = orchestrator.active_profile or ""
-    target_key = orchestrator._registry_key(PROFILE_CREATIVE_IMAGE)
-    model_ready = orchestrator.is_model_ready(FLUX2_PRO.container_name)
-    if current != target_key or not model_ready:
-        force_swap = current == target_key and not model_ready
-        success = await orchestrator.switch_profile(PROFILE_CREATIVE_IMAGE, force=force_swap)
-        if not success:
-            raise HTTPException(status_code=503, detail="Could not activate image generation mode")
-
-    payload = {
-        "prompt": body.get("prompt", ""),
-        "width": body.get("size", "1024x1024").split("x")[0] if "size" in body else body.get("width", 1024),
-        "height": body.get("size", "1024x1024").split("x")[1] if "size" in body else body.get("height", 1024),
-        "steps": body.get("steps", 30),
-        "seed": body.get("seed"),
-    }
-    result = await inference_proxy.generate_image(FLUX2_PRO, payload)
-    created = int(_time.time())
-
-    if "error" in result:
-        raise HTTPException(status_code=502, detail=result["error"])
-
-    import base64 as _b64
-
-
-    data_items = []
-    for img_b64 in result.get("images", []):
-        filename = f"{uuid.uuid4().hex}.png"
-        filepath = GENERATED_IMAGES_DIR / filename
-        filepath.write_bytes(_b64.b64decode(img_b64))
-        image_url = f"{GATEWAY_PUBLIC_URL}/generated/{filename}"
-        data_items.append({"url": image_url, "b64_json": img_b64})
-
-    return {
-        "created": created,
-        "data": data_items,
-    }
-
-
-@app.post("/v1/videos/generate", tags=["Multimedia"])
-async def generate_video(request: VideoGenerationRequest):
-    """
-    Generates a video with LTX-Video 2.
-    Automatically triggers the switch to Creative Mode if needed.
-    """
-    start_time = time.time()
-
-    from gateway.config import PROFILE_CREATIVE_VIDEO, LTX_VIDEO_2
-
-    current = orchestrator.active_profile or ""
-    target_key = orchestrator._registry_key(PROFILE_CREATIVE_VIDEO)
-    model_ready = orchestrator.is_model_ready(LTX_VIDEO_2.container_name)
-
-    if current != target_key or not model_ready:
-        if not model_ready and current == target_key:
-            logger.warning(
-                "Model '%s' is not ready (state=%s). Forcing restart.",
-                LTX_VIDEO_2.container_name,
-                orchestrator.container_states.get(LTX_VIDEO_2.container_name),
-            )
-        if orchestrator.is_swapping:
-            raise HTTPException(
-                status_code=503,
-                detail="Swap in progress",
-                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
-            )
-        force_swap = current == target_key and not model_ready
-        success = await orchestrator.switch_profile(PROFILE_CREATIVE_VIDEO, force=force_swap)
-        if not success:
-            raise HTTPException(status_code=503, detail="Could not activate creative video mode")
-
-    payload = request.model_dump()
-    result = await inference_proxy.generate_video(LTX_VIDEO_2, payload)
-    elapsed = (time.time() - start_time) * 1000
-
-    return GatewayResponse(
-        success="error" not in result,
-        data=result,
-        profile=ProfileMode.CREATIVE,
-        processing_time_ms=elapsed,
-        model_used="ltx-video-2",
-    )
-
-
 # ──────────── Manual Profile Management ────────────
 
 @app.post("/admin/profile/{profile_name}", tags=["Administration"])
@@ -861,83 +746,24 @@ async def _drain_buffered_requests() -> None:
 
 
 async def _dispatch_to_backend(decision, request: AgentRequest) -> Any:
-    """Dispatches the request to the correct inference backend."""
-    model = decision.target_model
+    """Dispatches the request to the inference backend.
 
-    if decision.media_type == MediaType.TEXT:
-        payload = {
-            "messages": request.messages,
-            "temperature": request.temperature,
-            "max_tokens": request.max_tokens,
-            "stream": request.stream,
-        }
-        if request.tools:
-            payload["tools"] = request.tools
-        if request.tool_choice:
-            payload["tool_choice"] = request.tool_choice
+    The catalog is text-only, so there is a single dispatch path.
+    """
+    payload = {
+        "messages": request.messages,
+        "temperature": request.temperature,
+        "max_tokens": request.max_tokens,
+        "stream": request.stream,
+    }
+    if request.tools:
+        payload["tools"] = request.tools
+    if request.tool_choice:
+        payload["tool_choice"] = request.tool_choice
 
-        return await inference_proxy.chat_completion(
-            model, payload, stream=request.stream
-        )
-
-    elif decision.media_type == MediaType.IMAGE:
-        payload = request.media_params or {}
-        # Extract prompt from last message if not in media_params
-        if "prompt" not in payload and request.messages:
-            last_msg = request.messages[-1]
-            payload["prompt"] = last_msg.get("content", "")
-        result = await inference_proxy.generate_image(model, payload)
-        # Wrap as OpenAI chat completion so any client can render it
-        if "images" in result and result["images"]:
-            import base64 as _b64
-
-            b64 = result["images"][0]
-            img_id = f"img-{result.get('seed', 0)}"
-
-            # Save image to disk and serve via URL (avoids huge SSE chunks)
-            filename = f"{uuid.uuid4().hex}.png"
-            filepath = GENERATED_IMAGES_DIR / filename
-            filepath.write_bytes(_b64.b64decode(b64))
-
-        
-            image_url = f"{GATEWAY_PUBLIC_URL}/generated/{filename}"
-            content = f"![generated image]({image_url})"
-
-            if request.stream:
-                return {
-                    "id": img_id,
-                    "object": "chat.completion.chunk",
-                    "model": model.name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": content},
-                        "finish_reason": "stop",
-                    }],
-                }
-            return {
-                "id": img_id,
-                "object": "chat.completion",
-                "model": model.name,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content,
-                    },
-                    "finish_reason": "stop",
-                }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            }
-        return result
-
-    elif decision.media_type == MediaType.VIDEO:
-        payload = request.media_params or {}
-        if "prompt" not in payload and request.messages:
-            last_msg = request.messages[-1]
-            payload["prompt"] = last_msg.get("content", "")
-        return await inference_proxy.generate_video(model, payload)
-
-    raise ValueError(f"Unknown MediaType: {decision.media_type}")
+    return await inference_proxy.chat_completion(
+        decision.target_model, payload, stream=request.stream
+    )
 
 
 # ──────────── Direct entry point ────────────────

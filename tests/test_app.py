@@ -46,6 +46,9 @@ def patched_app(mock_vram_monitor):
     app_module.orchestrator._container_states = {}
     app_module.orchestrator._swap_in_progress = False
     app_module.orchestrator._active_profile = None
+    app_module.orchestrator._ray_status = None
+    app_module.orchestrator._ray_status_profile = None
+    app_module.orchestrator._ray_status_at = 0.0
 
     # Reset swap task tracking
     app_module._active_swap_task = None
@@ -95,6 +98,203 @@ class TestHealthEndpoint:
 
         app_module.orchestrator._active_profile = "deepseek"
         resp = await client.get("/health")
+        assert resp.json()["active_profile"] == "focus"
+
+
+# ──────────────────────────────────────────────────────
+#  Ray reporting in /health
+# ──────────────────────────────────────────────────────
+
+class TestHealthRay:
+    """/health reports Ray only when the loaded models depend on it."""
+
+    @pytest.mark.asyncio
+    async def test_no_ray_block_when_profile_does_not_need_ray(
+        self, client, patched_app
+    ):
+        import gateway.app as app_module
+
+        app_module.orchestrator._active_profile = "test_a"
+        await app_module.orchestrator.refresh_ray_status()
+
+        resp = await client.get("/health")
+        data = resp.json()
+        assert data["ray"] is None
+        assert data["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_degraded_when_required_ray_cluster_is_short_on_nodes(
+        self, client, patched_app
+    ):
+        import gateway.app as app_module
+        from gateway.backends.base import ExecResult
+
+        # qwen35 shards through Ray with TP=2 but only 1 node answers.
+        app_module.orchestrator._backend.exec_in_workload = AsyncMock(
+            return_value=ExecResult(exit_code=0, output="1\n")
+        )
+        app_module.orchestrator._active_profile = "qwen35"
+        await app_module.orchestrator.refresh_ray_status()
+
+        resp = await client.get("/health")
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["ray"]["healthy"] is False
+        cluster = data["ray"]["clusters"][0]
+        assert cluster["nodes_active"] == 1
+        assert cluster["nodes_required"] == 2
+        assert "qwen3.5-122b" in cluster["models"]
+        assert "1 of 2 nodes" in cluster["detail"]
+
+    @pytest.mark.asyncio
+    async def test_ok_when_required_ray_cluster_is_complete(
+        self, client, patched_app
+    ):
+        import gateway.app as app_module
+        from gateway.backends.base import ExecResult
+
+        app_module.orchestrator._backend.exec_in_workload = AsyncMock(
+            return_value=ExecResult(exit_code=0, output="2\n")
+        )
+        app_module.orchestrator._active_profile = "qwen35"
+        await app_module.orchestrator.refresh_ray_status()
+
+        resp = await client.get("/health")
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["ray"]["healthy"] is True
+        assert data["ray"]["checked_seconds_ago"] is not None
+
+    @pytest.mark.asyncio
+    async def test_degraded_when_ray_head_is_missing(self, client, patched_app):
+        import gateway.app as app_module
+
+        # list_workloads returns [] -> no Ray head container running.
+        app_module.orchestrator._active_profile = "test_ray"
+        await app_module.orchestrator.refresh_ray_status()
+
+        resp = await client.get("/health")
+        data = resp.json()
+        assert data["status"] == "degraded"
+        cluster = data["ray"]["clusters"][0]
+        assert cluster["nodes_active"] == 0
+        assert "ray-node-head" in cluster["detail"]
+
+    @pytest.mark.asyncio
+    async def test_stale_reading_from_another_profile_is_discarded(
+        self, client, patched_app
+    ):
+        """A verdict polled before a swap must not be reported afterwards."""
+        import gateway.app as app_module
+        from gateway.backends.base import ExecResult
+
+        app_module.orchestrator._backend.exec_in_workload = AsyncMock(
+            return_value=ExecResult(exit_code=0, output="1\n")
+        )
+        app_module.orchestrator._active_profile = "qwen35"
+        await app_module.orchestrator.refresh_ray_status()
+        assert app_module.orchestrator.ray_status is not None
+
+        app_module.orchestrator._active_profile = "test_a"
+        resp = await client.get("/health")
+        data = resp.json()
+        assert data["ray"] is None
+        assert data["status"] == "ok"
+
+
+# ──────────────────────────────────────────────────────
+#  Ray watchdog
+# ──────────────────────────────────────────────────────
+
+class TestRayWatchdog:
+
+    @pytest.mark.asyncio
+    async def test_tick_marks_ready_model_error_when_ray_loses_a_node(
+        self, patched_app
+    ):
+        """A worker that drops out after startup must not leave the model READY."""
+        import gateway.app as app_module
+        from gateway.backends.base import ExecResult
+        from gateway.config import QWEN35_122B_FP8
+
+        orch = app_module.orchestrator
+        orch._active_profile = "qwen35"
+        orch._container_states[QWEN35_122B_FP8.container_name] = ContainerState.READY
+        # TP=2 but `ray status` only sees one node.
+        orch._backend.exec_in_workload = AsyncMock(
+            return_value=ExecResult(exit_code=0, output="1\n")
+        )
+
+        await app_module._ray_watchdog_tick()
+
+        assert (
+            orch._container_states[QWEN35_122B_FP8.container_name]
+            == ContainerState.ERROR
+        )
+        assert orch.ray_status is not None and orch.ray_status.healthy is False
+
+    @pytest.mark.asyncio
+    async def test_tick_keeps_model_ready_when_ray_cluster_is_complete(
+        self, patched_app, monkeypatch
+    ):
+        import gateway.app as app_module
+        from gateway.backends.base import ExecResult
+        from gateway.config import QWEN35_122B_FP8
+
+        orch = app_module.orchestrator
+        orch._active_profile = "qwen35"
+        orch._container_states[QWEN35_122B_FP8.container_name] = ContainerState.READY
+        orch._backend.exec_in_workload = AsyncMock(
+            return_value=ExecResult(exit_code=0, output="2\n")
+        )
+        # monkeypatch, not plain assignment: `orchestrator` is a module
+        # singleton, so an unrestored method would leak into later tests.
+        monkeypatch.setattr(orch, "_check_vllm_health", AsyncMock(return_value=True))
+
+        await app_module._ray_watchdog_tick()
+
+        assert (
+            orch._container_states[QWEN35_122B_FP8.container_name]
+            == ContainerState.READY
+        )
+        assert orch.ray_status.healthy is True
+
+
+# ──────────────────────────────────────────────────────
+#  Profile status endpoint
+# ──────────────────────────────────────────────────────
+
+class TestProfileStatus:
+
+    @pytest.mark.asyncio
+    async def test_profile_status_reports_the_loaded_model_not_the_last_defined(
+        self, client, patched_app
+    ):
+        """Regression: cluster models share the 'vllm_node' container, so
+        mapping container states back to models kept only the last definition
+        and /status/profile reported qwen3.5 while deepseek was loaded."""
+        import gateway.app as app_module
+        from gateway.config import DEEPSEEK_V4_FLASH
+
+        app_module.orchestrator._active_profile = "deepseek"
+        app_module.orchestrator._container_states[
+            DEEPSEEK_V4_FLASH.container_name
+        ] = ContainerState.READY
+
+        resp = await client.get("/status/profile")
+        data = resp.json()
+        assert [m["name"] for m in data["models"]] == ["deepseek-v4-flash"]
+
+    @pytest.mark.asyncio
+    async def test_profile_status_reports_declared_mode_not_key_substring(
+        self, client, patched_app
+    ):
+        """Regression: same guess-from-key bug /health had — FOCUS profiles
+        without "focus" in the key were reported as CREATIVE."""
+        import gateway.app as app_module
+
+        app_module.orchestrator._active_profile = "deepseek"
+        resp = await client.get("/status/profile")
         assert resp.json()["active_profile"] == "focus"
 
 
@@ -155,12 +355,12 @@ class TestChatCompletionsSwap:
     async def test_successful_completion_when_profile_active(self, client):
         """When the correct profile is already active, should proxy through."""
         import gateway.app as app_module
-        from gateway.config import PROFILE_FOCUS, GPT_OSS_120B
+        from tests.conftest import TEST_PROFILE_A, TEST_MODEL_A
 
         # Set active profile to focus with model READY
-        key = app_module.orchestrator._registry_key(PROFILE_FOCUS)
+        key = app_module.orchestrator._registry_key(TEST_PROFILE_A)
         app_module.orchestrator._active_profile = key
-        app_module.orchestrator._container_states[GPT_OSS_120B.container_name] = (
+        app_module.orchestrator._container_states[TEST_MODEL_A.container_name] = (
             ContainerState.READY
         )
 
@@ -194,17 +394,17 @@ class TestModelListing:
         data = resp.json()
         assert data["object"] == "list"
         names = [m["id"] for m in data["data"]]
-        assert "gpt-oss-120b" in names
-        assert "qwen3-coder-next-80b" in names
-        assert "qwen3.5-4b" in names
+        assert "test-model-a" in names
+        assert "test-model-b" in names
+        assert "test-model-c" in names
 
     @pytest.mark.asyncio
     async def test_list_models_includes_labels_for_active_profile(self, client):
         """When a profile is active, its label aliases should appear."""
         import gateway.app as app_module
-        from gateway.config import PROFILE_FOCUS
+        from tests.conftest import TEST_PROFILE_A
 
-        key = app_module.orchestrator._registry_key(PROFILE_FOCUS)
+        key = app_module.orchestrator._registry_key(TEST_PROFILE_A)
         app_module.orchestrator._active_profile = key
 
         resp = await client.get("/v1/models")
@@ -212,17 +412,17 @@ class TestModelListing:
         names = [m["id"] for m in data["data"]]
         assert "chat" in names
 
-        # The "chat" entry should reference gpt-oss-120b
+        # The "chat" entry should reference test-model-a
         chat_entry = next(m for m in data["data"] if m["id"] == "chat")
-        assert chat_entry["alias_for"] == "gpt-oss-120b"
+        assert chat_entry["alias_for"] == "test-model-a"
 
     @pytest.mark.asyncio
     async def test_list_models_labels_change_with_profile(self, client):
         """Labels should reflect the active profile's model mapping."""
         import gateway.app as app_module
-        from gateway.config import PROFILE_FOCUS_CODE
+        from tests.conftest import TEST_PROFILE_B
 
-        key = app_module.orchestrator._registry_key(PROFILE_FOCUS_CODE)
+        key = app_module.orchestrator._registry_key(TEST_PROFILE_B)
         app_module.orchestrator._active_profile = key
 
         resp = await client.get("/v1/models")
@@ -232,10 +432,10 @@ class TestModelListing:
         assert "code" in names
 
         chat_entry = next(m for m in data["data"] if m["id"] == "chat")
-        assert chat_entry["alias_for"] == "qwen3.5-4b"
+        assert chat_entry["alias_for"] == "test-model-c"
 
         code_entry = next(m for m in data["data"] if m["id"] == "code")
-        assert code_entry["alias_for"] == "qwen3-coder-next-80b"
+        assert code_entry["alias_for"] == "test-model-b"
 
 
 # ──────────────────────────────────────────────────────
@@ -248,11 +448,11 @@ class TestLabelRouting:
     async def test_chat_label_stays_in_current_profile(self, client):
         """model='chat' should NOT trigger a swap — it resolves within active profile."""
         import gateway.app as app_module
-        from gateway.config import PROFILE_FOCUS_CODE, QWEN3_5_4B
+        from tests.conftest import TEST_PROFILE_B, TEST_MODEL_C
 
-        key = app_module.orchestrator._registry_key(PROFILE_FOCUS_CODE)
+        key = app_module.orchestrator._registry_key(TEST_PROFILE_B)
         app_module.orchestrator._active_profile = key
-        app_module.orchestrator._container_states[QWEN3_5_4B.container_name] = (
+        app_module.orchestrator._container_states[TEST_MODEL_C.container_name] = (
             ContainerState.READY
         )
 
@@ -268,17 +468,17 @@ class TestLabelRouting:
         # The proxy should have been called with the Qwen3.5-4B model
         call_args = app_module.inference_proxy.chat_completion.call_args
         model_used = call_args[0][0]  # first positional arg = ModelDefinition
-        assert model_used.name == "qwen3.5-4b"
+        assert model_used.name == "test-model-c"
 
     @pytest.mark.asyncio
     async def test_code_label_triggers_swap_from_focus(self, client):
         """model='code' from focus profile should trigger swap to focus_code."""
         import gateway.app as app_module
-        from gateway.config import PROFILE_FOCUS, GPT_OSS_120B
+        from tests.conftest import TEST_PROFILE_A, TEST_MODEL_A
 
-        key = app_module.orchestrator._registry_key(PROFILE_FOCUS)
+        key = app_module.orchestrator._registry_key(TEST_PROFILE_A)
         app_module.orchestrator._active_profile = key
-        app_module.orchestrator._container_states[GPT_OSS_120B.container_name] = (
+        app_module.orchestrator._container_states[TEST_MODEL_A.container_name] = (
             ContainerState.READY
         )
 
@@ -314,7 +514,7 @@ class TestSwapTaskManagement:
         """Two calls to _get_or_create_swap_task with the same target
            should return the exact same Task object."""
         import gateway.app as app_module
-        from gateway.config import PROFILE_FOCUS
+        from tests.conftest import TEST_PROFILE_A
 
         # Reset state
         app_module._active_swap_task = None
@@ -329,10 +529,10 @@ class TestSwapTaskManagement:
         )
 
         try:
-            target_key = app_module.orchestrator._profile_key(PROFILE_FOCUS)
+            target_key = app_module.orchestrator._profile_key(TEST_PROFILE_A)
 
-            task1 = app_module._get_or_create_swap_task(PROFILE_FOCUS, target_key)
-            task2 = app_module._get_or_create_swap_task(PROFILE_FOCUS, target_key)
+            task1 = app_module._get_or_create_swap_task(TEST_PROFILE_A, target_key)
+            task2 = app_module._get_or_create_swap_task(TEST_PROFILE_A, target_key)
 
             assert task1 is task2, "Should reuse the same task for the same target"
         finally:
@@ -351,7 +551,7 @@ class TestSwapTaskManagement:
     async def test_execute_swap_and_drain_clears_state(self):
         """After _execute_swap_and_drain completes, tracking vars should be None."""
         import gateway.app as app_module
-        from gateway.config import PROFILE_FOCUS
+        from tests.conftest import TEST_PROFILE_A
 
         app_module._active_swap_task = MagicMock()
         app_module._active_swap_target = "some_target"
@@ -362,7 +562,7 @@ class TestSwapTaskManagement:
         app_module._drain_buffered_requests = AsyncMock()
 
         try:
-            result = await app_module._execute_swap_and_drain(PROFILE_FOCUS)
+            result = await app_module._execute_swap_and_drain(TEST_PROFILE_A)
 
             assert result is True
             assert app_module._active_swap_task is None
@@ -375,7 +575,7 @@ class TestSwapTaskManagement:
     async def test_execute_swap_rejects_buffer_on_failure(self):
         """If the swap fails, buffered requests should be rejected."""
         import gateway.app as app_module
-        from gateway.config import PROFILE_FOCUS
+        from tests.conftest import TEST_PROFILE_A
 
         app_module._active_swap_task = MagicMock()
         app_module._active_swap_target = "some_target"
@@ -387,7 +587,7 @@ class TestSwapTaskManagement:
         app_module.request_buffer.reject_all = AsyncMock()
 
         try:
-            result = await app_module._execute_swap_and_drain(PROFILE_FOCUS)
+            result = await app_module._execute_swap_and_drain(TEST_PROFILE_A)
 
             assert result is False
             app_module.request_buffer.reject_all.assert_called_once_with("Swap failed")

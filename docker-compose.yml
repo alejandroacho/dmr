@@ -1,6 +1,6 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Docker Compose — Blackwell Smart Gateway
-#  Full configuration with all inference services.
+#  The two catalog models run on the Spark cluster (see README), not here.
 #  Usage: docker compose up -d
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -20,26 +20,6 @@ volumes:
     driver: local
   triton_cache:
     driver: local
-
-# ──────────────────────────────────────────────────────
-#  Reusable common variables
-# ──────────────────────────────────────────────────────
-x-gpu-common: &gpu-common
-  deploy:
-    resources:
-      reservations:
-        devices:
-          - driver: nvidia
-            count: all
-            capabilities: [gpu]
-  shm_size: "16g"
-  restart: unless-stopped
-  networks:
-    - blackwell_net
-
-x-model-volumes: &model-volumes
-  - /home/alejandroacho/Models:/home/alejandroacho/Models:ro
-  - triton_cache:/root/.triton
 
 services:
 
@@ -66,7 +46,8 @@ services:
       - GATEWAY_HOST=0.0.0.0
       - GATEWAY_PORT=8000
       - MODELS_PATH=/home/alejandroacho/Models
-      - SYSTEM_RAM_GB=128
+      # SYSTEM_RAM_GB is auto-detected from the host's MemTotal. Set it only
+      # to override (the box reports 121 GiB, not the nominal 128).
       - SWAP_TIMEOUT_S=600
       - VRAM_POLL_INTERVAL_S=2.0
       - VRAM_SAFETY_MARGIN_MB=4096
@@ -87,6 +68,10 @@ services:
       - SPARK_MASTER_PORT=29501
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # The GB10 has unified memory: NVML reports "Not Supported" for device
+      # memory, and per-process accounting is invisible from this container's
+      # PID namespace. The host's own meminfo is the only honest source.
+      - /proc/meminfo:/host/meminfo:ro
       - /home/alejandroacho/Models:/home/alejandroacho/Models:ro
       - /home/alejandroacho/Server/.gateway-state:/data
       # Dedicated key (not the user's personal one) so the Gateway can start
@@ -101,158 +86,3 @@ services:
       retries: 3
       start_period: 15s
     depends_on: []  # The gateway manages containers dynamically
-
-  # ════════════════════════════════════════════════
-  #  FOCUS PROFILE — Text Models (Engineering)
-  # ════════════════════════════════════════════════
-
-  # GPT-OSS 120B — Primary reasoning model
-  vllm-gpt-oss-120b:
-    <<: *gpu-common
-    image: vllm/vllm-openai:cu130-nightly
-    container_name: vllm-gpt-oss-120b
-    ports:
-      - "8001:8001"
-    volumes: *model-volumes
-    environment:
-      - MODEL_NAME=gpt-oss-120b
-      - NVIDIA_VISIBLE_DEVICES=all
-      - VLLM_PORT=8001
-      - TRITON_CACHE_DIR=/root/.triton
-    command: >
-      python -m vllm.entrypoints.openai.api_server
-      --model /home/alejandroacho/Models/gpt-oss-120b-q8
-      --port 8001
-      --tensor-parallel-size 2
-      --max-model-len 128000
-      --kv-cache-dtype fp8
-      --quantization gptq
-      --enable-prefix-caching
-      --trust-remote-code
-      --disable-log-requests
-    profiles:
-      - focus
-
-  # Qwen 3 Coder Next 80B MoE — Secondary code model
-  vllm-qwen3-coder-next-80b:
-    <<: *gpu-common
-    image: vllm/vllm-openai:cu130-nightly
-    container_name: vllm-qwen3-coder-next-80b
-    ports:
-      - "8002:8002"
-    volumes: *model-volumes
-    environment:
-      - MODEL_NAME=qwen3-coder-next-80b
-      - NVIDIA_VISIBLE_DEVICES=all
-      - VLLM_PORT=8002
-      - TRITON_CACHE_DIR=/root/.triton
-    command: >
-      python -m vllm.entrypoints.openai.api_server
-      --model /home/alejandroacho/Models/qwen3-coder-next-80b-q8
-      --port 8002
-      --tensor-parallel-size 2
-      --max-model-len 128000
-      --kv-cache-dtype fp8
-      --quantization gptq
-      --enable-prefix-caching
-      --trust-remote-code
-      --disable-log-requests
-    profiles:
-      - focus
-
-  # ════════════════════════════════════════════════════
-  #  CREATIVE PROFILE — Multimedia Models
-  # ════════════════════════════════════════════════
-
-  # Qwen 3 Coder (base) — Agent support in creative mode
-  vllm-qwen3-coder:
-    <<: *gpu-common
-    image: vllm/vllm-openai:cu130-nightly
-    container_name: vllm-qwen3-coder
-    ports:
-      - "8003:8003"
-    volumes: *model-volumes
-    environment:
-      - MODEL_NAME=qwen3-coder
-      - NVIDIA_VISIBLE_DEVICES=all
-      - VLLM_PORT=8003
-      - TRITON_CACHE_DIR=/root/.triton
-    command: >
-      python -m vllm.entrypoints.openai.api_server
-      --model /home/alejandroacho/Models/qwen3-coder-q8
-      --port 8003
-      --tensor-parallel-size 2
-      --max-model-len 128000
-      --kv-cache-dtype fp8
-      --quantization gptq
-      --enable-prefix-caching
-      --trust-remote-code
-      --disable-log-requests
-    profiles:
-      - creative
-
-  # FLUX.2 Pro — Image generation (FP16)
-  comfyui-flux2-pro:
-    <<: *gpu-common
-    image: comfyui-flux:latest
-    container_name: comfyui-flux2-pro
-    ports:
-      - "8004:8004"
-    volumes: *model-volumes
-    environment:
-      - MODEL_NAME=flux2-pro
-      - NVIDIA_VISIBLE_DEVICES=all
-    profiles:
-      - creative_image
-
-  # LTX-Video 2 — Video generation (Q8)
-  diffusers-ltx-video-2:
-    <<: *gpu-common
-    image: ltx-video:latest
-    container_name: diffusers-ltx-video-2
-    ports:
-      - "8005:8005"
-    volumes: *model-volumes
-    environment:
-      - MODEL_NAME=ltx-video-2
-      - NVIDIA_VISIBLE_DEVICES=all
-    profiles:
-      - creative_video
-
-  # ════════════════════════════════════════════════════
-  #  FOCUS_LARGE PROFILE — Large Reasoning Model
-  # ════════════════════════════════════════════════════
-
-  # Qwen3.5-122B-A10B — Large MoE reasoning model (GPTQ Int4, ~61 GB weights)
-  # Hybrid Gated DeltaNet + MoE arch: only 12/48 layers use KV cache → tiny KV footprint
-  # Requires blackwell-vllm:latest with Gated DeltaNet kernel support
-  vllm-qwen3-5-122b:
-    <<: *gpu-common
-    image: blackwell-vllm:latest
-    container_name: vllm-qwen3-5-122b
-    ports:
-      - "8008:8008"
-    volumes: *model-volumes
-    environment:
-      - MODEL_NAME=qwen3.5-122b
-      - NVIDIA_VISIBLE_DEVICES=all
-      - VLLM_PORT=8008
-      - TRITON_CACHE_DIR=/root/.triton
-    command: >
-      Qwen/Qwen3.5-122B-A10B-GPTQ-Int4
-      --port 8008
-      --served-model-name qwen3.5-122b
-      --tensor-parallel-size 1
-      --max-model-len 65536
-      --kv-cache-dtype fp8
-      --quantization gptq
-      --enable-prefix-caching
-      --trust-remote-code
-      --gpu-memory-utilization 0.62
-      --enforce-eager
-      --language-model-only
-      --reasoning-parser qwen3
-      --enable-auto-tool-choice
-      --tool-call-parser qwen3_coder
-    profiles:
-      - focus_large

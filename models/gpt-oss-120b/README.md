@@ -9,13 +9,13 @@ GPT-OSS 120B inference on GB10 Blackwell (SM121) using MXFP4 quantization.
 
 ```bash
 # Download weights (~240 GB)
-just download-gpt-oss
+make download-gpt-oss
 
 # Build the spark image from your fork (only needed once)
-just build-spark
+make build-spark
 
 # Switch gateway to focus profile (loads GPT-OSS)
-just focus
+make focus
 ```
 
 ## Prerequisites

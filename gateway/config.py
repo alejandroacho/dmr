@@ -64,8 +64,32 @@ GATEWAY_PUBLIC_URL: str = os.getenv("GATEWAY_PUBLIC_URL", "http://192.168.1.125:
 # Local path where model weights reside
 MODELS_PATH: str = os.getenv("MODELS_PATH", "/home/alejandroacho/Models")
 
-# Total system RAM; determines swap strategy
-SYSTEM_RAM_GB: int = int(os.getenv("SYSTEM_RAM_GB", "512"))
+# Host /proc/meminfo, bind-mounted into the container. On unified-memory
+# systems (GB10) this is the real memory budget: NVML answers "Not Supported"
+# for device memory, and its per-process accounting cannot see the inference
+# processes, which live in another container's PID namespace.
+HOST_MEMINFO_PATH: str = os.getenv("HOST_MEMINFO_PATH", "/host/meminfo")
+
+
+def _detect_system_ram_gb(default: int = 512) -> int:
+    """Total RAM in GiB, read from the host when the mount is available.
+
+    Preferred over a hardcoded figure: SYSTEM_RAM_GB caps the VRAM budget, so
+    an over-estimate (128 on a 121 GiB box) silently inflates the free margin.
+    """
+    for path in (HOST_MEMINFO_PATH, "/proc/meminfo"):
+        try:
+            with open(path) as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) // (1024 * 1024)
+        except (OSError, ValueError, IndexError):
+            continue
+    return default
+
+
+# Total system RAM; determines swap strategy and caps the VRAM budget.
+SYSTEM_RAM_GB: int = int(os.getenv("SYSTEM_RAM_GB", "0")) or _detect_system_ram_gb()
 
 # Maximum timeout for swaps before aborting (seconds)
 # GB10 can take ~4 min to load large models (weights + KV cache + warmup)
@@ -105,40 +129,6 @@ ORCHESTRATION_BACKEND: str = os.getenv("ORCHESTRATION_BACKEND", "docker")
 K8S_NAMESPACE: str = os.getenv("K8S_NAMESPACE", "blackwell")
 
 
-# ─────────────────── Trigger Keywords ─────────────────────
-
-# Keywords that trigger a switch to CREATIVE mode
-VISUAL_TRIGGER_KEYWORDS: list[str] = [
-    "gen_video",
-    "render_frame",
-    "generate_image",
-    "create_image",
-    "create_video",
-    "render_video",
-    "flux",
-    "ltx_video",
-    "image_generation",
-    "video_generation",
-    "gen_image",
-    "draw",
-    "illustrate",
-    "render",
-    "animate",
-    "storyboard",
-]
-
-VISUAL_TOOL_NAMES: list[str] = [
-    "gen_video",
-    "render_frame",
-    "generate_image",
-    "create_image",
-    "create_video",
-    "flux_generate",
-    "ltx_generate",
-    "comfyui_render",
-]
-
-
 # ─────────────────── Model Definitions ───────────────────────
 
 @dataclass
@@ -160,9 +150,13 @@ class ModelDefinition:
     # For EXEC_ENGINES: container to exec the serve process into. Empty means
     # "the Ray head", resolved at runtime.
     exec_container: str = ""
-    # For spark_cluster: total nodes in the vLLM group. >1 means the Gateway
-    # also starts a headless rank on each SPARK_WORKER_HOSTS entry.
+    # For spark_cluster: number of serve processes to launch. >1 selects vLLM's
+    # native multi-node mode (rank 0 here + one --headless rank per worker);
+    # 1 means a single process that shards the model some other way.
     cluster_nodes: int = 1
+    # For spark_cluster: the model shards through Ray instead of the native
+    # multi-node mode, so a Ray cluster must already span the containers.
+    requires_ray_cluster: bool = False
     extra_args: dict[str, Any] = field(default_factory=dict)
     # Prefix injected before model path in the container command.
     # Needed when the image ENTRYPOINT is a generic shell (e.g. entrypoint.sh
@@ -176,6 +170,19 @@ class ModelDefinition:
     # Override the image ENTRYPOINT (e.g. ["vllm", "serve"] for images
     # whose default entrypoint is a shell like /bin/bash -c).
     container_entrypoint: list[str] | None = None
+
+    @property
+    def required_ray_nodes(self) -> int:
+        """Ray nodes this model needs to serve, or 0 if it does not use Ray.
+
+        Two different topologies rely on Ray: `ray_vllm` models run their serve
+        process inside the Ray head container, while `requires_ray_cluster`
+        models shard through a Ray cluster spanning their own containers.
+        Either way the cluster must span one node per tensor-parallel rank.
+        """
+        if self.engine == "ray_vllm" or self.requires_ray_cluster:
+            return max(self.tensor_parallel_size, 1)
+        return 0
 
     def to_slot(self, state: ContainerState = ContainerState.STOPPED) -> ModelSlot:
         return ModelSlot(
@@ -193,348 +200,6 @@ class ModelDefinition:
 
 # ────── Model Catalog ──────
 
-GPT_OSS_120B = ModelDefinition(
-    name="gpt-oss-120b",
-    # Custom image built from github.com/christopherowen/spark-vllm-mxfp4-docker
-    # Includes CUTLASS MXFP4 kernels compiled for sm_121 (GB10 Blackwell).
-    # Build: docker build -t vllm-mxfp4-spark .
-    container_image="vllm-mxfp4-spark:latest",
-    container_name="vllm-gpt-oss-120b",
-    vram_required_mb=84_000,        # 70% of ~120 GB = ~84 GB (mxfp4 weights + fp8 KV)
-    port=8001,
-    quantization="mxfp4",
-    tensor_parallel_size=1,
-    max_model_len=131072,           # Full 128K context — fits at 70% utilization
-    kv_cache_dtype="fp8",
-    model_path="gpt-oss-120b-q8",
-    engine="vllm",
-    # The custom image ENTRYPOINT is entrypoint.sh (exec "$@"), not the vllm binary,
-    # so we must prefix the command with "vllm serve".
-    cmd_prefix=["vllm", "serve"],
-    extra_args={
-        "--mxfp4-backend": "CUTLASS",
-        "--mxfp4-layers": "moe,qkv,o,lm_head",
-        "--attention-backend": "FLASHINFER",
-        "--gpu-memory-utilization": "0.70",
-        "--max-num-seqs": "10",
-        "--max-num-batched-tokens": "8192",
-        "--load-format": "fastsafetensors",
-        "--enforce-eager": True,          # Disable CUDA graphs — avoids cudaErrorIllegalAddress with MXFP4 CUTLASS on SM121
-    },
-    # Provide o200k_harmony.tiktoken (copy of o200k_base) so the openai_harmony
-    # Rust binary can load the harmony encoding without internet access.
-    # The Rust code extends o200k_base with GPT-OSS harmony special tokens internally.
-    extra_volumes={
-        "/home/alejandroacho/Server/tiktoken_encodings": {
-            "bind": "/tiktoken_enc",
-            "mode": "ro",
-        }
-    },
-    extra_env={
-        "TIKTOKEN_ENCODINGS_BASE": "/tiktoken_enc",
-    },
-)
-
-QWEN3_CODER_NEXT_80B = ModelDefinition(
-    name="qwen3-coder-next-80b",
-    container_image="blackwell-vllm:latest",
-    container_name="vllm-qwen3-coder-next-80b",
-    # TP=2: ~90 GB weights split across both GB10s (~45 GB each).
-    # Reduced from 0.79 to 0.75 to leave room for qwen3.5-4b (secondary
-    # model in focus_code profile) which needs ~15% of VRAM on one node.
-    vram_required_mb=95_000,
-    port=8002,
-    quantization="auto",
-    tensor_parallel_size=2,
-    max_model_len=131072,
-    kv_cache_dtype="fp8",
-    hf_model_id="Qwen/Qwen3-Coder-Next-FP8",
-    engine="ray_vllm",
-    extra_args={
-        "--gpu-memory-utilization": "0.75",
-        "--enable-auto-tool-choice": True,
-        "--tool-call-parser": "qwen3_coder",
-        "--enforce-eager": True,
-        "--distributed-executor-backend": "ray",
-    },
-)
-
-GEMMA4_31B = ModelDefinition(
-    name="gemma-4-31b",
-    container_image="blackwell-vllm:latest",
-    container_name="vllm-gemma4-31b",
-    # TP=2: BF16 weights ~62 GB split across both GB10s (~31 GB each).
-    # Leaves ~64 GB KV cache per node at 0.80 utilization (119 GB unified).
-    # Gemma 4 supports up to 256K context; start with 128K for stability.
-    vram_required_mb=62_000,
-    port=8009,
-    quantization="auto",            # BF16 native; vLLM detects from config.json
-    tensor_parallel_size=2,
-    max_model_len=131072,           # 128K — raise to 262144 once confirmed stable
-    kv_cache_dtype="fp8",
-    hf_model_id="google/gemma-4-31B-it",
-    engine="ray_vllm",
-    extra_args={
-        "--gpu-memory-utilization": "0.80",
-        "--distributed-executor-backend": "ray",
-        # gemma4_mm.py (multimodal) was patched from vLLM 0.19.0 but imports
-        # symbols missing in the base 0.17.1 image.  Override architectures
-        # so vLLM inspects Gemma4ForCausalLM (text-only, works on 0.17.1)
-        # instead of Gemma4ForConditionalGeneration (multimodal, broken import).
-        "--hf-overrides": '{"architectures": ["Gemma4ForCausalLM"]}',
-        "--language-model-only": True,
-        "--enable-auto-tool-choice": True,
-        "--tool-call-parser": "gemma4",
-    },
-)
-
-GEMMA4_31B_FP8 = ModelDefinition(
-    name="gemma-4-31b",
-    container_image="blackwell-vllm:latest",
-    container_name="vllm-gemma4-31b-fp8",
-    # FP8 weights ~31 GB on a single GB10 (96 GB VRAM).
-    # Leaves ~35 GB free for concurrent KV caches (5-9 users).
-    vram_required_mb=31_000,
-    port=8009,
-    quantization="compressed-tensors",
-    tensor_parallel_size=1,
-    max_model_len=131072,           # 128K context
-    kv_cache_dtype="fp8",
-    hf_model_id="RedHatAI/gemma-4-31B-it-FP8-block",
-    engine="ray_vllm",
-    extra_args={
-        "--gpu-memory-utilization": "0.90",
-        "--hf-overrides": '{"architectures": ["Gemma4ForCausalLM"]}',
-        "--language-model-only": True,
-        "--enable-auto-tool-choice": True,
-        "--tool-call-parser": "gemma4",
-    },
-)
-
-GEMMA4_31B_FP8_VLLM = ModelDefinition(
-    name="gemma-4-31b",
-    # vLLM 0.19.1 with native Gemma 4 support + stable CUDA graphs on Blackwell.
-    # Entrypoint is ["vllm", "serve"] — no container_entrypoint override needed.
-    container_image="vllm/vllm-openai:gemma4-cu130",
-    container_name="vllm-gemma4-31b-fp8-direct",
-    # FP8 weights ~31 GB on a single GB10 (96 GB VRAM).
-    # Runs via Docker directly (no Ray) with CUDA graphs for max throughput.
-    vram_required_mb=31_000,
-    port=8010,
-    quantization="compressed-tensors",
-    tensor_parallel_size=1,
-    max_model_len=131072,           # 128K context
-    kv_cache_dtype="fp8",
-    hf_model_id="RedHatAI/gemma-4-31B-it-FP8-block",
-    engine="vllm",
-    # Mount host HF cache so weights are loaded locally, not re-downloaded.
-    extra_volumes={
-        "/home/alejandroacho/.cache/huggingface": {
-            "bind": "/root/.cache/huggingface",
-            "mode": "rw",
-        },
-    },
-    extra_args={
-        "--gpu-memory-utilization": "0.90",
-        "--enable-auto-tool-choice": True,
-        "--tool-call-parser": "gemma4",
-    },
-)
-
-QWEN3_CODER_BASE = ModelDefinition(
-    name="qwen3-coder",
-    container_image="blackwell-vllm:latest",
-    container_name="vllm-qwen3-coder",
-    vram_required_mb=35_000,
-    port=8003,
-    quantization="auto",
-    tensor_parallel_size=1,
-    max_model_len=32768,
-    kv_cache_dtype="fp8",
-    model_path="qwen3-coder-q8",
-    engine="ray_vllm",
-    extra_args={"--gpu-memory-utilization": "0.92"},
-)
-
-FLUX2_PRO = ModelDefinition(
-    name="flux2-pro",
-    container_image="comfyui-flux:latest",
-    container_name="comfyui-flux2-pro",
-    vram_required_mb=42_000,        # FP16 ~ 42 GB
-    port=8004,
-    quantization="FP16",
-    tensor_parallel_size=1,
-    max_model_len=0,
-    kv_cache_dtype="none",
-    model_path="flux2-pro-fp16",
-    engine="comfyui",
-)
-
-LTX_VIDEO_2 = ModelDefinition(
-    name="ltx-video-2",
-    container_image="ltx-video:latest",
-    container_name="diffusers-ltx-video-2",
-    vram_required_mb=42_000,        # Q8 ~ 42 GB
-    port=8005,
-    quantization="Q8",
-    tensor_parallel_size=1,
-    max_model_len=0,
-    kv_cache_dtype="none",
-    model_path="ltx-video-2-q8",
-    engine="diffusers",
-)
-
-QWEN25_CODER_7B = ModelDefinition(
-    name="qwen2.5-coder-7b",
-    container_image="blackwell-vllm:latest",
-    container_name="vllm-qwen25-coder-7b",
-    vram_required_mb=8_000,
-    port=8007,
-    quantization="fp8",
-    tensor_parallel_size=1,
-    max_model_len=32768,
-    kv_cache_dtype="fp8",
-    hf_model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
-    engine="ray_vllm",
-    extra_args={
-        "--gpu-memory-utilization": "0.23",
-        "--enforce-eager": True,
-    },
-)
-
-QWEN3_5_4B = ModelDefinition(
-    name="qwen3.5-4b",
-    container_image="blackwell-vllm:latest",
-    container_name="vllm-qwen3-5-4b",
-    vram_required_mb=4_000,
-    port=8006,
-    quantization="auto",
-    tensor_parallel_size=1,
-    max_model_len=32768,
-    kv_cache_dtype="fp8",
-    hf_model_id="Qwen/Qwen3.5-4B",
-    engine="ray_vllm",
-    extra_args={
-        "--gpu-memory-utilization": "0.10",
-        "--enforce-eager": True,
-        "--reasoning-parser": "qwen3",
-        "--language-model-only": True,  # Skip vision encoder — conv3d lacks SM121 kernels
-    },
-)
-
-QWEN3_5_122B = ModelDefinition(
-    name="qwen3.5-122b",
-    container_image="blackwell-vllm:latest",
-    container_name="vllm-qwen3-5-122b",
-    # TP=2: 61 GB GPTQ Int4 weights split across both GB10s (~30 GB each),
-    # doubling available KV cache and allowing higher context utilization.
-    vram_required_mb=72_000,
-    port=8008,
-    quantization="gptq",
-    tensor_parallel_size=2,
-    max_model_len=131072,            # 128K now feasible with TP=2 KV headroom
-    kv_cache_dtype="fp8",
-    hf_model_id="Qwen/Qwen3.5-122B-A10B-GPTQ-Int4",
-    engine="ray_vllm",
-    extra_args={
-        "--gpu-memory-utilization": "0.62",
-        "--enforce-eager": True,
-        "--language-model-only": True,
-        "--reasoning-parser": "qwen3",
-        "--enable-auto-tool-choice": True,
-        "--tool-call-parser": "qwen3_coder",
-        "--distributed-executor-backend": "ray",
-    },
-)
-
-QWEN3_5_122B_VLLM = ModelDefinition(
-    name="qwen3.5-122b",
-    # Docker-direct single-node: ~64 GB GPTQ-Int4 weights on one GB10.
-    # Leaves ~46 GB for KV cache (9 agents × ~5K tokens each).
-    # No Ray overhead, no TP communication latency.
-    container_image="vllm/vllm-openai:gemma4-cu130",  # vLLM 0.19.1, CUDA 13.0
-    container_name="vllm-qwen3-5-122b-direct",
-    vram_required_mb=64_000,
-    port=8011,
-    quantization="gptq_marlin",
-    tensor_parallel_size=1,
-    max_model_len=32768,             # 32K per agent — safe for 9 concurrent
-    kv_cache_dtype="fp8",
-    hf_model_id="Qwen/Qwen3.5-122B-A10B-GPTQ-Int4",
-    engine="vllm",
-    # Mount host HF cache so weights are loaded locally.
-    extra_volumes={
-        "/home/alejandroacho/.cache/huggingface": {
-            "bind": "/root/.cache/huggingface",
-            "mode": "rw",
-        },
-    },
-    extra_args={
-        "--gpu-memory-utilization": "0.90",
-        "--max-num-batched-tokens": "8192",
-        "--reasoning-parser": "qwen3",
-        "--enable-auto-tool-choice": True,
-        "--tool-call-parser": "qwen3_coder",
-    },
-)
-
-QWEN3_6_35B_A3B_FP8 = ModelDefinition(
-    name="qwen3.6-35b-a3b",
-    container_image="blackwell-vllm:latest",
-    container_name="vllm-qwen3-6-35b-a3b-fp8",
-    # FP8 weights ~35 GB on a single GB10 (96 GB VRAM). MoE with 3B active params.
-    # At 0.85 utilization leaves ~46 GB for KV cache — comfortable for 256K context.
-    # Hybrid Gated DeltaNet + Gated Attention (same family as Qwen3.5-122B).
-    vram_required_mb=36_000,
-    port=8012,
-    quantization="fp8",
-    tensor_parallel_size=2,
-    max_model_len=262144,            # 256K native context
-    kv_cache_dtype="fp8",
-    hf_model_id="Qwen/Qwen3.6-35B-A3B-FP8",
-    engine="ray_vllm",
-    extra_args={
-        "--gpu-memory-utilization": "0.85",
-        # Mamba cache block_size (2128) requires max_num_batched_tokens >= 2128
-        # in this hybrid Gated-DeltaNet + attention arch; default 2048 trips
-        # the alignment assertion at engine init.
-        "--max-num-batched-tokens": "8192",
-        "--reasoning-parser": "qwen3",
-        "--enable-auto-tool-choice": True,
-        "--tool-call-parser": "qwen3_coder",
-        "--language-model-only": True,   # Skip vision encoder — conv3d lacks SM121 kernels
-        "--distributed-executor-backend": "ray",
-        # MTP speculative decoding for +30-50% throughput
-        "--speculative-config": '{"method":"qwen3_next_mtp","num_speculative_tokens":2}',
-    },
-)
-
-QWEN3_5_122B_FP8 = ModelDefinition(
-    name="qwen3.5-122b",
-    container_image="blackwell-vllm:latest",
-    container_name="vllm-qwen3-5-122b-fp8",
-    # TP=2: ~127 GB FP8 weights split across both GB10s (~63.5 GB each).
-    # At 0.90 utilization leaves ~35.5 GB/node for KV cache — enough for 128K.
-    # Near-lossless quality vs BF16; significant upgrade over GPTQ-Int4.
-    vram_required_mb=130_000,
-    port=8008,
-    quantization="fp8",
-    tensor_parallel_size=2,
-    max_model_len=131072,
-    kv_cache_dtype="fp8",
-    hf_model_id="Qwen/Qwen3.5-122B-A10B-FP8",
-    engine="ray_vllm",
-    extra_args={
-        "--gpu-memory-utilization": "0.90",
-        "--reasoning-parser": "qwen3",
-        "--enable-auto-tool-choice": True,
-        "--tool-call-parser": "qwen3_coder",
-        "--language-model-only": True,
-        "--distributed-executor-backend": "ray",
-    },
-)
-
-
 DEEPSEEK_V4_FLASH = ModelDefinition(
     name="deepseek-v4-flash",
     # Community B12X build for DGX Spark: eugr/spark-vllm-b12x, tagged locally
@@ -547,8 +212,6 @@ DEEPSEEK_V4_FLASH = ModelDefinition(
     # 284B total / 13B active MoE, FP4 experts + FP8 dense, sharded TP=2 across
     # both Sparks. Not visible to local NVML, hence skip_vram_check below.
     vram_required_mb=220_000,
-    # 8020 deliberately sits outside the 8001-8012 range used by the
-    # Docker-managed models (8010 belongs to GEMMA4_31B_FP8_VLLM).
     port=8020,
     quantization="auto",           # native FP4/FP8 checkpoint, never --quantization
     tensor_parallel_size=2,
@@ -613,6 +276,44 @@ DEEPSEEK_V4_FLASH = ModelDefinition(
 )
 
 
+QWEN35_122B_FP8 = ModelDefinition(
+    name="qwen3.5-122b",
+    # Same cluster container as DeepSeek. Its two mods coexist: DeepSeek needs
+    # instanttensor-hybrid-draft-loader (patches vLLM's model loader) and this
+    # one needs fix-qwen3.5-chat-template, which only drops a jinja file into
+    # /workspace, so one container launch serves both models.
+    container_image="vllm-node-b12x:latest",
+    container_name=SPARK_CLUSTER_CONTAINER,
+    # 122B-A10B in Qwen's own FP8: ~127 GB of weights, ~64 GB per node.
+    vram_required_mb=140_000,
+    port=8021,
+    quantization="auto",           # native FP8 checkpoint
+    tensor_parallel_size=2,
+    max_model_len=262144,
+    kv_cache_dtype="auto",         # the recipe leaves KV in its default dtype
+    hf_model_id="Qwen/Qwen3.5-122B-A10B-FP8",
+    engine="spark_cluster",
+    exec_container=SPARK_CLUSTER_CONTAINER,
+    # Unlike DeepSeek, this recipe shards through Ray: a single serve process
+    # drives both GPUs, so no headless rank and no --nnodes/--node-rank.
+    cluster_nodes=1,
+    requires_ray_cluster=True,
+    extra_args={
+        "--host": "0.0.0.0",
+        "--distributed-executor-backend": "ray",
+        "--gpu-memory-utilization": "0.8",
+        "--max-num-batched-tokens": 8192,
+        "--load-format": "instanttensor",
+        "--enable-auto-tool-choice": True,
+        "--tool-call-parser": "qwen3_coder",
+        "--reasoning-parser": "qwen3",
+        # Installed by the fix-qwen3.5-chat-template mod. Absolute path so the
+        # process does not depend on its working directory.
+        "--chat-template": "/workspace/unsloth.jinja",
+    },
+)
+
+
 # ────── Load Profiles ──────
 
 @dataclass
@@ -633,106 +334,6 @@ class VRAMProfile:
         self.total_vram_required_mb = sum(m.vram_required_mb for m in all_models)
 
 
-PROFILE_FOCUS = VRAMProfile(
-    mode=ProfileMode.FOCUS,
-    description="Reasoning Mode: GPT-OSS 120B + Qwen2.5-Coder-7B (~92 GB)",
-    primary_models=[GPT_OSS_120B],
-    secondary_models=[QWEN25_CODER_7B],
-    labels={"chat": GPT_OSS_120B, "code": QWEN25_CODER_7B},
-    # GPT-OSS runs as a local Docker container; Qwen2.5-7B runs on Ray cluster.
-    skip_vram_check=False,
-)
-
-PROFILE_FOCUS_CODE = VRAMProfile(
-    mode=ProfileMode.FOCUS,
-    description="Code Mode: Qwen3-Coder-Next 80B TP=2 Ray + Qwen3.5-4B (~95 GB across cluster)",
-    primary_models=[QWEN3_CODER_NEXT_80B],
-    secondary_models=[QWEN3_5_4B],
-    labels={"code": QWEN3_CODER_NEXT_80B, "chat": QWEN3_5_4B},
-    skip_vram_check=True,
-)
-
-PROFILE_CREATIVE_IMAGE = VRAMProfile(
-    mode=ProfileMode.CREATIVE,
-    description="Creative Image Mode: FLUX.2 Pro + Qwen3.5-4B chat (~46 GB)",
-    primary_models=[FLUX2_PRO],
-    secondary_models=[QWEN3_5_4B],
-    labels={"image": FLUX2_PRO, "chat": QWEN3_5_4B},
-    skip_vram_check=False,
-)
-
-PROFILE_CREATIVE_VIDEO = VRAMProfile(
-    mode=ProfileMode.CREATIVE,
-    description="Creative Video Mode: Qwen3 Coder 30B Ray + LTX-Video 2 (~77 GB)",
-    primary_models=[QWEN3_CODER_BASE],
-    secondary_models=[LTX_VIDEO_2],
-    labels={"video": LTX_VIDEO_2, "chat": QWEN3_CODER_BASE},
-    skip_vram_check=False,
-)
-
-PROFILE_FOCUS_LARGE = VRAMProfile(
-    mode=ProfileMode.FOCUS,
-    description="Large Reasoning Mode: Qwen3.5-122B TP=2 Ray 128K (~72 GB across cluster)",
-    primary_models=[QWEN3_5_122B],
-    secondary_models=[],
-    labels={"chat": QWEN3_5_122B},
-    skip_vram_check=True,
-)
-
-PROFILE_GEMMA4 = VRAMProfile(
-    mode=ProfileMode.FOCUS,
-    description="Gemma 4 31B-it BF16 TP=2 Ray 128K (~62 GB across cluster)",
-    primary_models=[GEMMA4_31B],
-    secondary_models=[],
-    labels={"chat": GEMMA4_31B},
-    skip_vram_check=True,
-)
-
-PROFILE_GEMMA4_FP8 = VRAMProfile(
-    mode=ProfileMode.FOCUS,
-    description="Gemma 4 31B-it FP8 TP=1 single-node 128K (~31 GB)",
-    primary_models=[GEMMA4_31B_FP8],
-    secondary_models=[],
-    labels={"chat": GEMMA4_31B_FP8},
-    skip_vram_check=True,
-)
-
-PROFILE_GEMMA4_FP8_VLLM = VRAMProfile(
-    mode=ProfileMode.FOCUS,
-    description="Gemma 4 31B-it FP8 Docker-direct single-GPU 128K (~31 GB)",
-    primary_models=[GEMMA4_31B_FP8_VLLM],
-    secondary_models=[],
-    labels={"chat": GEMMA4_31B_FP8_VLLM},
-    skip_vram_check=False,
-)
-
-PROFILE_FOCUS_LARGE_VLLM = VRAMProfile(
-    mode=ProfileMode.FOCUS,
-    description="Large Reasoning Mode: Qwen3.5-122B GPTQ-Int4 Docker-direct single-GPU 32K (~64 GB)",
-    primary_models=[QWEN3_5_122B_VLLM],
-    secondary_models=[],
-    labels={"chat": QWEN3_5_122B_VLLM},
-    skip_vram_check=False,
-)
-
-PROFILE_QWEN36 = VRAMProfile(
-    mode=ProfileMode.FOCUS,
-    description="Qwen3.6 35B-A3B FP8 single-GPU 256K + MTP speculative (~36 GB)",
-    primary_models=[QWEN3_6_35B_A3B_FP8],
-    secondary_models=[],
-    labels={"chat": QWEN3_6_35B_A3B_FP8},
-    skip_vram_check=True,
-)
-
-PROFILE_FOCUS_LARGE_FP8 = VRAMProfile(
-    mode=ProfileMode.FOCUS,
-    description="Large Reasoning Mode: Qwen3.5-122B FP8 TP=2 Ray 128K (~130 GB across cluster)",
-    primary_models=[QWEN3_5_122B_FP8],
-    secondary_models=[],
-    labels={"chat": QWEN3_5_122B_FP8},
-    skip_vram_check=True,
-)
-
 PROFILE_DEEPSEEK = VRAMProfile(
     mode=ProfileMode.FOCUS,
     description=(
@@ -746,38 +347,28 @@ PROFILE_DEEPSEEK = VRAMProfile(
     skip_vram_check=True,
 )
 
+PROFILE_QWEN35 = VRAMProfile(
+    mode=ProfileMode.FOCUS,
+    description=(
+        "Qwen3.5-122B-A10B FP8, TP=2 across both Sparks via Ray, "
+        "256K context (~140 GB cluster-wide)"
+    ),
+    primary_models=[QWEN35_122B_FP8],
+    secondary_models=[],
+    labels={"chat": QWEN35_122B_FP8, "code": QWEN35_122B_FP8},
+    # Sharded across two nodes; local NVML sees only half.
+    skip_vram_check=True,
+)
+
 PROFILES: dict[str, VRAMProfile] = {
-    "focus": PROFILE_FOCUS,
-    "focus_code": PROFILE_FOCUS_CODE,
-    "focus_large": PROFILE_FOCUS_LARGE,
-    "focus_large_fp8": PROFILE_FOCUS_LARGE_FP8,
-    "qwen36": PROFILE_QWEN36,
-    "gemma4": PROFILE_GEMMA4,
-    "gemma4_fp8": PROFILE_GEMMA4_FP8,
-    "gemma4_fp8_vllm": PROFILE_GEMMA4_FP8_VLLM,
-    "focus_large_vllm": PROFILE_FOCUS_LARGE_VLLM,
-    "creative_image": PROFILE_CREATIVE_IMAGE,
-    "creative_video": PROFILE_CREATIVE_VIDEO,
     "deepseek": PROFILE_DEEPSEEK,
+    "qwen35": PROFILE_QWEN35,
 }
 
 # Flat list of every model in the catalog (used for orphan cleanup)
 ALL_MODELS: list[ModelDefinition] = [
-    GPT_OSS_120B,
-    QWEN3_CODER_NEXT_80B,
-    QWEN3_CODER_BASE,
-    QWEN25_CODER_7B,
-    FLUX2_PRO,
-    LTX_VIDEO_2,
-    QWEN3_5_4B,
-    QWEN3_5_122B,
-    QWEN3_5_122B_FP8,
-    GEMMA4_31B,
-    GEMMA4_31B_FP8,
-    GEMMA4_31B_FP8_VLLM,
-    QWEN3_5_122B_VLLM,
-    QWEN3_6_35B_A3B_FP8,
     DEEPSEEK_V4_FLASH,
+    QWEN35_122B_FP8,
 ]
 
 

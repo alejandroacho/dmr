@@ -9,13 +9,13 @@ Qwen3-Coder-Next FP8 inference on GB10 Blackwell (SM121).
 
 ```bash
 # Download weights
-just download-qwen3
+make download-qwen3
 
 # Build image
-just build-qwen3
+make build-qwen3
 
 # Start gateway in focus_code profile
-just focus-code
+make focus-code
 ```
 
 ## Files

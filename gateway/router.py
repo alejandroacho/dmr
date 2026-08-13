@@ -7,38 +7,25 @@ and which backend model should serve them.
 from __future__ import annotations
 
 import logging
-import re
-from typing import Optional
 
 from gateway.config import (
-    VISUAL_TRIGGER_KEYWORDS,
-    VISUAL_TOOL_NAMES,
     PROFILES,
-    PROFILE_FOCUS,
-    PROFILE_CREATIVE_IMAGE,
-    PROFILE_CREATIVE_VIDEO,
+    PROFILE_DEEPSEEK,
     VRAMProfile,
     ModelDefinition,
-    FLUX2_PRO,
-    LTX_VIDEO_2,
 )
 from gateway.schemas import AgentRequest, MediaType, ProfileMode
 
 logger = logging.getLogger("gateway.router")
 
-# Compiled regex for fast visual keyword detection
-_VISUAL_PATTERN = re.compile(
-    r"\b(" + "|".join(re.escape(kw) for kw in VISUAL_TRIGGER_KEYWORDS) + r")\b",
-    re.IGNORECASE,
-)
-
 
 class SmartRouter:
     """
     Analyzes incoming requests and determines:
-    1. Whether a profile switch is required (Focus ↔ Creative).
+    1. Whether a profile switch is required.
     2. Which specific backend model should serve the request.
-    3. What type of media is being requested (TEXT / IMAGE / VIDEO).
+
+    The catalog is text-only, so every decision carries MediaType.TEXT.
     """
 
     def route(
@@ -61,32 +48,20 @@ class SmartRouter:
             resolved = self._resolve_label(requested, active_profile)
             if resolved:
                 profile, model = resolved
-                # Infer media type from the resolved model's engine.
-                # vllm models are always TEXT — never re-run prompt detection
-                # here, or a video keyword in the prompt would send the request
-                # to generate_video() against a vllm container (→ 404).
-                if model.engine == "comfyui":
-                    media_type = MediaType.IMAGE
-                elif model.engine == "diffusers":
-                    media_type = MediaType.VIDEO
-                else:
-                    media_type = MediaType.TEXT
-
                 logger.debug(
-                    "Routing (label '%s'): agent=%s media=%s profile=%s model=%s",
-                    requested, request.agent_id, media_type.value,
-                    profile.mode.value, model.name,
+                    "Routing (label '%s'): agent=%s profile=%s model=%s",
+                    requested, request.agent_id, profile.mode.value, model.name,
                 )
                 return RoutingDecision(
-                    media_type=media_type,
+                    media_type=MediaType.TEXT,
                     profile=profile,
                     target_model=model,
                 )
 
         # Standard routing (no label match)
-        media_type = self._detect_media_type(request)
-        profile = self._select_profile(request, media_type, active_profile)
-        model = self._select_model(request, media_type, profile)
+        media_type = MediaType.TEXT
+        profile = self._select_profile(request, active_profile)
+        model = self._select_model(request, profile)
 
         decision = RoutingDecision(
             media_type=media_type,
@@ -105,68 +80,19 @@ class SmartRouter:
 
         return decision
 
-    # ──────────── Media Type Detection ──────────
-
-    def _detect_media_type(self, request: AgentRequest) -> MediaType:
-        """
-        Determines the requested media type by inspecting:
-        1. Explicit media_type field.
-        2. tool_choice field.
-        3. Prompt content (keywords).
-        """
-        # 1. If the agent declares it explicitly
-        if request.media_type != MediaType.TEXT:
-            return request.media_type
-
-        # 2. Model name — image/video models identified by name
-        requested_model = (request.model or "").lower()
-        if any(k in requested_model for k in ("flux", "stable-diffusion", "sdxl")):
-            return MediaType.IMAGE
-        if any(k in requested_model for k in ("ltx", "video-gen", "animate")):
-            return MediaType.VIDEO
-
-        # 3. Inspect tool_choice
-        tool_name = self._extract_tool_name(request.tool_choice)
-        if tool_name:
-            if any(vt in tool_name.lower() for vt in ("video", "animate", "ltx")):
-                return MediaType.VIDEO
-            if any(vt in tool_name.lower() for vt in ("image", "render", "flux", "draw")):
-                return MediaType.IMAGE
-            if tool_name.lower() in VISUAL_TOOL_NAMES:
-                # Distinguish video vs image by name
-                if "video" in tool_name.lower():
-                    return MediaType.VIDEO
-                return MediaType.IMAGE
-
-        # 3. Inspect prompt content
-        prompt_text = self._extract_prompt_text(request)
-        if prompt_text:
-            if self._contains_video_keywords(prompt_text):
-                return MediaType.VIDEO
-            if _VISUAL_PATTERN.search(prompt_text):
-                return MediaType.IMAGE
-
-        return MediaType.TEXT
-
     # ──────────── Profile Selection ──────────────────
 
     def _select_profile(
         self,
         request: AgentRequest,
-        media_type: MediaType,
         active_profile: VRAMProfile | None = None,
     ) -> VRAMProfile:
-        """Selects the VRAM profile based on the detected media type and model hint.
+        """Selects the VRAM profile from the requested model hint.
 
         Profile is derived from the model catalog: whichever profile owns the
         requested model wins. This avoids hardcoded string matching — adding a
         model to a profile in config.py is sufficient.
         """
-        if media_type == MediaType.VIDEO:
-            return PROFILE_CREATIVE_VIDEO
-        if media_type == MediaType.IMAGE:
-            return PROFILE_CREATIVE_IMAGE
-
         requested = (request.model or "").strip().lower()
 
         if requested and requested not in ("auto", ""):
@@ -174,8 +100,11 @@ class SmartRouter:
             if profile:
                 return profile
 
-        # Default text → GPT-OSS reasoning mode
-        return PROFILE_FOCUS
+        # Staying put beats a multi-minute swap when nothing specific was asked.
+        if active_profile:
+            return active_profile
+
+        return PROFILE_DEEPSEEK
 
     @staticmethod
     def _find_profile_for_model(requested: str) -> VRAMProfile | None:
@@ -203,7 +132,6 @@ class SmartRouter:
     def _select_model(
         self,
         request: AgentRequest,
-        media_type: MediaType,
         profile: VRAMProfile,
     ) -> ModelDefinition:
         """Selects the specific backend model within the profile.
@@ -212,13 +140,6 @@ class SmartRouter:
         orchestrator never tries to proxy to a container that isn't part
         of the active profile.
         """
-        # Multimedia
-        if media_type == MediaType.IMAGE:
-            return FLUX2_PRO
-        if media_type == MediaType.VIDEO:
-            return LTX_VIDEO_2
-
-        # Text: decide based on the requested model or profile
         requested = request.model.lower() if request.model else "auto"
 
         if requested in ("auto", ""):
@@ -266,19 +187,6 @@ class SmartRouter:
     # ──────────── Helpers ──────────────────────────────
 
     @staticmethod
-    def _extract_tool_name(tool_choice: str | dict | None) -> Optional[str]:
-        """Extracts the tool name from the tool_choice field."""
-        if tool_choice is None:
-            return None
-        if isinstance(tool_choice, str):
-            return tool_choice if tool_choice not in ("auto", "none", "required") else None
-        if isinstance(tool_choice, dict):
-            # OpenAI format: {"type": "function", "function": {"name": "..."}}
-            func = tool_choice.get("function", {})
-            return func.get("name")
-        return None
-
-    @staticmethod
     def _extract_prompt_text(request: AgentRequest) -> str:
         """Extracts the combined text from the agent's messages."""
         parts: list[str] = []
@@ -308,20 +216,6 @@ class SmartRouter:
             if name in profile.labels:
                 return (profile, profile.labels[name])
         return None
-
-    @staticmethod
-    def _contains_video_keywords(text: str) -> bool:
-        """Detects video-specific keywords in the text."""
-        video_patterns = [
-            r"\bgen_video\b",
-            r"\brender_video\b",
-            r"\bcreate_video\b",
-            r"\bltx[_\-]?video\b",
-            r"\banimate\b",
-            r"\bvideo[_\-]?generation\b",
-        ]
-        combined = re.compile("|".join(video_patterns), re.IGNORECASE)
-        return bool(combined.search(text))
 
 
 class RoutingDecision:

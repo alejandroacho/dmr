@@ -157,6 +157,23 @@ class GatewayResponse(BaseModel):
     model_used: str | None = None
 
 
+class RayClusterStatus(BaseModel):
+    """State of one Ray cluster the active profile depends on."""
+    container: str
+    nodes_active: int = 0
+    nodes_required: int = 0
+    models: list[str] = []
+    healthy: bool = False
+    detail: str | None = None
+
+
+class RayStatus(BaseModel):
+    """Ray health, reported only when the loaded models actually need Ray."""
+    healthy: bool = False
+    clusters: list[RayClusterStatus] = []
+    checked_seconds_ago: float | None = None
+
+
 class HealthResponse(BaseModel):
     """Health-check response."""
     status: str = "ok"
@@ -164,6 +181,8 @@ class HealthResponse(BaseModel):
     active_profile: ProfileMode | None = None
     vram: VRAMReport | None = None
     containers: dict[str, ContainerState] = {}
+    # Absent when no model in the active profile uses Ray.
+    ray: RayStatus | None = None
     uptime_seconds: float = 0.0
 
 

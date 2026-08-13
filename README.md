@@ -1,6 +1,8 @@
 # Blackwell Orchestrator & Smart Gateway
 
-Intelligent middleware layer for autonomous VRAM management (~120 GB), dynamic model swapping, and smart routing on an ASUS GX10 with a single NVIDIA GB10 Blackwell GPU.
+FastAPI middleware that fronts a two-node NVIDIA DGX Spark (GB10 Blackwell) cluster, serving two large text models and swapping between them on demand.
+
+The catalog is deliberately small: **DeepSeek-V4-Flash** and **Qwen3.5-122B**. Both are too large for one node, so both shard across the pair with tensor parallelism.
 
 ---
 
@@ -8,8 +10,8 @@ Intelligent middleware layer for autonomous VRAM management (~120 GB), dynamic m
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                    9 External Agents                     │
-│         (text, image, video — unified endpoint)          │
+│                    External Agents                       │
+│              (OpenAI-compatible, text only)              │
 └──────────────────────┬───────────────────────────────────┘
                        │  HTTP / JSON
                        ▼
@@ -18,151 +20,70 @@ Intelligent middleware layer for autonomous VRAM management (~120 GB), dynamic m
 │                                                          │
 │  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐   │
 │  │ Smart Router│  │  VRAM Monitor│  │ Request Buffer │   │
-│  │  & Trigger  │  │  (nvidia-smi)│  │ (Long Polling) │   │
+│  │  (by model) │  │  (nvidia-smi)│  │ (Long Polling) │   │
 │  └──────┬──────┘  └──────┬───────┘  └───────┬────────┘   │
 │         │                │                   │           │
 │  ┌──────▼────────────────▼───────────────────▼────────┐  │
-│  │         Container Orchestrator (Docker SDK)        │  │
-│  │         Mutex-protected profile swapping           │  │
-│  └──────────────────────┬─────────────────────────────┘  │
-└─────────────────────────┼────────────────────────────────┘
-                          │  Docker Socket
-         ┌────────────────┼──────────────────────┐
-         ▼                ▼                      ▼
-┌──────────────┐ ┌───────────────────┐ ┌──────────────────┐
-│ vLLM :8001   │ │ vLLM :8002        │ │ Diffusers :8004  │
-│ GPT-OSS 120B │ │ Qwen3 Coder Next  │ │ FLUX.1-dev BF16  │
-│  (mxfp4)     │ │ 80B MoE (fp8)     │ │ (pytorch:25.01)  │
-└──────────────┘ └───────────────────┘ └──────────────────┘
-  FOCUS PROFILE    FOCUS_CODE PROFILE    CREATIVE_IMAGE
-                   (default at startup)
+│  │              Container Orchestrator                │  │
+│  │        Mutex-protected profile swapping            │  │
+│  └───────┬──────────────────────────────┬─────────────┘  │
+└──────────┼──────────────────────────────┼────────────────┘
+           │ Docker socket                │ SSH
+           ▼                              ▼
+┌────────────────────────┐   ┌────────────────────────────┐
+│  HEAD  192.168.200.12  │   │  WORKER  192.168.200.13    │
+│  container: vllm_node  │◄─►│  container: vllm_node      │
+│  (host net, sleep ∞)   │IB │  (host net, sleep ∞)       │
+│                        │   │                            │
+│  vllm serve rank 0     │   │  vllm serve rank 1         │
+│  :8020 DeepSeek        │   │  --headless                │
+│  :8021 Qwen3.5         │   │                            │
+└────────────────────────┘   └────────────────────────────┘
+      GB10 · 128 GB                 GB10 · 128 GB
 ```
 
-## VRAM Profiles
+### The key idea: the Gateway owns processes, not containers
 
-| Profile key | Models | VRAM Used | Use Case |
-|-------------|--------|-----------|----------|
-| **`focus_code`** ⭐ | Qwen3 Coder Next 80B MoE (fp8) | ~95 GB | Code, engineering — **default at startup** |
-| **`focus`** | GPT-OSS 120B (mxfp4 CUTLASS sm_121) | ~84 GB | Reasoning, general tasks |
-| **`creative_image`** | FLUX.1-dev (BF16) | ~24 GB | Image generation |
-| **`creative_video`** | Qwen3 Coder 30B + LTX-Video 2 (Q8) | ~77 GB | Text + video generation |
+The two `vllm_node` containers are created and owned by **[eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker)**'s `launch-cluster.sh`, not by the Gateway. Their foreground process is `sleep infinity`, and each model runs as an exec'd child process inside them.
 
-> **Note:** `creative_image` runs FLUX.1-dev solo (no text model). Image generation via `/v1/images/generate`. Current speed: ~12s/step on pytorch:25.01 (no sm_121 kernels). Pending migration to a Blackwell-native image for <1s/step.
+That split is deliberate. Those containers need patches (mods) applied at launch time and host networking across both nodes — things a generic Docker orchestrator cannot reproduce. So the Gateway starts and stops the `vllm serve` processes and **never creates, removes, pauses, or recreates the containers**. This is the `spark_cluster` engine in `gateway/config.py`.
 
-> **Note:** `focus` (GPT-OSS 120B) requires a custom vLLM image with CUTLASS MXFP4 kernels compiled for sm_121. Build it first: `just build-spark` (~30 min). Runs with `--enforce-eager` (CUDA graphs crash on SM121 with MXFP4 batching). Expected throughput: ~57 tok/s single request, ~5-6 tok/s per request with 10 concurrent agents. Supports up to 10 simultaneous requests (`--max-num-seqs 10`).
+Consequences worth knowing:
 
-> **Note:** `focus_code` (Qwen3-Coder-Next FP8) uses `blackwell-vllm:latest` with two runtime patches applied at build time. Expected throughput: ~43–48 tok/s on single GB10.
-
-Profile transitions are **automatic** — the Gateway detects visual keywords in requests and swaps models transparently.
+- Rank 0 runs on the head and is reached through the local Docker socket. Ranks ≥ 1 live on another machine's Docker daemon and are reached over **SSH**.
+- A Gateway restart re-adopts a healthy model without reloading weights (~0s instead of minutes).
+- If the cluster containers are down, a profile swap fails fast with the exact command to bring them back.
 
 ---
 
-## Ray Cluster
+## Models & Profiles
 
-The `focus_code`, `focus_large`, and other TP=2 models require a 2-node Ray cluster for distributed inference across both GPUs.
+| Profile key | Model | Sharding | Port | Context |
+|---|---|---|---|---|
+| **`deepseek`** ⭐ | DeepSeek-V4-Flash-0731 — 284B total / 13B active MoE, FP4 experts + FP8 dense | Native multi-node, TP=2 (2 processes) | 8020 | 1,048,576 |
+| **`qwen35`** | Qwen3.5-122B-A10B-FP8 — native FP8 | Ray, TP=2 (1 process) | 8021 | 262,144 |
 
-| Node | Role | IP | Container |
-|---|---|---|---|
-| Node 1 | Head + gateway host | 192.168.200.12 | `ray-node-head` |
-| Node 2 | Worker | 192.168.200.13 | `ray-node-worker` |
+`deepseek` is the default at startup.
 
-Both nodes run `blackwell-vllm:latest` with `--network host` for NCCL/UCX inter-node communication.
+### Why these two
 
-### Initial cluster setup
+DeepSeek-V4-Flash is the reason the cluster exists: 167 GB of weights, ~220 GB of footprint across both nodes, and dspark speculative decoding. Qwen3.5-122B-A10B-FP8 is the second-opinion model — Qwen's own FP8 quantization (not a third-party int4 requant), ~127 GB, comfortable at ~64 GB per node with room for a 256K KV cache.
 
-**Node 1:**
-```bash
-bash ~/Server/ray-cluster/reset_ray_node.sh --head
-```
+Two Qwen3.5 recipes were rejected: `qwen3.5-397b-int4-autoround` is labeled EXPERIMENTAL upstream and its 226 GB leave almost nothing for KV cache within the 256 GB the pair has; `qwen3.5-122b-int4-autoround` is a lossy requant whose only advantage — fitting on one node — is irrelevant here.
 
-**Node 2:**
-```bash
-bash ~/Server/ray-cluster/reset_ray_node.sh --worker 192.168.200.12
-```
+### The two models need different cluster modes
 
-Verify both nodes are up:
-```bash
-bash ~/Server/ray-cluster/check_ray_cluster_status.sh
-# Expected: 2 active nodes, 2/2 GPUs
-```
+This is the sharpest operational edge in the whole setup:
 
-### Systemd services (auto-restart on reboot)
-
-**Node 1:**
-```bash
-sudo cp ~/Server/ray-cluster/ray-node-head.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now ray-node-head
-```
-
-**Node 2** (copy service file from Node 1 first):
-```bash
-scp alejandroacho@192.168.200.12:~/Server/ray-cluster/ray-node-worker.service ~/
-sudo cp ~/Server/ray-cluster/ray-node-worker.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now ray-node-worker
-```
-
-### Resilience layers
-
-| Layer | Mechanism | Effect |
+| | DeepSeek | Qwen3.5 |
 |---|---|---|
-| Docker restart policy | `--restart unless-stopped` in `ray-cluster/run_cluster.sh` | Container auto-recovers from crashes |
-| Systemd services | `ray-node-{head,worker}.service` | Cluster auto-starts after host reboot |
-| TP=2 pre-flight | `_verify_ray_cluster_ready()` in `orchestrator.py` | Fails fast with a clear error if worker is down instead of hanging 10 min |
-| Gateway watchdog | `_ray_watchdog_loop()` in `app.py` (every 30 s) | Detects silent failures between requests and marks models as `ERROR` |
+| Distribution | vLLM native (`--nnodes/--node-rank`, one `--headless` rank per worker) | Ray (`--distributed-executor-backend ray`, single process) |
+| Requires Ray inside the containers | No | **Yes** |
+| Mod | `instanttensor-hybrid-draft-loader` (patches vLLM's model loader) | `fix-qwen3.5-chat-template` (drops a jinja file in `/workspace`) |
 
-See [ray-cluster/](ray-cluster/) for scripts, service files, and per-node setup guides. The [Stacked Sparks guide](ray-cluster/README.md) covers the full setup from scratch.
+The two **mods coexist** — one patches Python, the other only copies a file — so a single container launch can serve both models. Ray mode does not, though: DeepSeek ignores a running Ray cluster, but Qwen3.5 hard-fails without one. Launch the containers in Ray mode if you want to swap freely between them.
 
----
-
-## Docker Images
-
-### `vllm-mxfp4-spark:latest` — GPT-OSS 120B only
-
-Built from [github.com/alejandroacho/gb10-vllm-mxfp4-docker](https://github.com/alejandroacho/gb10-vllm-mxfp4-docker). Contains:
-
-- **CUTLASS MXFP4 MoE kernels** compiled for SM121
-- FP8 E4M3 KV cache with GPT-OSS attention sink support
-- PyTorch and Triton compiled natively for SM121
-- `fastsafetensors` for fast NVMe-to-GPU weight loading
-
-```bash
-git clone https://github.com/alejandroacho/gb10-vllm-mxfp4-docker ~/gb10-vllm-mxfp4-docker
-just build-spark
-```
-
-This image is **not compatible with Qwen3-Coder-Next**. It has a custom `vllm.envs` missing `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER`.
-
----
-
-### `blackwell-vllm:latest` — Qwen3-Coder-Next FP8 and other vLLM models
-
-`vllm/vllm-openai:cu130-nightly` re-tagged locally with two patches baked in (see `models/qwen3-coder-next/`):
-
-| Patch | What it fixes |
-|---|---|
-| Revert PR #34279 | Removes `tl.int64` Triton MoE stride annotations that cause severe slowness on GB10 |
-| `_triton_alloc_setup.py` | Patches `triton.runtime._allocation.NullAllocator` to use CUDA caching allocator |
-
-Expected throughput: **43–48 tok/s** decode, **~3000 tok/s** prefill, up to 262K token context.
-
----
-
-### `comfyui-flux:latest` — FLUX.1-dev image generation
-
-Built from `Dockerfile.comfyui`. Runs `inference/flux_server.py` — a FastAPI server that loads FLUX.1-dev via Diffusers and exposes `POST /generate`.
-
-- Base image: `nvcr.io/nvidia/pytorch:25.01-py3` (CUDA 12.8, compatible with driver 525+)
-- Model loaded in BF16 to avoid APEX fused layer norm issues with FP16
-- Health endpoint returns 503 while model loads, 200 when ready
-- Current speed: ~12s/step (~6 min for 30 steps) — pytorch:25.01 has no sm_121 kernels
-
-```bash
-# Build
-docker build -f Dockerfile.comfyui -t comfyui-flux:latest .
-
-# Download weights (~34 GB, requires HuggingFace login with FLUX.1-dev access)
-cd models/flux2-pro && ./download.sh
-```
+The Gateway checks this before every Qwen3.5 swap and refuses with a clear message rather than starting a process that would die.
 
 ---
 
@@ -170,76 +91,97 @@ cd models/flux2-pro && ./download.sh
 
 | Requirement | Minimum |
 |---|---|
-| **OS** | Linux (Ubuntu 22.04+ recommended) |
-| **Docker** | Docker Engine 24+ with Docker Compose V2 |
-| **NVIDIA Driver** | 535+ (Blackwell-compatible) |
-| **NVIDIA Container Toolkit** | `nvidia-container-toolkit` installed and configured |
-| **GPU** | 1× NVIDIA GB10 Blackwell with ~120 GB unified VRAM |
-| **System RAM** | 218 GB+ (512 GB+ enables fast pause/unpause swap strategy) |
-| **Storage** | NVMe SSD with models at `/home/alejandroacho/Models/` |
-| **Python** | 3.10+ (only needed for local development without Docker) |
+| **Nodes** | 2× NVIDIA DGX Spark (GB10 Blackwell), 128 GB unified memory each |
+| **Interconnect** | ConnectX-7 direct link between the nodes (see [docs/NETWORKING.md](https://github.com/eugr/spark-vllm-docker/blob/main/docs/NETWORKING.md) in the spark repo) |
+| **SSH** | Passwordless from head to worker |
+| **OS** | Linux aarch64, NVIDIA driver 580+ / CUDA 13 |
+| **Docker** | Engine 24+ with Compose V2 and NVIDIA Container Toolkit, on **both** nodes |
+| **Storage** | ~170 GB per model, per node |
+| **Python** | 3.10+ (local development only) |
 
 ---
 
-## Quick Start (fresh machine)
+## Cluster Setup
 
-### 1. Prerequisites
+Everything below runs on the **head node**.
+
+### 1. Clone the launcher and install `uv`
 
 ```bash
-# Install Docker Engine + NVIDIA Container Toolkit
-# https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
-
-# Install just
-cargo install just   # or: brew install just / apt install just
-
-# Install the hf CLI and log in
-pip install -U huggingface_hub
-hf login
+git clone https://github.com/eugr/spark-vllm-docker.git ~/spark-vllm-docker
+curl -LsSf https://astral.sh/uv/install.sh | sh   # hf-download.sh calls `uvx hf download`
 ```
 
-### 2. Clone the repos
+### 2. Pin the cluster configuration
+
+Autodiscovery is bypassed on purpose here. This host has **four** CX7 links with two interfaces per subnet (`192.168.100.0/24` and `192.168.200.0/24`), and `autodiscover.sh` rejects duplicate subnets — correctly, since it makes routing ambiguous. Instead, `~/spark-vllm-docker/.env` pins the nodes and interfaces:
 
 ```bash
-git clone https://github.com/alejandroacho/Server ~/Server
-git clone https://github.com/alejandroacho/gb10-vllm-mxfp4-docker ~/gb10-vllm-mxfp4-docker
+CLUSTER_NODES="192.168.200.12,192.168.200.13"
+ETH_IF="enp1s0f1np1"                    # holds .12 here and .13 there
+IB_IF="rocep1s0f1,roceP2p1s0f1"         # port 1 of both CX7 cards, 2 RDMA rails
+LOCAL_IP="192.168.200.12"
+MASTER_PORT="29501"
+COPY_HOSTS="192.168.200.13"
+```
+
+> Re-addressing the four links so each gets its own `/24` (per the spark repo's networking guide) would fix routing properly and re-enable autodiscovery. It needs root and would break the current `192.168.200.x` references.
+
+### 3. Pull the B12X runner image onto both nodes
+
+```bash
+cd ~/spark-vllm-docker
+./build-and-copy.sh --exp-b12x -c
+```
+
+`--exp-b12x` pulls the prebuilt, upstream-tested `eugr/spark-vllm-b12x:latest` (~23 GB) and tags it `vllm-node-b12x`. Nothing is compiled — older instructions that build vLLM and a FlashInfer PR from source are obsolete.
+
+### 4. Download weights to `~/hf-cache` on both nodes
+
+**Use `HF_HOME=~/hf-cache`, not the default cache.** On this cluster the worker's `~/.cache/huggingface/hub` is owned by root (a container created it) and holds another user's models, so rsync cannot write there. `~/hf-cache` is user-owned on both nodes and needs no root.
+
+```bash
+mkdir -p ~/hf-cache/hub
+ssh 192.168.200.13 'mkdir -p ~/hf-cache/hub'
+
+cd ~/spark-vllm-docker
+HF_HOME=~/hf-cache ./hf-download.sh deepseek-ai/DeepSeek-V4-Flash-0731 -c   # ~167 GB
+HF_HOME=~/hf-cache ./hf-download.sh Qwen/Qwen3.5-122B-A10B-FP8 -c           # ~127 GB
+```
+
+`-c` copies to `COPY_HOSTS` over the fast link (~575 MB/s in practice, ~5 min for DeepSeek).
+
+> If a model is already in the default cache, hardlink it instead of downloading twice — same filesystem, zero extra space:
+> `cp -al ~/.cache/huggingface/hub/models--org--name ~/hf-cache/hub/`
+
+### 5. Launch the cluster containers
+
+```bash
+cd ~/spark-vllm-docker
+HF_HOME=~/hf-cache ./run-recipe.sh deepseek-v4-flash-0731 --port 8020 -d
+```
+
+This applies the mods, brings up `vllm_node` on both nodes, and starts the model. From here the Gateway takes over the process lifecycle.
+
+### 6. Give the Gateway SSH access to the worker
+
+The Gateway needs to start the headless rank on the worker, which lives on another Docker daemon. Use a **dedicated** key, not your personal one:
+
+```bash
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_spark_gateway -C "blackwell-gateway->spark-worker"
+ssh-copy-id -f -i ~/.ssh/id_spark_gateway.pub 192.168.200.13
+```
+
+`docker-compose.yml` mounts it read-only at `/ssh/id_spark`.
+
+> **Security:** this key lets the Gateway container run `docker` on the worker — root-equivalent access there. It is the unavoidable cost of managing a remote rank. To narrow it, restrict the key with a `command=` prefix in the worker's `authorized_keys`.
+
+### 7. Start the Gateway
+
+```bash
 cd ~/Server
-```
-
-### 3. Build Docker images
-
-```bash
-# Build everything: spark (~30 min), qwen3 (~2 min), flux (~5 min), gateway (~1 min)
-just build
-
-# Or individually:
-just build-spark       # vllm-mxfp4-spark:latest  (GPT-OSS 120B)
-just build-qwen3       # blackwell-vllm:latest     (Qwen3-Coder-Next)
-docker build -f Dockerfile.comfyui -t comfyui-flux:latest .   # FLUX.1-dev
-docker compose build gateway
-```
-
-### 4. Download model weights
-
-```bash
-just download-gpt-oss    # openai/gpt-oss-120b      → ~/Models/gpt-oss-120b-q8  (~240 GB)
-just download-qwen3      # Qwen/Qwen3-Coder-Next-FP8 → HF cache                 (~95 GB)
-cd models/flux2-pro && ./download.sh   # FLUX.1-dev  → ~/Models/flux2-pro-fp16  (~34 GB)
-```
-
-> Ctrl+C pauses any download — re-running resumes it.
-
-### 5. Launch
-
-```bash
-just up
-```
-
-### 6. Verify it's running
-
-```bash
-just health    # gateway health check
-just vram      # VRAM usage
-just profile   # active profile and loaded models
+docker compose build gateway && docker compose up -d gateway
+make health
 ```
 
 ---
@@ -248,13 +190,20 @@ just profile   # active profile and loaded models
 
 ```bash
 cd ~/Server
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-> **Note:** Local development requires Docker Engine running (the Gateway manages inference containers via the Docker socket).
+> Requires a reachable Docker socket (the Gateway drives containers through it) and, for Spark models, an `ssh` binary plus a readable `SPARK_SSH_KEY`.
+
+Tests mock Docker, NVML and SSH entirely — no GPU or cluster needed:
+
+```bash
+pytest tests/ -v
+```
+
+Because the shipped catalog holds only `spark_cluster` models, tests that exercise the generic Docker container lifecycle use a **synthetic catalog** registered by `tests/conftest.py` (`TEST_MODEL_A/B/C`, `TEST_PROFILE_A/B`). Add new Docker-managed fixtures there rather than coupling tests to the real catalog.
 
 ---
 
@@ -263,32 +212,31 @@ python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8000 --reload
 ### Inference
 
 | Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/v1/chat/completions` | **Unified endpoint** — auto-detects text/image/video and routes accordingly. OpenAI-compatible. |
-| `POST` | `/v1/images/generate` | Direct image generation (FLUX.1-dev). Returns base64 PNG. |
-| `POST` | `/v1/videos/generate` | Direct video generation (LTX-Video 2) |
-| `GET`  | `/v1/models` | List available models (OpenAI format) |
+|---|---|---|
+| `POST` | `/v1/chat/completions` | OpenAI-compatible. Streaming supported. Swaps profile if the requested model belongs to another one. |
+| `GET` | `/v1/models` | Available models plus the active profile's label aliases (`chat`, `code`) |
 
-### System Status
+### System status
 
 | Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/health` | Gateway health check + cluster status |
-| `GET` | `/status/vram` | Detailed VRAM report from nvidia-smi |
-| `GET` | `/status/swap` | Current swap status (in progress, elapsed, queue) |
-| `GET` | `/status/profile` | Active profile and loaded models |
-| `GET` | `/status/cache` | Radix Prefix Cache statistics |
+|---|---|---|
+| `GET` | `/health` | Health, active profile mode, per-container state, and Ray cluster state (`ray`) when — and only when — a loaded model needs Ray. `status` is `degraded` if that cluster is short on nodes |
+| `GET` | `/status/vram` | Memory report for the **local node only** — cluster models are sharded, so the other node's half is not counted. On unified-memory hosts the figures come from the host's `MemAvailable` (see below), not from NVML |
+| `GET` | `/status/swap` | Swap in progress, elapsed, queue depth |
+| `GET` | `/status/profile` | Active profile and its models |
+| `GET` | `/v1/profiles` | All profiles |
+| `GET` | `/v1/profiles/active` | Active profile with its registry key — the reliable source for "what is loaded" |
+| `GET` | `/status/cache` | Radix prefix cache statistics |
 
 ### Administration
 
 | Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/admin/profile/{name}` | Manually switch profile (`focus`, `focus_code`, `creative_image`, `creative_video`) |
-| `POST` | `/admin/container/{name}/stop` | Stop a specific inference container |
-| `POST` | `/admin/container/{name}/remove` | Remove a specific inference container |
+|---|---|---|
+| `POST` | `/admin/profile/{name}` | Switch profile (`deepseek`, `qwen35`). Add `?force=true` to restart the active one. |
+| `POST` | `/admin/container/{name}/stop` | Stop a Docker-managed workload |
+| `POST` | `/admin/container/{name}/remove` | Remove a Docker-managed workload |
 
 - **Swagger UI:** [http://localhost:8000/docs](http://localhost:8000/docs)
-- **ReDoc:** [http://localhost:8000/redoc](http://localhost:8000/redoc)
 
 ---
 
@@ -298,84 +246,101 @@ python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8000 --reload
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
+  -H 'Content-Type: application/json' \
   -d '{
-    "messages": [
-      {"role": "system", "content": "You are a senior software engineer."},
-      {"role": "user", "content": "Explain the observer pattern in Go."}
-    ],
-    "temperature": 0.7,
-    "max_tokens": 2048,
-    "agent_id": "agent-1"
+    "model": "deepseek-v4-flash",
+    "messages": [{"role": "user", "content": "Explain MoE routing in one paragraph"}],
+    "max_tokens": 4000
   }'
 ```
 
-### Image generation (direct endpoint)
-
-```bash
-curl -X POST http://localhost:8000/v1/images/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "A photorealistic mountain landscape with northern lights",
-    "width": 1024,
-    "height": 1024,
-    "steps": 30,
-    "seed": 42
-  }'
-```
-
-Response: `{"success": true, "data": {"images": ["<base64 PNG>"], "seed": 42, ...}}`
-
-To save to disk:
-```bash
-curl -s -X POST http://localhost:8000/v1/images/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "a red cat"}' \
-  | python3 -c "
-import sys, json, base64
-data = json.load(sys.stdin)
-img = base64.b64decode(data['data']['images'][0])
-open('output.png', 'wb').write(img)
-print('Saved output.png')
-"
-```
-
-### Video generation
-
-```bash
-curl -X POST http://localhost:8000/v1/videos/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "A drone flyover of a coral reef in crystal clear water",
-    "width": 768,
-    "height": 512,
-    "num_frames": 81,
-    "fps": 24
-  }'
-```
+Or use a label that follows the active profile: `"model": "chat"`.
 
 ### Manual profile switch
 
 ```bash
-curl -X POST http://localhost:8000/admin/profile/focus_code      # Qwen3 Coder Next 80B (default)
-curl -X POST http://localhost:8000/admin/profile/focus            # GPT-OSS 120B
-curl -X POST http://localhost:8000/admin/profile/creative_image   # FLUX.1-dev
-curl -X POST http://localhost:8000/admin/profile/creative_video   # LTX-Video 2
+curl -X POST http://localhost:8000/admin/profile/deepseek
+curl -X POST http://localhost:8000/admin/profile/qwen35
 ```
+
+A swap tears down the current model's processes and starts the new ones. Expect **2-5 minutes**, not seconds — `LONG_POLLING_ENABLED=true` holds client connections meanwhile.
+
+### ⚠️ Give DeepSeek room to think
+
+The recipe sets `reasoning_effort=high`, so the model reasons at length before answering, and the reasoning is billed against `max_tokens`. With a tight budget you get an **empty `content`** and `finish_reason: "length"` — all tokens went to reasoning. Use generous `max_tokens` (4000+), or lower the effort per request.
+
+The chain of thought arrives in the **`reasoning`** field of the message, not `reasoning_content`.
 
 ---
 
 ## Swap Behavior
 
 | Config | Behavior |
-|--------|----------|
-| `LONG_POLLING_ENABLED=true` | Connection stays open; response sent once the swap completes |
-| `LONG_POLLING_ENABLED=false` | Immediate `HTTP 503` with `Retry-After` header |
+|---|---|
+| `LONG_POLLING_ENABLED=true` | Connection held; response sent once the swap completes |
+| `LONG_POLLING_ENABLED=false` | Immediate `HTTP 503` with `Retry-After` |
 
-| System RAM | Strategy | Speed |
+Docker-managed models still honor the pause/unpause vs stop/start strategy (`SYSTEM_RAM_GB ≥ 512` picks pause/unpause), but the two catalog models are `spark_cluster`: swapping them means killing and relaunching `vllm serve`, dominated by weight loading.
+
+Measured on this cluster: DeepSeek reaches `READY` in **~165 s** from a warm container, **~285 s** cold. InstantTensor loads its 72,317 tensors at ~3,500/s, and CUDA graph capture adds ~25 s.
+
+---
+
+## Memory Accounting on Unified-Memory Hosts
+
+The GB10 has no dedicated VRAM: the GPU allocates from the same LPDDR the OS
+uses. Two NVML paths that work on discrete GPUs both fail here:
+
+- `nvmlDeviceGetMemoryInfo` returns **`Not Supported`** (so does
+  `nvidia-smi --query-gpu=memory.used`, which prints `N/A`).
+- Per-process accounting only sees processes in the caller's PID namespace.
+  The Gateway runs in its own container while `vllm serve` runs in
+  `vllm_node`, so it reads back an **empty** process list.
+
+Together those made the Gateway report 0 MB used and a fully free GPU while
+vLLM held ~101 GiB. The memory figures therefore come from the host's
+`/proc/meminfo`, bind-mounted at `HOST_MEMINFO_PATH`, using **`MemAvailable`**
+— the kernel's own estimate of what a new allocation can get, which counts
+reclaimable page cache and every other container. Swap is deliberately
+excluded: serving a model from swap is worse than refusing to load it. NVML is
+still used for temperature and utilization, which it reports correctly.
+
+Note that vLLM's `--gpu-memory-utilization` (0.85 here) reserves its pool
+**once at startup** and never returns it, so this figure does not drop between
+requests. It only drops when `vllm serve` exits.
+
+The catalog's profiles keep `skip_vram_check=True`, and should: their
+`vram_required_mb` is a **cluster-wide** total (DeepSeek declares 220 GB
+across two nodes), so comparing it against one node's memory would reject
+loads that fit fine. Enabling the check would first require a per-node budget.
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
 |---|---|---|
-| ≥ 512 GB | `pause/unpause` | ~1-2s |
-| < 512 GB | `stop/start` | ~3-5s |
+| `GATEWAY_HOST` | `0.0.0.0` | Host to bind |
+| `GATEWAY_PORT` | `8000` | Port to listen on |
+| `RAY_HEAD_HOST` | `192.168.200.12` | Head node IP — where `spark_cluster` models expose their HTTP port |
+| `SPARK_CLUSTER_CONTAINER` | `vllm_node` | Container the serve processes are exec'd into |
+| `SPARK_WORKER_HOSTS` | `192.168.200.13` | Comma-separated worker IPs (ranks ≥ 1) |
+| `SPARK_SSH_USER` | `alejandroacho` | SSH user for the workers |
+| `SPARK_SSH_KEY` | `/ssh/id_spark` | SSH identity inside the container |
+| `SPARK_MASTER_PORT` | `29501` | Multi-node coordination port (match the launcher's `.env`) |
+| `MODELS_PATH` | `/home/alejandroacho/Models` | Local weights path (Docker-managed models only) |
+| `SYSTEM_RAM_GB` | auto | Total RAM in GiB, read from `MemTotal`. Determines swap strategy and caps the VRAM budget. Set only to override |
+| `HOST_MEMINFO_PATH` | `/host/meminfo` | Host `/proc/meminfo`, bind-mounted read-only. The memory source of truth on unified-memory hosts |
+| `SWAP_TIMEOUT_S` | `600` | Max seconds to wait for a swap |
+| `VRAM_POLL_INTERVAL_S` | `2.0` | nvidia-smi polling interval |
+| `VRAM_SAFETY_MARGIN_MB` | `4096` | VRAM kept free as a buffer |
+| `DOCKER_SOCKET` | `unix:///var/run/docker.sock` | Docker daemon socket |
+| `DOCKER_NETWORK` | `blackwell-gateway_blackwell_net` | Docker network name |
+| `LONG_POLLING_ENABLED` | `true` | Hold connections during swaps |
+| `LONG_POLLING_TIMEOUT_S` | `600` | Max long-polling wait |
+| `MAX_QUEUE_SIZE` | `200` | Max requests queued during a swap |
+| `RETRY_AFTER_SECONDS` | `5` | `Retry-After` value for 503s |
+| `RAY_WATCHDOG_INTERVAL_S` | `30` | Seconds between backend health checks (0 disables) |
 
 ---
 
@@ -383,140 +348,87 @@ curl -X POST http://localhost:8000/admin/profile/creative_video   # LTX-Video 2
 
 ```
 Server/
-├── Dockerfile                  # Gateway container image
-├── Dockerfile.comfyui          # FLUX.1-dev inference server image
-├── Dockerfile.ltx              # LTX-Video 2 inference server image
-├── docker-compose.yml          # Full stack definition
-├── justfile                    # Task runner
-├── requirements.txt            # Python dependencies
-├── ray-cluster/                # Ray distributed inference cluster
-│   ├── README.md               # Stacked Sparks full setup guide (connect, NCCL, vLLM)
-│   ├── README_head_node.md     # Node 1 (head) setup guide
-│   ├── README_worker_node.md   # Node 2 (worker) setup guide
-│   ├── Dockerfile.blackwell-vllm  # Ray node image (blackwell-vllm:latest)
-│   ├── patch_gemma4.py         # Patches vLLM 0.17.1 to register Gemma 4 architectures
-│   ├── run_cluster.sh          # Low-level Docker run wrapper for Ray nodes
-│   ├── reset_ray_node.sh       # Tear-down + restart a Ray node (head or worker)
-│   ├── check_ray_cluster_status.sh  # Quick cluster health check (ray status)
-│   ├── ray-node-head.service   # systemd unit for Node 1
-│   └── ray-node-worker.service # systemd unit for Node 2
-├── inference/
-│   ├── flux_server.py          # FLUX.1-dev FastAPI server (port 8004)
-│   └── ltx_server.py           # LTX-Video 2 FastAPI server (port 8005)
-├── models/
-│   ├── gpt-oss-120b/
-│   │   ├── Dockerfile          # FROM vllm-mxfp4-spark:latest
-│   │   └── download.sh         # hf download openai/gpt-oss-120b (~240 GB)
-│   ├── qwen3-coder-next/
-│   │   ├── Dockerfile          # FROM cu130-nightly + GB10 patches
-│   │   ├── fix_slowness.diff   # Reverts vLLM PR #34279
-│   │   ├── _triton_alloc_setup.py
-│   │   ├── _triton_alloc_setup.pth
-│   │   └── download.sh         # hf download Qwen/Qwen3-Coder-Next-FP8 (~95 GB)
-│   └── flux2-pro/
-│       ├── Dockerfile          # Reference → Dockerfile.comfyui at root
-│       └── download.sh         # hf download black-forest-labs/FLUX.1-dev (~34 GB)
-└── gateway/
-    ├── app.py                  # FastAPI application (main entry point)
-    ├── config.py               # Central configuration + VRAM profiles
-    ├── orchestrator.py         # Docker container lifecycle manager
-    ├── proxy.py                # HTTP proxy to inference backends
-    ├── request_buffer.py       # Request queue + Radix Prefix Cache
-    ├── router.py               # Smart routing + trigger detection
-    ├── schemas.py              # Pydantic data models
-    └── vram_monitor.py         # nvidia-smi VRAM monitoring
+├── Dockerfile                  # Gateway image (python:3.12-slim + openssh-client)
+├── docker-compose.yml          # Gateway only — models live on the Spark cluster
+├── Makefile                    # Task runner
+├── requirements.txt
+├── gateway/
+│   ├── app.py                  # FastAPI application and endpoints
+│   ├── config.py               # Model catalog, profiles, environment
+│   ├── orchestrator.py         # Lifecycle: Docker workloads + spark_cluster processes
+│   ├── proxy.py                # HTTP proxy to the backends
+│   ├── request_buffer.py       # Request queue + radix prefix cache
+│   ├── router.py               # Model/profile routing (text only)
+│   ├── schemas.py              # Pydantic models
+│   ├── vram_monitor.py         # nvidia-smi monitoring
+│   └── backends/               # Docker and Kubernetes orchestration backends
+├── tests/                      # Fully mocked; no GPU or cluster required
+├── ray-cluster/                # Legacy Ray cluster tooling (see note below)
+└── k8s/                        # Kubernetes manifests
 ```
 
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GATEWAY_HOST` | `0.0.0.0` | Host to bind |
-| `GATEWAY_PORT` | `8000` | Port to listen on |
-| `MODELS_PATH` | `/home/alejandroacho/Models` | Path to model weights on host |
-| `SYSTEM_RAM_GB` | `218` | System RAM (determines swap strategy) |
-| `SWAP_TIMEOUT_S` | `600` | Max seconds to wait for a swap |
-| `VRAM_POLL_INTERVAL_S` | `2.0` | nvidia-smi polling interval |
-| `VRAM_SAFETY_MARGIN_MB` | `4096` | VRAM to keep free as safety buffer |
-| `DOCKER_SOCKET` | `unix:///var/run/docker.sock` | Docker daemon socket |
-| `DOCKER_NETWORK` | `blackwell-gateway_blackwell_net` | Docker network name |
-| `LONG_POLLING_ENABLED` | `true` | Hold connections during swaps |
-| `LONG_POLLING_TIMEOUT_S` | `600` | Max long polling wait |
-| `MAX_QUEUE_SIZE` | `200` | Max requests queued during swap |
-| `RETRY_AFTER_SECONDS` | `5` | Retry-After header value for 503s |
-| `RAY_WATCHDOG_INTERVAL_S` | `30` | Seconds between Ray cluster health checks (0 to disable) |
+> `ray-cluster/`, `inference/`, `models/`, `Dockerfile.comfyui` and `Dockerfile.ltx` are leftovers from the previous single-node, multimedia-capable setup. Nothing in the current catalog references them.
 
 ---
 
 ## Troubleshooting
 
-### Gateway won't start
-```bash
-docker compose logs -f gateway
-ls -la /var/run/docker.sock
-docker run --rm --runtime=nvidia nvidia/cuda:12.0-base nvidia-smi
-```
+### Swap refused: "cluster container 'vllm_node' is not running"
 
-### FLUX container fails with "model_index.json not found"
-The model directory is empty. Download weights:
-```bash
-cd models/flux2-pro && ./download.sh
-```
-
-### FLUX container: "expected scalar type Float but found Half"
-Model is loaded in FP16. Switch to BF16 in `inference/flux_server.py`:
-```python
-torch_dtype=torch.bfloat16
-```
-
-### FLUX generation is slow (~12s/step)
-pytorch:25.01 does not have native SM121 (GB10) kernels. The container warns "GB10 GPU may not yet be supported". Performance will improve when migrating to a Blackwell-native PyTorch image. Current workaround: proxy timeout set to 900s.
-
-### Swap is too slow
-- Increase `SYSTEM_RAM_GB` if you have ≥512 GB RAM (enables fast pause/unpause)
-- Check NVMe speed: `fio --name=test --rw=read --bs=1M --size=1G --numjobs=1`
-
-### VRAM errors during swap
-```bash
-curl http://localhost:8000/status/vram
-curl -X POST "http://localhost:8000/admin/profile/focus?force=true"
-```
-
-### GPT-OSS 120B: `cudaErrorIllegalAddress` crash with concurrent requests
-
-CUDA graphs are incompatible with MXFP4 CUTLASS kernels on SM121 (GB10) when batching multiple requests. The vLLM EngineCore crashes with `torch.AcceleratorError: CUDA error: an illegal memory access was encountered`.
-
-**Fix:** `--enforce-eager` is enabled in `config.py` to disable CUDA graphs. This adds ~5-10% latency per token but eliminates the crash entirely, allowing multi-agent concurrency.
-
-The `--max-num-seqs` parameter controls how many requests vLLM batches simultaneously. Default: `10`. All requests run in parallel sharing GPU throughput (e.g. 10 concurrent requests ≈ 5-6 tok/s each instead of ~57 tok/s for a single one).
-
-### Config changes don't take effect after editing `config.py`
-
-The Gateway builds container args at creation time. If a container is already running (or gets restarted by Docker's `unless-stopped` policy), it keeps its original args. To apply new config:
+The Gateway never creates that container. Bring it up on both nodes:
 
 ```bash
-# 1. Remove the container (stops and deletes it)
-curl -X POST http://localhost:8000/admin/container/<container-name>/remove
-
-# 2. Force-recreate with new args
-curl -X POST "http://localhost:8000/admin/profile/<profile>?force=true"
+cd ~/spark-vllm-docker && HF_HOME=~/hf-cache ./run-recipe.sh deepseek-v4-flash-0731 --port 8020 -d
 ```
 
-This causes ~60-90s downtime while vLLM reloads the model.
+### Swap refused: "it shards through Ray but 'vllm_node' sees 0 Ray node(s)"
 
-### Container stuck in STARTING state
+Qwen3.5 needs a Ray cluster spanning the containers, and they were launched in native multi-node mode (what DeepSeek uses). Relaunch in Ray mode:
+
 ```bash
-docker logs <container-name>
-curl -X POST http://localhost:8000/admin/container/<container-name>/remove
+cd ~/spark-vllm-docker && HF_HOME=~/hf-cache ./run-recipe.sh qwen3.5-122b-fp8 --port 8021 -d
 ```
 
-### Qwen3-Coder-Next: "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER" AttributeError
-Qwen3-Next is being served on `vllm-mxfp4-spark` instead of `blackwell-vllm`. Verify `config.py` has `QWEN3_CODER_NEXT_80B` using `container_image="blackwell-vllm:latest"`.
+### Empty `content` in the response
 
-### Qwen3-Coder-Next: 2–3 tok/s instead of ~43 tok/s
-vLLM PR #34279 causes slowness on GB10. Check that `fix_slowness.diff` is applied. Look for `Using TRITON Fp8 MoE backend` in container logs.
+Not a bug — see the warning under Usage Examples. Raise `max_tokens`.
+
+### SSH failures in the Gateway logs
+
+```bash
+docker exec blackwell-gateway ssh -i /ssh/id_spark -o BatchMode=yes \
+  alejandroacho@192.168.200.13 hostname
+```
+
+`Permission denied (publickey)` means the key never landed on the worker. Note that `ssh-copy-id` may report "all keys were skipped because they already exist" while installing nothing — use `-f` to force, and verify from inside the container as above rather than from the host, where your personal key or `~/.ssh/config` can mask the failure.
+
+### Model loading hangs for 20+ minutes
+
+`--load-format instanttensor` without the `instanttensor-hybrid-draft-loader` mod. `run-recipe.sh` applies it from the recipe; a hand-rolled `launch-cluster.sh` invocation must pass `--apply-mod mods/instanttensor-hybrid-draft-loader`.
+
+### `vllm serve: error: argument --reasoning-config: Invalid JSON`
+
+The JSON reached vLLM mangled by a shell layer. The Gateway writes the serve command to a file through a quoted heredoc precisely to avoid this — if you see it, something re-wrapped the command in `bash -c '...'`, where `shlex`'s single quotes collide with the wrapper's and the shell eats the braces.
+
+### Reading a model's own log
+
+```bash
+docker exec vllm_node tail -f /tmp/vllm_deepseek-v4-flash_r0.log      # rank 0, head
+ssh 192.168.200.13 'docker exec vllm_node tail -f /tmp/vllm_deepseek-v4-flash_r1.log'
+```
+
+### Inspecting what actually runs
+
+```bash
+docker exec vllm_node bash -c "cat /proc/\$(pgrep -f 'vllm serve' | head -1)/cmdline | tr '\0' '\n'"
+```
+
+---
+
+## Current State
+
+- **`deepseek`** is operational: weights on both nodes, serving on 8020, ~49 tok/s single-stream, 1,146,734 tokens of KV cache.
+- **`qwen35`** is configured but **not yet operational**: its 127 GB of weights are not downloaded, and the containers currently run in native (non-Ray) mode, so its preflight check will refuse the swap. Downloading it leaves only ~24 GB free on the head node — worth freeing space first.
 
 ---
 

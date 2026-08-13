@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import pytest
 
-from gateway.config import GPT_OSS_120B
+from tests.conftest import TEST_MODEL_A
 from gateway.proxy import InferenceProxy
 
 
@@ -66,7 +66,7 @@ class TestChatCompletionRetry:
         )
 
         result = await proxy.chat_completion(
-            GPT_OSS_120B, {"messages": []}, stream=False
+            TEST_MODEL_A, {"messages": []}, stream=False
         )
 
         assert result == expected
@@ -89,7 +89,7 @@ class TestChatCompletionRetry:
         proxy._session.post = _alternating_post
 
         result = await proxy.chat_completion(
-            GPT_OSS_120B, {"messages": []}, stream=False
+            TEST_MODEL_A, {"messages": []}, stream=False
         )
 
         assert result == {"ok": True}
@@ -106,7 +106,7 @@ class TestChatCompletionRetry:
         proxy._session.post = _always_fail
 
         result = await proxy.chat_completion(
-            GPT_OSS_120B, {"messages": []}, stream=False
+            TEST_MODEL_A, {"messages": []}, stream=False
         )
 
         assert "error" in result
@@ -129,7 +129,7 @@ class TestChatCompletionRetry:
         proxy._session.post = _timeout_then_ok
 
         result = await proxy.chat_completion(
-            GPT_OSS_120B, {"messages": []}, stream=False
+            TEST_MODEL_A, {"messages": []}, stream=False
         )
 
         assert result == {"done": True}
@@ -149,7 +149,7 @@ class TestChatCompletionRetry:
         proxy._session.post = _http_error
 
         result = await proxy.chat_completion(
-            GPT_OSS_120B, {"messages": []}, stream=False
+            TEST_MODEL_A, {"messages": []}, stream=False
         )
 
         assert "error" in result

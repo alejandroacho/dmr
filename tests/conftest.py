@@ -15,6 +15,101 @@ import pytest
 from gateway.backends.base import ExecResult, WorkloadInfo
 
 
+# ─── Synthetic Docker-managed catalog for tests ──────────────────
+#
+# The shipped catalog holds only spark_cluster models, whose backend is a
+# process exec'd inside a container the Gateway must never create or destroy.
+# Tests that exercise the generic container lifecycle (create, pause, unpause,
+# remove) need Docker-managed models, so they are defined here and registered
+# into the catalog for the duration of the test session.
+
+def _register_test_catalog():
+    from gateway.config import ALL_MODELS, PROFILES, ModelDefinition, VRAMProfile
+    from gateway.schemas import ProfileMode
+
+    model_a = ModelDefinition(
+        name="test-model-a",
+        container_image="test-image:latest",
+        container_name="vllm-test-a",
+        vram_required_mb=40_000,
+        port=9101,
+        tensor_parallel_size=1,
+        hf_model_id="test-org/model-a",
+        engine="vllm",
+    )
+    model_b = ModelDefinition(
+        name="test-model-b",
+        container_image="test-image:latest",
+        container_name="vllm-test-b",
+        vram_required_mb=50_000,
+        port=9102,
+        tensor_parallel_size=1,
+        hf_model_id="test-org/model-b",
+        engine="vllm",
+    )
+    model_c = ModelDefinition(
+        name="test-model-c",
+        container_image="test-image:latest",
+        container_name="vllm-test-c",
+        vram_required_mb=8_000,
+        port=9103,
+        tensor_parallel_size=1,
+        hf_model_id="test-org/model-c",
+        engine="vllm",
+    )
+    # Nothing in the shipped catalog uses the ray_vllm engine (its models are
+    # spark_cluster), so the Ray-head code path needs a model of its own.
+    model_ray = ModelDefinition(
+        name="test-model-ray",
+        container_image="test-image:latest",
+        container_name="vllm-test-ray",
+        vram_required_mb=60_000,
+        port=9104,
+        tensor_parallel_size=2,
+        hf_model_id="test-org/model-ray",
+        engine="ray_vllm",
+    )
+
+    profile_a = VRAMProfile(
+        mode=ProfileMode.FOCUS,
+        description="Test profile A (single Docker-managed model)",
+        primary_models=[model_a],
+        labels={"chat": model_a},
+    )
+    profile_b = VRAMProfile(
+        mode=ProfileMode.FOCUS,
+        description="Test profile B (primary + secondary)",
+        primary_models=[model_b],
+        secondary_models=[model_c],
+        labels={"code": model_b, "chat": model_c},
+    )
+
+    profile_ray = VRAMProfile(
+        mode=ProfileMode.FOCUS,
+        description="Test profile Ray (model served inside the Ray head)",
+        primary_models=[model_ray],
+        labels={"chat": model_ray},
+        skip_vram_check=True,
+    )
+
+    ALL_MODELS.extend([model_a, model_b, model_c, model_ray])
+    PROFILES["test_a"] = profile_a
+    PROFILES["test_b"] = profile_b
+    PROFILES["test_ray"] = profile_ray
+    return model_a, model_b, model_c, model_ray, profile_a, profile_b, profile_ray
+
+
+(
+    TEST_MODEL_A,
+    TEST_MODEL_B,
+    TEST_MODEL_C,
+    TEST_MODEL_RAY,
+    TEST_PROFILE_A,
+    TEST_PROFILE_B,
+    TEST_PROFILE_RAY,
+) = _register_test_catalog()
+
+
 # ─── Patch docker.DockerClient BEFORE importing gateway modules ──
 
 @pytest.fixture(autouse=True)
