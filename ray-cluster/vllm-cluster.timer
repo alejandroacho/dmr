@@ -1,0 +1,17 @@
+[Unit]
+Description=Re-check the vLLM cluster containers periodically
+Documentation=file:///home/alejandroacho/Server/ray-cluster/ensure_vllm_cluster.sh
+
+[Timer]
+# At boot: after Docker has settled.
+OnBootSec=90s
+# And every 2 minutes afterwards. This is what covers the worker rebooting on
+# its own — the head owns the launch, so nothing on the worker recreates its
+# container, and the head has to notice. The check is two `docker inspect`
+# calls and exits immediately when the cluster is healthy.
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=vllm-cluster.service
+
+[Install]
+WantedBy=timers.target

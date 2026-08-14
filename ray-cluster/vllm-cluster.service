@@ -1,0 +1,21 @@
+[Unit]
+Description=vLLM cluster containers (vllm_node on head + worker)
+Documentation=file:///home/alejandroacho/Server/ray-cluster/ensure_vllm_cluster.sh
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as the user, not root: it needs that user's SSH key to reach the worker
+# and its docker group membership locally.
+User=alejandroacho
+Group=alejandroacho
+ExecStart=/bin/bash /home/alejandroacho/Server/ray-cluster/ensure_vllm_cluster.sh
+# Long enough for the launcher to build and start both containers.
+TimeoutStartSec=600s
+# Deliberately no RemainAfterExit: the timer re-runs this to catch a worker
+# that rebooted on its own, and the script is a no-op when all is well.
+
+[Install]
+WantedBy=multi-user.target
