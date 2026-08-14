@@ -184,6 +184,39 @@ docker compose build gateway && docker compose up -d gateway
 make health
 ```
 
+### 8. Make the cluster survive reboots
+
+**Without this step DeepSeek does not come back after a power cut or a reboot.** `launch-cluster.sh` creates the containers with `docker run --rm`, which Docker refuses to combine with a restart policy — so `vllm_node` runs with `restart=no` and a container that dies is removed and never recreated. Nothing on the worker recreates its own container either: the head owns the launch, so the head has to notice.
+
+`ray-cluster/ensure_vllm_cluster.sh` closes that gap. It defaults to exactly the DeepSeek launch of step 5 (`RECIPE=deepseek-v4-flash-0731`, `PORT=8020`) and is idempotent — a complete cluster is left strictly alone, so it is safe from both a boot unit and a timer:
+
+```bash
+sudo cp ~/Server/ray-cluster/vllm-cluster.service /etc/systemd/system/
+sudo cp ~/Server/ray-cluster/vllm-cluster.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now vllm-cluster.timer
+```
+
+Verify:
+
+```bash
+systemctl list-timers vllm-cluster.timer
+journalctl -u vllm-cluster.service -n 20
+```
+
+The timer fires 90 s after boot and re-checks every 2 minutes. Two behaviours are worth knowing before you rely on it:
+
+- **A partial cluster is torn down and relaunched whole.** The launcher only checks whether *some* container is running and then skips the launch, which would leave the node that lost its container without a rank. A TP=2 model cannot serve on one rank, so the script stops **both** first.
+- **An unreachable worker is left alone.** A network blip must never be read as "the worker is gone" — tearing down a healthy cluster costs a full 167 GB weight reload for nothing.
+
+Run it by hand at any time (it exits in ~1 s when all is well):
+
+```bash
+bash ~/Server/ray-cluster/ensure_vllm_cluster.sh
+```
+
+> The service runs as `alejandroacho`, not root: it needs that user's SSH key to reach the worker and its `docker` group membership locally. It only ensures the **containers** are up — the model itself then loads in the background (~3–5 min), and the Gateway re-adopts it without reloading weights.
+
 ---
 
 ## Local Development (Without Docker)
@@ -363,11 +396,17 @@ Server/
 │   ├── vram_monitor.py         # nvidia-smi monitoring
 │   └── backends/               # Docker and Kubernetes orchestration backends
 ├── tests/                      # Fully mocked; no GPU or cluster required
-├── ray-cluster/                # Legacy Ray cluster tooling (see note below)
+├── ray-cluster/                # Cluster keep-alive (active) + legacy Ray tooling
+│   ├── ensure_vllm_cluster.sh  # ACTIVE — idempotent vllm_node keep-alive (step 8)
+│   ├── vllm-cluster.service    # ACTIVE — boot unit for the above
+│   ├── vllm-cluster.timer      # ACTIVE — re-checks every 2 min
+│   └── ...                     # Legacy single-node Ray tooling (see note below)
 └── k8s/                        # Kubernetes manifests
 ```
 
-> `ray-cluster/`, `inference/`, `models/`, `Dockerfile.comfyui` and `Dockerfile.ltx` are leftovers from the previous single-node, multimedia-capable setup. Nothing in the current catalog references them.
+> **Not all of `ray-cluster/` is legacy.** The three files marked ACTIVE above keep the *current* Spark cluster alive and are what step 8 installs; `ensure_vllm_cluster.sh` drives `spark-vllm-docker`'s launcher, not Ray. They live here for historical reasons — the directory predates them.
+>
+> The rest of `ray-cluster/` (`reset_ray_node.sh`, `run_cluster.sh`, `ray-node-{head,worker}.service`, `discover-sparks.sh`, `Dockerfile.blackwell-vllm`, `patch_gemma4.py`), plus `inference/`, `models/`, `Dockerfile.comfyui` and `Dockerfile.ltx`, are leftovers from the previous single-node, multimedia-capable setup. They drive a separate `ray-node-head` container on the `blackwell-vllm:latest` image via the `ray_vllm` engine, which **no model in the current catalog uses**. Do not confuse that container with `vllm_node`.
 
 ---
 
@@ -379,6 +418,18 @@ The Gateway never creates that container. Bring it up on both nodes:
 
 ```bash
 cd ~/spark-vllm-docker && HF_HOME=~/hf-cache ./run-recipe.sh deepseek-v4-flash-0731 --port 8020 -d
+```
+
+Or, equivalently and safe to repeat, the keep-alive script — which also handles the case where only *one* of the two ranks died:
+
+```bash
+bash ~/Server/ray-cluster/ensure_vllm_cluster.sh
+```
+
+**If this happened after a reboot or a power cut, the fix is step 8**, not this command — `vllm_node` runs with `restart=no` and does not come back on its own. Check whether the keep-alive is actually installed:
+
+```bash
+systemctl list-timers vllm-cluster.timer   # empty output = never installed
 ```
 
 ### Swap refused: "it shards through Ray but 'vllm_node' sees 0 Ray node(s)"
@@ -429,6 +480,7 @@ docker exec vllm_node bash -c "cat /proc/\$(pgrep -f 'vllm serve' | head -1)/cmd
 
 - **`deepseek`** is operational: weights on both nodes, serving on 8020, ~49 tok/s single-stream, 1,146,734 tokens of KV cache.
 - **`qwen35`** is configured but **not yet operational**: its 127 GB of weights are not downloaded, and the containers currently run in native (non-Ray) mode, so its preflight check will refuse the swap. Downloading it leaves only ~24 GB free on the head node — worth freeing space first.
+- **The cluster keep-alive of step 8 is not installed yet.** `vllm-cluster.service` and `.timer` exist in `ray-cluster/` but are not in `/etc/systemd/system/` (only `ray-node-head.service` is), so the current uptime depends on nothing crashing. DeepSeek will **not** return on its own after a reboot until step 8 is applied.
 
 ---
 
