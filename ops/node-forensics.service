@@ -1,0 +1,34 @@
+[Unit]
+Description=Muestreo de forense de hardware (temperaturas, AER, GPU, enlace del cluster)
+Documentation=file:///home/alejandroacho/Server/ops/README.md
+# Arranca pronto y para tarde: el valor está justo en los segundos que rodean
+# al fallo, así que no debe depender de docker ni de la red.
+DefaultDependencies=no
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+User=alejandroacho
+Group=alejandroacho
+ExecStart=/usr/bin/python3 /home/alejandroacho/Server/ops/node_forensics.py
+Environment=FORENSICS_INTERVAL=5
+Environment=FORENSICS_PEER=192.168.200.13
+Environment=FORENSICS_PEER_IFACE=enp1s0f1np1
+Environment=PYTHONUNBUFFERED=1
+
+# SIGTERM es lo que dispara la línea #CLEAN_STOP. Sin ese cierre ordenado, el
+# post-mortem no puede distinguir un apagado normal de un corte de corriente.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+Restart=always
+RestartSec=5
+
+# Que el muestreador nunca sea el motivo de nada: prioridad baja y sin poder
+# competir por CPU con la inferencia.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

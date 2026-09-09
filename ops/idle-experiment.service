@@ -1,0 +1,19 @@
+[Unit]
+Description=Experimento: desactiva los estados de reposo profundo (LPI-2/LPI-3)
+Documentation=file:///home/alejandroacho/Server/ops/README.md
+# Los ajustes de cpuidle viven en sysfs y se pierden en cada arranque. Como el
+# fallo que investigamos ES un reinicio, sin esta unidad el experimento se
+# desactivaría solo justo después del evento que queremos medir, y el resultado
+# sería una falsa negativa.
+DefaultDependencies=no
+After=sysinit.target
+Wants=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/env bash /home/alejandroacho/Server/ops/idle_experiment.sh off
+ExecStop=/usr/bin/env bash /home/alejandroacho/Server/ops/idle_experiment.sh on
+
+[Install]
+WantedBy=multi-user.target

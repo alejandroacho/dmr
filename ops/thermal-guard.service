@@ -1,0 +1,20 @@
+[Unit]
+Description=Gobernador termico: mantiene la GPU fuera de la banda de corte (~85 C)
+Documentation=file:///home/alejandroacho/Server/ops/README.md
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=simple
+# Root: -lgc necesita privilegios sobre el driver.
+User=root
+ExecStart=/usr/bin/python3 /home/alejandroacho/Server/ops/thermal_guard.py
+Environment=PYTHONUNBUFFERED=1
+Environment=GUARD_WARN_C=80
+Environment=GUARD_DANGER_C=83
+Environment=GUARD_COOL_C=72
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

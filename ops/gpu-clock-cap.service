@@ -1,0 +1,18 @@
+[Unit]
+Description=Limita la frecuencia de la GPU para evitar la banda termica del fallo
+Documentation=file:///home/alejandroacho/Server/ops/README.md
+# Igual que con idle-experiment: el ajuste vive en el driver y se pierde al
+# reiniciar. Como el fallo ES un reinicio, sin persistencia el limite
+# desapareceria justo despues del evento que queremos evitar.
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=GPU_CAP_MHZ=2100
+ExecStart=/usr/bin/env bash /home/alejandroacho/Server/ops/gpu_clock_cap.sh on
+ExecStop=/usr/bin/env bash /home/alejandroacho/Server/ops/gpu_clock_cap.sh off
+
+[Install]
+WantedBy=multi-user.target
