@@ -1,4 +1,25 @@
-# Node 2 — Worker Node (192.168.200.13)
+# Node 2 — Worker Node (192.168.200.13) · LEGACY
+
+> **⚠️ Este documento describe el flujo Ray antiguo, que ya no está en uso.**
+>
+> El worker actual **no** corre `ray-node-worker` sobre `blackwell-vllm:latest`.
+> Corre el contenedor `vllm_node` sobre `vllm-node-b12x:latest`, lanzado desde
+> Node 1 con `run-recipe.sh`, y monta `~/hf-cache` (no `~/.cache/huggingface`).
+> Ningún modelo del catálogo actual usa el motor `ray_vllm`.
+>
+> **Para el estado real del worker, ver [NODE2.md](../NODE2.md).**
+> Se conserva este fichero como referencia histórica del montaje anterior.
+>
+> Dos avisos si aun así sigues estos pasos:
+>
+> - `ray-node-worker.service` fija la ruta `/home/alejandroacho/reset_ray_node.sh`,
+>   así que los scripts tienen que estar sueltos en `$HOME`. Si en su lugar clonas
+>   el repo (la alternativa que ofrece el paso 1), el `ExecStart` apunta a un
+>   fichero inexistente y el arranque falla en cada boot.
+> - `run_cluster.sh` no comprueba el código de salida de `docker run`, así que un
+>   fallo al lanzar el contenedor sale igualmente con `status=0/SUCCESS` y
+>   systemd lo da por bueno. Un `systemctl is-active` verde no prueba nada aquí:
+>   verifica siempre con `docker ps`.
 
 ## Requisitos previos
 

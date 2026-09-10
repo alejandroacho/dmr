@@ -103,7 +103,9 @@ The Gateway checks this before every Qwen3.5 swap and refuses with a clear messa
 
 ## Cluster Setup
 
-Everything below runs on the **head node**.
+Everything below runs on the **head node**. For the other end — what must exist
+on the worker, what is deployed there from this repo, and the two things that
+are *not* in git and would be lost on a reinstall — see [NODE2.md](NODE2.md).
 
 ### 1. Clone the launcher and install `uv`
 
@@ -381,6 +383,7 @@ loads that fit fine. Enabling the check would first require a per-node budget.
 
 ```
 Server/
+├── NODE2.md                    # Worker inventory: what must be on it, what is not in git
 ├── Dockerfile                  # Gateway image (python:3.12-slim + openssh-client)
 ├── docker-compose.yml          # Gateway only — models live on the Spark cluster
 ├── Makefile                    # Task runner
@@ -479,8 +482,10 @@ docker exec vllm_node bash -c "cat /proc/\$(pgrep -f 'vllm serve' | head -1)/cmd
 ## Current State
 
 - **`deepseek`** is operational: weights on both nodes, serving on 8020, ~49 tok/s single-stream, 1,146,734 tokens of KV cache.
-- **`qwen35`** is configured but **not yet operational**: its 127 GB of weights are not downloaded, and the containers currently run in native (non-Ray) mode, so its preflight check will refuse the swap. Downloading it leaves only ~24 GB free on the head node — worth freeing space first.
-- **The cluster keep-alive of step 8 is not installed yet.** `vllm-cluster.service` and `.timer` exist in `ray-cluster/` but are not in `/etc/systemd/system/` (only `ray-node-head.service` is), so the current uptime depends on nothing crashing. DeepSeek will **not** return on its own after a reboot until step 8 is applied.
+- **`qwen35`** is configured but **not yet operational**: its 127 GB of weights are not downloaded on either node, and the containers currently run in native (non-Ray) mode, so its preflight check will refuse the swap. Space is no longer the blocker it once was — as of 2026-09-10 the head has 545 GB free and the worker 417 GB.
+- **The cluster keep-alive of step 8 is installed and running** (as of 2026-09-10): `vllm-cluster.timer` is enabled on the head and fires every 2 minutes. DeepSeek now does come back on its own after a reboot.
+- **The worker still carries legacy Ray debt.** `ray-node-worker.service` is enabled there and fails on every boot, and 157 GB of orphaned HuggingFace cache sit in its `~/.cache/huggingface`. See [NODE2.md](NODE2.md) §5.
+- **The legacy `ray-node-head` container is still running on the head** (`blackwell-vllm:latest`, `ray-node-head.service` enabled), even though no model in the catalog uses the `ray_vllm` engine.
 
 ---
 
