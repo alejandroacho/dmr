@@ -64,5 +64,11 @@ models--*/
 hf-cache/
 .cache/
 
+# Checkout completo de HuggingFace: estuvo rastreado hasta que se sacó de la
+# historia con git-filter-repo. Sigue en disco (7,6 GB), fuera de git. Además
+# de los pesos trae config.json, tokenizer, LICENSE y un .gitattributes que
+# declara un LFS que no está instalado — el directorio entero fuera.
+models/Qwen3-4B/
+
 # Los .tiktoken de tiktoken_encodings/ SÍ van en git a propósito: son de 1-3 MB
 # y el harmony_stub los necesita sin salida a internet.
