@@ -42,6 +42,18 @@ VRAM_POLL_INTERVAL_S: float = float(os.getenv("VRAM_POLL_INTERVAL_S", "2.0"))
 # Safety VRAM margin to always keep free (MB)
 VRAM_SAFETY_MARGIN_MB: int = int(os.getenv("VRAM_SAFETY_MARGIN_MB", "4096"))
 
+# ── Media node (node 3) ──
+# Dedicated GB10 that serves MiniMax-H3 video+audio and nothing else. It is a
+# separate machine with its own 124 GB unified pool, so it never participates in
+# this Gateway's VRAM profiles or container swapping.
+# MEDIA_NODE_IP is the single place the node's address is configured (see .env);
+# MEDIA_NODE_HOST still overrides it for the rare case of addressing the adapter
+# and the asset URLs differently. Currently on WiFi — switch MEDIA_NODE_IP to the
+# wired 192.168.1.x address once cabled.
+MEDIA_NODE_IP: str = os.getenv("MEDIA_NODE_IP", "192.168.8.147")
+MEDIA_NODE_HOST: str = os.getenv("MEDIA_NODE_HOST", MEDIA_NODE_IP)
+MEDIA_NODE_PORT: int = int(os.getenv("MEDIA_NODE_PORT", "8010"))
+
 # Docker socket
 DOCKER_SOCKET: str = os.getenv("DOCKER_SOCKET", "unix:///var/run/docker.sock")
 
@@ -125,6 +137,19 @@ class ModelDefinition:
     extra_volumes: dict[str, Any] = field(default_factory=dict)
     # Extra environment variables to inject into the container.
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Remote node hostname/IP. Empty means the model runs as a local container
+    # reachable by name on DOCKER_NETWORK. When set, the model lives on another
+    # machine: the Gateway proxies to it but never manages its lifecycle.
+    host: str = ""
+
+    @property
+    def is_remote(self) -> bool:
+        return bool(self.host)
+
+    @property
+    def base_url(self) -> str:
+        """Backend base URL — remote host if set, else the container's DNS name."""
+        return f"http://{self.host or self.container_name}:{self.port}"
 
     def to_slot(self, state: ContainerState = ContainerState.STOPPED) -> ModelSlot:
         return ModelSlot(
@@ -247,6 +272,100 @@ LTX_VIDEO_2 = ModelDefinition(
     model_path="ltx-video-2-q8",
     engine="diffusers",
 )
+
+# ────── Media node models (node 3, remote) ──────
+# MiniMax-H3: omni-modal DiT generating video with native stereo audio, up to 2K
+# and ~15s. Both task checkpoints share the Qwen3-VL-32B conditioning encoder
+# and both VAEs, so all of it (~63 GB) stays resident on node 3's GB10 — no
+# swapping, and no interaction with this node's text profiles.
+#
+# fl2va  — t2va and first/last-frame-to-video+audio
+# ref2va — omni-reference (9 images, 3 videos, 3 video soundtracks, 3 audios)
+#
+# Both entries point at the same adapter port: node 3 picks the checkpoint from
+# the request. They are deliberately absent from ALL_MODELS and PROFILES —
+# those drive local container lifecycle (including force-removal of "orphans").
+
+MINIMAX_H3_FL2VA = ModelDefinition(
+    name="minimax-h3-fl2va",
+    # One image and one container serve all three families (see Dockerfile.media),
+    # so these match ACE-Step's and HiDream's. Purely informational — `host` is
+    # set, so this model is proxied to and never orchestrated from here.
+    container_image="media-node:latest",
+    container_name="media-node",
+    vram_required_mb=42_470,        # fl2va INT8 convrot + NVFP4 encoder + both VAEs
+    port=MEDIA_NODE_PORT,
+    quantization="int8_convrot",
+    tensor_parallel_size=1,
+    max_model_len=0,
+    kv_cache_dtype="none",
+    model_path="minimax-h3",
+    engine="comfyui",
+    host=MEDIA_NODE_HOST,
+)
+
+MINIMAX_H3_REF2VA = ModelDefinition(
+    name="minimax-h3-ref2va",
+    container_image="media-node:latest",
+    container_name="media-node",
+    vram_required_mb=20_970,        # ref2va INT8 convrot (encoder + VAEs already loaded)
+    port=MEDIA_NODE_PORT,
+    quantization="int8_convrot",
+    tensor_parallel_size=1,
+    max_model_len=0,
+    kv_cache_dtype="none",
+    model_path="minimax-h3",
+    engine="comfyui",
+    host=MEDIA_NODE_HOST,
+)
+
+ACE_STEP_15_XL_TURBO = ModelDefinition(
+    name="ace-step-1.5-xl-turbo",
+    container_image="media-node:latest",
+    container_name="media-node",
+    vram_required_mb=19_900,        # DiT bf16 + both Qwen encoders + VAE
+    port=MEDIA_NODE_PORT,
+    quantization="bf16",
+    tensor_parallel_size=1,
+    max_model_len=0,
+    kv_cache_dtype="none",
+    model_path="ace-step-1.5",
+    engine="comfyui",
+    host=MEDIA_NODE_HOST,
+)
+
+HIDREAM_O1_IMAGE = ModelDefinition(
+    name="hidream-o1-image",
+    container_image="media-node:latest",
+    container_name="media-node",
+    vram_required_mb=8_100,         # all-in-one fp8_scaled checkpoint
+    port=MEDIA_NODE_PORT,
+    quantization="fp8_scaled",
+    tensor_parallel_size=1,
+    max_model_len=0,
+    kv_cache_dtype="none",
+    model_path="hidream-o1",
+    engine="comfyui",
+    host=MEDIA_NODE_HOST,
+)
+
+# Models served by the media node — exposed via /v1/models and proxied to,
+# never orchestrated. One ComfyUI holds all of them and evicts as needed.
+REMOTE_MEDIA_MODELS: list[ModelDefinition] = [
+    MINIMAX_H3_FL2VA,
+    MINIMAX_H3_REF2VA,
+    ACE_STEP_15_XL_TURBO,
+    HIDREAM_O1_IMAGE,
+]
+
+# Which Gateway endpoint drives each model.
+MEDIA_MODEL_ENDPOINTS: dict[str, str] = {
+    MINIMAX_H3_FL2VA.name: "/v1/av/generate",
+    MINIMAX_H3_REF2VA.name: "/v1/av/generate",
+    ACE_STEP_15_XL_TURBO.name: "/v1/audio/music",
+    HIDREAM_O1_IMAGE.name: "/v1/images/generate",
+}
+
 
 QWEN25_CODER_7B = ModelDefinition(
     name="qwen2.5-coder-7b",

@@ -20,6 +20,12 @@ volumes:
     driver: local
   triton_cache:
     driver: local
+  media_output:
+    driver: local
+  media_input:
+    driver: local
+  media_assets:
+    driver: local
 
 # ──────────────────────────────────────────────────────
 #  Reusable common variables
@@ -207,3 +213,130 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
     profiles:
       - creative_video
+
+  # ════════════════════════════════════════════════════
+  #  MEDIA NODE (node 3) — standalone, three modalities
+  #
+  #  Runs alone on its own GB10: no text models, no profile swapping, no
+  #  Docker socket. One ComfyUI serves all three model families and evicts
+  #  between them as needed:
+  #
+  #    av     MiniMax-H3 (fl2va + ref2va + encoder + 2 VAEs)   ~63 GB
+  #    music  ACE-Step 1.5 XL Turbo (DiT + 2 encoders + VAE)   ~20 GB
+  #    image  HiDream-O1-Image (all-in-one checkpoint)          ~8 GB
+  #
+  #  Start:  docker compose --profile media up -d media-node media-gateway
+  # ════════════════════════════════════════════════════
+  media-node:
+    <<: *gpu-common
+    build:
+      context: .
+      dockerfile: Dockerfile.media
+    image: media-node:latest
+    container_name: media-node
+    ports:
+      # Published on all interfaces so the adapter can be reached directly too.
+      - "8010:8010"
+    volumes:
+      # The whole models dir: extra_model_paths.yaml maps one entry per family.
+      - /home/alejandroacho/Models:/models:ro
+      - media_output:/opt/ComfyUI/output
+      - media_input:/opt/ComfyUI/input
+      - triton_cache:/root/.triton
+    environment:
+      - MODEL_NAME=media-node
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PORT=8010
+      - COMFY_URL=http://127.0.0.1:8188
+      # Raise Dockerfile.media's HEALTHCHECK --start-period with this, or the
+      # container reports unhealthy while it is still loading.
+      - COMFY_BOOT_TIMEOUT_S=600
+      # 0 = no ceiling on a generation. A 15s clip at full canvas is ~55 min,
+      # so any finite value here kills long jobs after paying the GPU cost.
+      # COMFY_HTTP_TIMEOUT_S still bounds each individual call to ComfyUI.
+      - GENERATE_TIMEOUT_S=0
+      - COMFY_HTTP_TIMEOUT_S=600
+      # Generations and uploaded references are swept once they pass 24h.
+      # 0 keeps everything; the volumes grow without bound if you do that.
+      - MEDIA_RETENTION_HOURS=24
+      - MEDIA_CLEANUP_INTERVAL_S=3600
+    profiles:
+      - media
+
+  # Media-only Gateway — the public API of a standalone media node.
+  #
+  # Runs gateway.media_app, NOT gateway.app: the main app's startup adopts or
+  # recreates VRAM profiles and force-removes "orphaned" containers, which here
+  # would delete media-node itself. No Docker socket is mounted, so it could not
+  # do that even if asked.
+  media-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: blackwell-gateway:latest
+    container_name: media-gateway
+    ports:
+      - "8000:8000"
+    command:
+      - python
+      - -m
+      - uvicorn
+      - gateway.media_app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+      - --log-level
+      - info
+      - --access-log
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # utility only — NVML for /status/vram, no CUDA context here.
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=utility
+      - GATEWAY_HOST=0.0.0.0
+      - GATEWAY_PORT=8000
+      - NODE_NAME=node3-media
+      # Same compose network — reach the adapter by container name, no IP to update.
+      - MEDIA_NODE_URL=http://media-node:8010
+      # 0 = no ceiling. Must not be finite either, or the Gateway cuts the
+      # connection mid-generation and the node cancels the job it was running.
+      - MEDIA_NODE_TIMEOUT_S=0
+      # Enables response_format:"url" so long clips aren't shipped as base64.
+      - MEDIA_ASSET_DIR=/assets
+      # The one address that must be reachable *by clients*, so it cannot use
+      # the compose network name. Set MEDIA_NODE_IP in .env — switching the node
+      # from WiFi to its wired 192.168.1.x address is then a one-line change.
+      - MEDIA_PUBLIC_URL=http://${MEDIA_NODE_IP:-192.168.8.147}:8000
+      # Saved assets are swept after 24h — so a URL handed to a client stops
+      # resolving after a day. Raise it if callers revisit old results.
+      - MEDIA_RETENTION_HOURS=24
+      - MEDIA_CLEANUP_INTERVAL_S=3600
+    volumes:
+      - media_assets:/assets
+    networks:
+      - blackwell_net
+    restart: unless-stopped
+    healthcheck:
+      # /health is 503 until the adapter is ready, so this has to outlast the
+      # adapter's own boot (COMFY_BOOT_TIMEOUT_S=600), not just its own startup.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 660s
+    # Deliberately not `condition: service_healthy`: this Gateway is meant to come
+    # up first and *report* the adapter as loading, which is more useful than a
+    # 10-minute silence. Nothing here needs the adapter present to start.
+    depends_on:
+      - media-node
+    profiles:
+      - media

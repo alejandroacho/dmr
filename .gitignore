@@ -30,3 +30,6 @@ Thumbs.db
 *.swp
 *.swo
 .gateway-state/
+
+# Output of `just media-test`
+h3-test.mp4

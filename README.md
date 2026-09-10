@@ -57,6 +57,250 @@ Profile transitions are **automatic** — the Gateway detects visual keywords in
 
 ---
 
+## Media Node (node 3) — video+audio, music, images
+
+A third GB10 that serves **media only** and runs **standalone** — it is not part
+of the text cluster. No text models, no VRAM profiles, no container swapping, no
+Docker socket. Its own Gateway sits in front, so agents talk the same API they
+use elsewhere.
+
+```
+                    clients / agents
+                           │
+                           ▼
+┌────────────────────────────────────────────────────────────┐
+│  node 3 — standalone media node                            │
+│                                                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  media-gateway  :8000   (gateway.media_app)          │  │
+│  │    POST /v1/av/generate      → video + audio         │  │
+│  │    POST /v1/audio/music      → music                 │  │
+│  │    POST /v1/images/generate  → images                │  │
+│  │    GET  /v1/models  /health  /status/vram  /docs     │  │
+│  └───────────────────────┬──────────────────────────────┘  │
+│                          │ http://media-node:8010          │
+│  ┌───────────────────────▼──────────────────────────────┐  │
+│  │  media-node     :8010   (media_server.py)            │  │
+│  │    builds a ComfyUI graph per request                 │  │
+│  │                    │                                  │  │
+│  │  ComfyUI  :8188 ◀──┘  (loopback only)                │  │
+│  │    MiniMax-H3 · ACE-Step 1.5 · HiDream-O1            │  │
+│  │    INT8-convrot, NVFP4 and FP8 ops, all native       │  │
+│  └──────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────┘
+```
+
+One ComfyUI serves all three families and evicts between them as needed, so
+switching modality costs a reload but never a redeploy.
+
+| Modality | Model | Weights | Endpoint |
+|---|---|---|---|
+| video + audio | MiniMax-H3 (t2va/fl2va/ref2va) | ~63 GB | `/v1/av/generate` |
+| music | ACE-Step 1.5 XL Turbo | ~20 GB | `/v1/audio/music` |
+| image | HiDream-O1-Image (dev + base) | ~16 GB | `/v1/images/generate` |
+
+`gateway/media_app.py` deliberately does **not** import `ContainerOrchestrator`.
+The main app's startup adopts or recreates VRAM profiles and force-removes
+"orphaned" containers — on this node that would delete the container serving the
+models. No Docker socket is mounted either, so it could not do so if asked.
+
+### Weights
+
+**MiniMax-H3** — `Comfy-Org/MiniMax-H3`, `just download-minimax`:
+
+| File | Size | Role |
+|---|---|---|
+| `minimax_h3_fl2va_pruned_int8_convrot` | 19.53 GiB | t2va + first/last-frame DiT |
+| `minimax_h3_ref2va_pruned_int8_convrot` | 19.53 GiB | omni-reference DiT |
+| `qwen3vl_32b_minimax_h3_nvfp4_awq` | 14.61 GiB | conditioning encoder (Qwen3-VL-32B) |
+| `minimax_h3_video_vae_fp16` | 4.85 GiB | video VAE |
+| `minimax_h3_audio_vae_fp32` | 0.56 GiB | audio VAE |
+
+The FL2VA set (DiT + encoder + both VAEs) is 42.47 GB; ref2va adds 20.97 GB and
+reuses the encoder and VAEs.
+
+**ACE-Step 1.5 XL Turbo** — `Comfy-Org/ace_step_1.5_ComfyUI_files`, `just download-ace`:
+
+| File | Size | Role |
+|---|---|---|
+| `acestep_v1.5_xl_turbo_bf16` | 9.29 GiB | DiT (8-step turbo) |
+| `qwen_0.6b_ace15` + `qwen_4b_ace15` | 8.91 GiB | both are required (DualCLIPLoader, type `ace`) |
+| `ace_1.5_vae` | 0.31 GiB | audio VAE (DCAE + vocoder) |
+
+**HiDream-O1-Image** — `Comfy-Org/HiDream-O1-Image`, `just download-hidream`:
+
+| File | Size | Role |
+|---|---|---|
+| `hidream_o1_image_dev_fp8_scaled` | 7.51 GiB | dev — all-in-one, 28 steps, no CFG |
+| `hidream_o1_image_fp8_scaled` | 7.51 GiB | base — all-in-one, 40 steps, CFG 5 |
+
+### Task modes (video + audio)
+
+The node picks the mode — and therefore the checkpoint — from the request:
+
+| Mode | Trigger | Inputs |
+|---|---|---|
+| `t2va` | prompt only | — |
+| `fl2va` | `first_frame` and/or `last_frame` | 1–2 keyframes |
+| `ref2va` | any `ref_*` field | ≤9 images, ≤3 videos, ≤3 video soundtracks, ≤3 audios; adapter also caps the total at 12 |
+
+### Setup (on node 3)
+
+```bash
+just download-media      # all three families, ~99 GB → ~/Models/
+just build-media         # ComfyUI + CUDA 13 image (~15 min)
+just media-up            # adapter :8010 + its Gateway :8000
+just media-status        # 503 until ComfyUI is up (~15s), then 200
+just media-test          "a lighthouse in a storm"      # → h3-test.mp4
+just media-test-music    "lofi hip hop, mellow piano"   # → music-test.mp3
+just media-test-image    "a noir portrait, 35mm film"   # → image-test.png
+```
+
+The build needs `gcc` and `python3-dev` in the image: Triton JIT-compiles kernels
+at request time for the NVFP4 encoder and the INT8/convrot ops, shelling out to
+`cc` and linking against `Python.h`. Without them the graph fails **mid-request**
+with `Failed to find C compiler` — the container still starts and reports healthy.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MEDIA_NODE_URL` | `http://192.168.8.147:8010` | Adapter address (`http://media-node:8010` in compose) |
+| `MEDIA_NODE_TIMEOUT_S` | `0` | Per-request ceiling; `0` = none (see below) |
+| `GENERATE_TIMEOUT_S` | `0` | *(adapter)* Whole-generation ceiling; `0` = none |
+| `COMFY_HTTP_TIMEOUT_S` | `600` | *(adapter)* Ceiling on one call to ComfyUI |
+| `MEDIA_ASSET_DIR` | *(unset)* | Enables `response_format: "url"` |
+| `MEDIA_PUBLIC_URL` | `GATEWAY_PUBLIC_URL` | Base URL for saved assets |
+| `MEDIA_NODE_ALIAS_VIDEOS` | `false` | Also answer `POST /v1/videos/generate` (forced on in `media_app`) |
+| `NODE_NAME` | `media-node` | Label reported by `/health` |
+
+**Both generation ceilings default to none, on purpose.** A 15s clip at the full
+1344x768 canvas runs ~55 min in a single pass, so the previous 1800s value cut off
+exactly the requests it existed to protect — and cut them off *after* the GPU had
+done the work. It also failed confusingly: the Gateway's ceiling raised
+`asyncio.TimeoutError`, which is not an `aiohttp.ClientError`, so it escaped as a
+bare 500. (A ceiling set explicitly now returns 504 and says which knob fired.)
+
+Nothing waits forever as a result, because neither hop relies on a clock:
+
+- the caller's disconnect is polled on both hops, and dropping the client cancels
+  the ComfyUI job in ~1.5s (see *Request limits and cancellation*);
+- if ComfyUI dies, the entrypoint takes the container down with it, so the
+  Gateway's connection drops and the request fails as a 503;
+- `COMFY_HTTP_TIMEOUT_S` still bounds every *individual* call to ComfyUI — a
+  `/history` poll, a queue edit, reading a finished file off loopback. That knob
+  is separate from the generation deadline precisely because sharing one value
+  between a 55-minute job and a 20 ms poll is what made "no ceiling"
+  inexpressible.
+
+For reference: ~12.6 min for a 5s clip, ~55 min for 15s.
+
+### File handling and retention
+
+Four separate paths, three of which are swept:
+
+| What | Where | Swept? |
+|---|---|---|
+| Model weights | `~/Models/*` → `/models:ro` | no — read-only input |
+| Uploaded references | ComfyUI `input/in_*` (volume `media_input`) | **yes** |
+| Generations | ComfyUI `output/media/` (volume `media_output`) | **yes** |
+| Saved assets (`url` mode) | Gateway `/assets` (volume `media_assets`) | **yes** |
+
+The adapter never reads ComfyUI's filesystem: it takes `{filename, subfolder,
+type}` from `/history/{id}` and fetches the bytes over `GET /view`, so the Gateway
+needs no access to ComfyUI's volume.
+
+Both processes sweep at startup and then hourly, deleting anything older than
+`MEDIA_RETENTION_HOURS` (default 24, `0` disables). The sweep is deliberately
+narrow — only `output/media/` and `input/in_*`, never ComfyUI's own bundled inputs
+or its output-dir marker file.
+
+> **`url` mode has a lifetime.** A URL handed to a client stops resolving once its
+> file is swept, so a transcript keeps a dead link rather than the content. With
+> `b64_json` the bytes travelled in the response, and whether they are kept is the
+> caller's business. Raise `MEDIA_RETENTION_HOURS` on the Gateway if callers are
+> expected to come back for old results.
+
+> **Readiness vs. loaded:** `/health` turns 200 once ComfyUI is up with the H3
+> nodes registered — the ~63 GB of weights load lazily on the **first generation
+> request**, which therefore takes ~40s longer than later ones. The models then
+> stay resident.
+
+> **VRAM reporting caveat:** inside the container NVML reports a 512 GB total and
+> `used: 0` on GB10 — its unified memory isn't visible that way from a container.
+> Temperature and utilization are correct. For real memory figures run
+> `nvidia-smi` on the host.
+
+### Optional: attaching it to another Gateway instead
+
+If you later want the media node reachable *through* the main Gateway rather than
+directly, `gateway/media_node.py` is a self-contained `APIRouter` — it imports
+nothing from the rest of the package and touches no shared state. Two lines in
+that Gateway's `app.py`, **after** its own routes are defined:
+
+```python
+from gateway import media_node
+media_node.attach(app)          # adds /v1/av/generate + /status/media-node
+```
+
+then start it with `MEDIA_NODE_URL=http://<node-3>:8010`.
+
+> Note that a Gateway on a different subnet may not be able to reach the media
+> node: if the path crosses a NAT'ing router, traffic only flows outward from the
+> media node. Check with `curl http://<node-3>:8010/health` from that Gateway's
+> host before wiring it up.
+
+### Request limits
+
+| Parameter | Cap | Why |
+|---|---|---|
+| `num_frames` | 362 (`AV_MAX_FRAMES`) | H3's trained range is ~124-362; beyond it the output degrades and the cost explodes |
+| `width x height` | 1,032,192 px (`AV_MAX_PIXELS`) | H3's native canvas, e.g. 1344x768 |
+| `duration` (music) | 600s | keeps one request from owning the GPU indefinitely |
+| `width`/`height` (image) | 4096 | the node's own limit |
+
+Cost is driven by video-latent tokens (`T x H/16 x W/16`), not pixels, and
+attention is superlinear in that. 999 frames at full canvas is ~1.19M tokens
+against the default's 149k — a 12-18 hour job. Such requests are now rejected
+with a 422 in milliseconds; anything past 2x the default token count is logged
+as expensive.
+
+Abandoning a request cancels the work: the Gateway watches for the caller
+disconnecting, drops its upstream call, and the node cancels the ComfyUI job
+(~1.5s end to end). Note that ComfyUI checks its interrupt flag only between
+sampling steps — if a step itself takes tens of minutes, restart the container.
+
+### Generation defaults
+
+Native canvas is a 768px short edge capped at 768×1344, each axis a multiple of
+32. Frame counts snap up to the model's `17k+5` grid at 24 fps (124 ≈ 5.2s;
+trained range ≈ 124–362).
+
+| Parameter | Default | Note |
+|---|---|---|
+| `steps` | `20` | H3's documented default |
+| `sampler` / `scheduler` | `res_multistep` / `simple` | |
+| `cfg_scale` | `1.0` | No CFG — one forward pass per step. Raise to 3–6 only if prompt adherence is weak |
+| `shift_video` / `shift_audio` | `12.0` / `3.0` | ComfyUI `MiniMaxH3SigmaShift` node defaults |
+
+### Measured throughput (single GB10, 20 steps, no Sage Attention)
+
+| Resolution | Frames | Video latent tokens | Time |
+|---|---|---|---|
+| 1344×768 (default) | 124 (5.2s) | ~149k | **17m 33s** |
+| 768×448 | 124 (5.2s) | ~50k | **3m 42s** |
+| 512×320 | 5 | ~24k | ~20s (2 steps) |
+
+Cost is dominated by attention over the video latent (`T×H/16×W/16` tokens, where
+124 frames → T=37), so it grows far faster than pixel count: 3× the tokens cost
+4.7× the time. **768×448 is the practical operating point**; the default canvas is
+for final renders. Generation is compute-bound — no offloading occurs, the models
+stay resident, and requests are serialized by a lock in the adapter.
+
+Untried lever: Sage Attention, which H3's docs say roughly doubles speed. It is
+deliberately not in the image — installing it requires matching the exact
+PyTorch/CUDA build, and it's the wrong variable to add while bringing a pipeline up.
+
+---
+
 ## Docker Images
 
 ### `vllm-mxfp4-spark:latest` — GPT-OSS 120B only
@@ -210,6 +454,8 @@ python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8000 --reload
 | `POST` | `/v1/chat/completions` | **Unified endpoint** — auto-detects text/image/video and routes accordingly. OpenAI-compatible. |
 | `POST` | `/v1/images/generate` | Direct image generation (FLUX.1-dev). Returns base64 PNG. |
 | `POST` | `/v1/videos/generate` | Direct video generation (LTX-Video 2) |
+| `POST` | `/v1/av/generate` | Video **with native stereo audio** (MiniMax-H3, media node) |
+| `POST` | `/v1/audio/music` | Music (ACE-Step 1.5 XL Turbo, media node) |
 | `GET`  | `/v1/models` | List available models (OpenAI format) |
 
 ### System Status
@@ -221,6 +467,7 @@ python -m uvicorn gateway.app:app --host 0.0.0.0 --port 8000 --reload
 | `GET` | `/status/swap` | Current swap status (in progress, elapsed, queue) |
 | `GET` | `/status/profile` | Active profile and loaded models |
 | `GET` | `/status/cache` | Radix Prefix Cache statistics |
+| `GET` | `/status/media-node` | Reachability and readiness of the media node (node 3) |
 
 ### Administration
 
@@ -297,6 +544,113 @@ curl -X POST http://localhost:8000/v1/videos/generate \
   }'
 ```
 
+### Video + native audio (MiniMax-H3, media node)
+
+> These run against the **media node's own Gateway** (node 3, `:8000`). Substitute
+> its address — e.g. `http://192.168.8.147:8000` — from another machine.
+
+```bash
+curl -X POST http://localhost:8000/v1/av/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A lighthouse in a storm, waves crashing, thunder rolling",
+    "num_frames": 124,
+    "steps": 20
+  }'
+```
+
+Response: `{"success": true, "data": {"video_base64": "<mp4 with stereo audio>", "mode": "t2va", "seed": ..., ...}}`
+
+Or `just media-test "your prompt"` to write `h3-test.mp4` directly.
+
+**First/last frame (fl2va)** — send one or both keyframes as base64:
+
+```bash
+curl -X POST http://localhost:8000/v1/av/generate \
+  -H "Content-Type: application/json" \
+  -d "{\"prompt\": \"the camera pulls back slowly\",
+       \"first_frame\": \"$(base64 -w0 start.png)\",
+       \"last_frame\": \"$(base64 -w0 end.png)\"}"
+```
+
+**Omni-reference (ref2va)** — reference images/videos/audio, addressed in the prompt
+as `<Picture i>` / `<Video k>` / `<Audio j>` (1-based, per type):
+
+```bash
+curl -X POST http://localhost:8000/v1/av/generate \
+  -H "Content-Type: application/json" \
+  -d "{\"prompt\": \"<Picture 1> walks through the market in <Picture 2>\",
+       \"ref_images\": [\"$(base64 -w0 person.png)\", \"$(base64 -w0 market.png)\"]}"
+```
+
+Sending any `ref_*` field switches node 3 to the ref2va checkpoint automatically.
+Limits, transcribed from the Autogrow templates in
+`comfy_extras/nodes_minimax_h3.py`: **9** `ref_images`, **3** `ref_videos`, **3**
+`ref_video_audios`, **3** `ref_audios`. `ref_video_audio_N` is the soundtrack *of*
+`ref_video_N` — the node pairs them by index and silently ignores any with no
+matching video, so the adapter rejects that case rather than letting you pay for
+an upload that gets dropped. When a video's soundtrack is not supplied, its own
+audio track is reused.
+
+The adapter additionally caps the **total** at 12 files. Note that ceiling is not
+in the node schema, whose per-container maxima add up to 18 — so unless it comes
+from H3's model card it is stricter than ComfyUI. It is left in place rather than
+loosened on a guess; raise it if you have the reference that says 18 is fine.
+
+> For long clips prefer `"response_format": "url"` over base64 — set `MEDIA_ASSET_DIR`
+> on the Gateway and it returns a `video_url` instead of ~50 MB of JSON. Available
+> on all three endpoints.
+
+### Music (ACE-Step 1.5 XL Turbo)
+
+`prompt` is a list of style tags, not prose — ACE-Step is not a natural-language
+model. Leave `lyrics` empty for an instrumental.
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/music \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "lofi hip hop, mellow piano, vinyl crackle, relaxed",
+    "duration": 20,
+    "bpm": 85,
+    "key_scale": "F major"
+  }'
+```
+
+Response: `{"success": true, "data": {"audio_base64": "<mp3>", "duration": 20.0, ...}}`
+
+XL Turbo samples in 8 steps, so a 20s clip takes ~16s including the cold model
+load. Note the two separate CFG knobs: `cfg_scale` (diffusion, default 1.0) and
+`lm_cfg_scale` (the audio-code LM, default 2.0) — both come from the blueprint.
+
+### Images (HiDream-O1)
+
+```bash
+curl -X POST http://localhost:8000/v1/images/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a noir portrait of a lighthouse keeper, 35mm film"}'
+```
+
+Response: `{"success": true, "data": {"images": ["<base64 PNG>"], "variant": "dev", ...}}`
+
+Two variants, whose sampling settings come from the official templates — you
+normally only pick the variant and leave the rest alone:
+
+| `variant` | Steps | CFG | Sampler | 1024² |
+|---|---|---|---|---|
+| `dev` (default) | 28 | 1.0 | `SamplerLCM` | ~12s |
+| `base` | 40 | 5.0 | `dpmpp_2m_sde_gpu` + seam smoothing | ~30s |
+
+Native canvas is 2048×2048. Reference images enable HiDream-O1's editing mode —
+1 image is an instruction edit, 2–10 is multi-reference:
+
+```bash
+curl -X POST http://localhost:8000/v1/images/generate \
+  -H "Content-Type: application/json" \
+  -d "{\"prompt\": \"make the background a neon city at night\",
+       \"ref_images\": [\"$(base64 -w0 portrait.png)\"]}"
+```
+
 ### Manual profile switch
 
 ```bash
@@ -329,12 +683,14 @@ Server/
 ├── Dockerfile                  # Gateway container image
 ├── Dockerfile.comfyui          # FLUX.1-dev inference server image
 ├── Dockerfile.ltx              # LTX-Video 2 inference server image
+├── Dockerfile.media            # Media node image (ComfyUI + CUDA 13)
 ├── docker-compose.yml          # Full stack definition
 ├── justfile                    # Task runner
 ├── requirements.txt            # Python dependencies
 ├── inference/
 │   ├── flux_server.py          # FLUX.1-dev FastAPI server (port 8004)
-│   └── ltx_server.py           # LTX-Video 2 FastAPI server (port 8005)
+│   ├── ltx_server.py           # LTX-Video 2 FastAPI server (port 8005)
+│   └── media_server.py         # Media node ComfyUI adapter (port 8010)
 ├── models/
 │   ├── gpt-oss-120b/
 │   │   ├── Dockerfile          # FROM vllm-mxfp4-spark:latest
@@ -345,12 +701,20 @@ Server/
 │   │   ├── _triton_alloc_setup.py
 │   │   ├── _triton_alloc_setup.pth
 │   │   └── download.sh         # hf download Qwen/Qwen3-Coder-Next-FP8 (~95 GB)
-│   └── flux2-pro/
-│       ├── Dockerfile          # Reference → Dockerfile.comfyui at root
-│       └── download.sh         # hf download black-forest-labs/FLUX.1-dev (~34 GB)
+│   ├── flux2-pro/
+│   │   ├── Dockerfile          # Reference → Dockerfile.comfyui at root
+│   │   └── download.sh         # hf download black-forest-labs/FLUX.1-dev (~34 GB)
+│   ├── minimax-h3/
+│   │   └── download.sh         # Comfy-Org/MiniMax-H3 (~63 GB)
+│   ├── ace-step-1.5/
+│   │   └── download.sh         # ACE-Step 1.5 XL Turbo (~20 GB)
+│   └── hidream-o1/
+│       └── download.sh         # HiDream-O1-Image (~16 GB)
 └── gateway/
     ├── app.py                  # FastAPI application (main entry point)
     ├── config.py               # Central configuration + VRAM profiles
+    ├── media_app.py            # Media-only Gateway — entry point on node 3
+    ├── media_node.py           # MiniMax-H3 routes — standalone, drop-in APIRouter
     ├── orchestrator.py         # Docker container lifecycle manager
     ├── proxy.py                # HTTP proxy to inference backends
     ├── request_buffer.py       # Request queue + Radix Prefix Cache
@@ -378,6 +742,9 @@ Server/
 | `LONG_POLLING_TIMEOUT_S` | `600` | Max long polling wait |
 | `MAX_QUEUE_SIZE` | `200` | Max requests queued during swap |
 | `RETRY_AFTER_SECONDS` | `5` | Retry-After header value for 503s |
+| `MEDIA_NODE_HOST` | `192.168.8.147` | Media node (node 3) address |
+| `MEDIA_NODE_PORT` | `8010` | Media node adapter port |
+| `MEDIA_NODE_URL` | `http://192.168.8.147:8010` | Full media node URL used by `media_node.py` |
 
 ---
 

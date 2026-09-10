@@ -53,7 +53,7 @@ class InferenceProxy:
         Forwards a chat completion request to the vLLM container.
         Retries on transient connection errors (model still loading).
         """
-        url = f"http://{model.container_name}:{model.port}/v1/chat/completions"
+        url = f"{model.base_url}/v1/chat/completions"
         # Use the served-model-name registered via --served-model-name
         payload["model"] = model.name
 
@@ -211,7 +211,7 @@ class InferenceProxy:
         """
         Sends an image generation request to the ComfyUI/Diffusers container.
         """
-        url = f"http://{model.container_name}:{model.port}/generate"
+        url = f"{model.base_url}/generate"
         timeout = aiohttp.ClientTimeout(total=self.IMAGE_TIMEOUT_S, connect=10)
 
         start = time.time()
@@ -233,8 +233,8 @@ class InferenceProxy:
                 )
                 return result
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            logger.error("Connection error to %s: %s", model.container_name, exc)
-            return {"error": {"message": f"Backend '{model.container_name}' unreachable: {exc}", "code": 502}}
+            logger.error("Connection error to %s: %s", url, exc)
+            return {"error": {"message": f"Backend '{model.name}' unreachable at {url}: {exc}", "code": 502}}
 
     # ──────────── Video (LTX-Video / Diffusers) ──────
 
@@ -248,7 +248,7 @@ class InferenceProxy:
         """
         Sends a video generation request to the LTX-Video container.
         """
-        url = f"http://{model.container_name}:{model.port}/generate"
+        url = f"{model.base_url}/generate"
         timeout = aiohttp.ClientTimeout(total=self.VIDEO_TIMEOUT_S, connect=10)
 
         start = time.time()
@@ -274,14 +274,14 @@ class InferenceProxy:
                 )
                 return result
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            logger.error("Connection error to %s: %s", model.container_name, exc)
-            return {"error": {"message": f"Backend '{model.container_name}' unreachable: {exc}", "code": 502}}
+            logger.error("Connection error to %s: %s", url, exc)
+            return {"error": {"message": f"Backend '{model.name}' unreachable at {url}: {exc}", "code": 502}}
 
     # ──────────── Generic Healthcheck ────────────────
 
     async def healthcheck(self, model: ModelDefinition) -> bool:
         """Verifies that the inference backend is responding."""
-        url = f"http://{model.container_name}:{model.port}/health"
+        url = f"{model.base_url}/health"
 
         try:
             async with self._session.get(url) as resp:
