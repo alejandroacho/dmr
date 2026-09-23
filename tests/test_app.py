@@ -749,3 +749,17 @@ class TestSwapTaskManagement:
         await task
         assert swap_completed.is_set()
         assert was_cancelled is False
+
+
+def test_profile_detail_reports_every_label_per_model():
+    """All three spark_cluster models share the 'vllm_node' container, so a
+    container-keyed label map collapsed them onto whichever label came last
+    and every model was reported as "code". A model holding both roles must
+    say so."""
+    from gateway.app import _build_profile_detail
+    from gateway.config import PROFILE_QWEN38
+
+    detail = _build_profile_detail("qwen38", PROFILE_QWEN38, is_active=True)
+
+    assert len(detail.models) == 1
+    assert detail.models[0].label == "chat, code"

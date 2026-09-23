@@ -356,8 +356,12 @@ class TestTeardownPreserve:
         orch = _make_orchestrator(mock_vram_monitor)
         teardown_calls = []
 
-        async def _spy_teardown(strategy, preserve=None):
-            teardown_calls.append({"strategy": strategy, "preserve": preserve})
+        async def _spy_teardown(strategy, preserve=None, preserve_models=None):
+            teardown_calls.append({
+                "strategy": strategy,
+                "preserve": preserve,
+                "preserve_models": preserve_models,
+            })
 
         orch._teardown_current = _spy_teardown
         orch._ensure_container_running = AsyncMock()
@@ -373,6 +377,9 @@ class TestTeardownPreserve:
         assert len(teardown_calls) >= 1
         preserve_set = teardown_calls[0]["preserve"]
         assert TEST_MODEL_A.container_name in preserve_set
+        # Container names alone cannot tell two spark_cluster models apart —
+        # they share one container — so the model identities must come too.
+        assert TEST_MODEL_A.name in teardown_calls[0]["preserve_models"]
 
 
 # ──────────────────────────────────────────────────────

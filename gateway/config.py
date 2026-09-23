@@ -228,7 +228,7 @@ DEEPSEEK_V4_FLASH = ModelDefinition(
         "CUTE_DSL_ARCH": "sm_121a",
         "VLLM_USE_AOT_COMPILE": "1",
         "VLLM_USE_BREAKABLE_CUDAGRAPH": "0",
-        "VLLM_USE_MEGA_AOT_ARTIFACT": "-1",
+        "VLLM_USE_MEGA_AOT_ARTIFACT": "1",
         "VLLM_MEMORY_PROFILE_INCLUDE_ATTN": "1",
         "VLLM_USE_FLASHINFER_SAMPLER": "1",
         "VLLM_USE_B12X_WO_PROJECTION": "1",
@@ -237,6 +237,7 @@ DEEPSEEK_V4_FLASH = ModelDefinition(
         "VLLM_USE_B12X_MOE": "1",
         "VLLM_USE_B12X_SPARSE_INDEXER": "1",
         "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_MOE_SKIP_PADDING": "0",
         "B12X_MLA_SM120_UNIFIED": "1",
         "B12X_MOE_FORCE_A8": "1",
     },
@@ -257,20 +258,21 @@ DEEPSEEK_V4_FLASH = ModelDefinition(
         # Passed as single tokens: vLLM parses the dotted nested form with "=".
         "--default-chat-template-kwargs.thinking=true": True,
         "--default-chat-template-kwargs.reasoning_effort=high": True,
-        # Needs the instanttensor-hybrid-draft-loader mod, applied to the
-        # container by launch-cluster.sh at launch time.
-        "--load-format": "instanttensor",
+        # Upstream dropped the instanttensor-hybrid-draft-loader mod from
+        # this recipe (2026-09) in favour of the b12x loader, which is built
+        # into the image and needs no patch at container launch.
+        "--load-format": "b12x",
         "--moe-backend": "b12x",
         "--linear-backend": "b12x",
-        "--attention-backend": "B12X_MLA_SPARSE",
-        "--max-cudagraph-capture-size": 64,
+        "--attention-backend": "B12X",
+        "--max-cudagraph-capture-size": 48,
         "--compilation-config": (
             '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
         ),
         "--speculative-config": (
             '{"method":"dspark","num_speculative_tokens":5,'
             '"draft_sample_method":"probabilistic",'
-            '"attention_backend":"B12X_MLA_SPARSE"}'
+            '"attention_backend":"B12X"}'
         ),
     },
 )
@@ -313,6 +315,78 @@ QWEN35_122B_FP8 = ModelDefinition(
     },
 )
 
+
+QWEN38_FLASH_NEXT = ModelDefinition(
+    name="qwen3.8-flash-next",
+    # Same cluster container and image as the other two. This recipe needs no
+    # mods at all (`mods: []` upstream), so it imposes nothing on a launch that
+    # already serves DeepSeek and Qwen3.5.
+    container_image="vllm-node-b12x:latest",
+    container_name=SPARK_CLUSTER_CONTAINER,
+    # ~106 GB of NVFP4 weights plus a 256K KV cache at 0.7 utilization,
+    # sharded across both nodes. Not visible to local NVML (skip_vram_check).
+    vram_required_mb=150_000,
+    port=8022,
+    # NVFP4 + MXFP8 mixed checkpoint: vLLM needs the quantization named
+    # explicitly here, unlike the native FP8/FP4 checkpoints above.
+    quantization="modelopt_mixed",
+    tensor_parallel_size=2,
+    max_model_len=262144,
+    kv_cache_dtype="fp8",
+    hf_model_id="local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
+    engine="spark_cluster",
+    exec_container=SPARK_CLUSTER_CONTAINER,
+    # Native multi-node like DeepSeek (rank 0 here + one --headless rank on the
+    # worker). The recipe passes no --distributed-executor-backend, so this one
+    # does NOT need the containers launched in Ray mode.
+    cluster_nodes=2,
+    requires_ray_cluster=False,
+    # launch-cluster.sh exports these inside its launch script rather than via
+    # `docker run -e`, so the exec'd serve process must set them itself.
+    extra_env={
+        "CUTE_DSL_ARCH": "sm_121a",
+        "SAFETENSORS_FAST_GPU": "1",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+        "VLLM_USE_AOT_COMPILE": "1",
+        "VLLM_USE_MEGA_AOT_ARTIFACT": "1",
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "B12X_POLICY_MODE": "auto",
+        # Cluster-only: collectives ride the ConnectX-7 RoCE rails.
+        "VLLM_ENABLE_ROCE_ALLREDUCE": "1",
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE": "2MB",
+    },
+    extra_args={
+        "--host": "0.0.0.0",
+        "--pipeline-parallel-size": 1,
+        "--dtype": "bfloat16",
+        "--block-size": 16,
+        "--max-num-seqs": 16,
+        "--max-num-batched-tokens": 4096,
+        "--gpu-memory-utilization": "0.7",
+        # Hybrid attention/SSM model: the Mamba state cache must be aligned to
+        # the attention block size or vLLM refuses to allocate it.
+        "--mamba-cache-mode": "align",
+        "--enable-chunked-prefill": True,
+        "--load-format": "b12x",
+        "--gdn-decode-kernel": "b12x",
+        "--linear-backend": "b12x",
+        "--moe-backend": "b12x",
+        "--no-enable-flashinfer-autotune": True,
+        # Multimodal checkpoint; the encoder replicates per rank instead of
+        # sharding. Harmless for the text-only traffic the Gateway serves.
+        "--mm-encoder-tp-mode": "data",
+        "--enable-auto-tool-choice": True,
+        "--tool-call-parser": "qwen3_xml",
+        "--reasoning-parser": "qwen3",
+        "--speculative-config": (
+            '{"method":"mtp","num_speculative_tokens":4}'
+        ),
+        "--compilation-config": (
+            '{"pass_config":{"fuse_act_quant":true}}'
+        ),
+    },
+)
 
 # ────── Load Profiles ──────
 
@@ -360,15 +434,30 @@ PROFILE_QWEN35 = VRAMProfile(
     skip_vram_check=True,
 )
 
+PROFILE_QWEN38 = VRAMProfile(
+    mode=ProfileMode.FOCUS,
+    description=(
+        "Qwen3.8-Flash-Next NVFP4, TP=2 across both Sparks (native multi-node, "
+        "no Ray), 256K context + MTP speculative decoding (~150 GB cluster-wide)"
+    ),
+    primary_models=[QWEN38_FLASH_NEXT],
+    secondary_models=[],
+    labels={"chat": QWEN38_FLASH_NEXT, "code": QWEN38_FLASH_NEXT},
+    # Sharded across two nodes; local NVML sees only half.
+    skip_vram_check=True,
+)
+
 PROFILES: dict[str, VRAMProfile] = {
     "deepseek": PROFILE_DEEPSEEK,
     "qwen35": PROFILE_QWEN35,
+    "qwen38": PROFILE_QWEN38,
 }
 
 # Flat list of every model in the catalog (used for orphan cleanup)
 ALL_MODELS: list[ModelDefinition] = [
     DEEPSEEK_V4_FLASH,
     QWEN35_122B_FP8,
+    QWEN38_FLASH_NEXT,
 ]
 
 

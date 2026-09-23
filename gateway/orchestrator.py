@@ -204,6 +204,11 @@ class ContainerOrchestrator:
         # Build a map of container_name → status for all known models
         running: dict[str, str] = {}
         exec_managed: set[str] = set()
+        # Every spark_cluster model execs into the SAME container, so a
+        # container name cannot identify which model is actually serving.
+        # Track the healthy models by name or adoption picks whichever
+        # profile is first in PROFILES (it always answered "deepseek").
+        healthy_exec_models: set[str] = set()
         for model in ALL_MODELS:
             name = model.container_name
             if model.engine in EXEC_ENGINES:
@@ -211,6 +216,7 @@ class ContainerOrchestrator:
                 healthy = await self._check_vllm_health(name, model.port, model.engine)
                 if healthy:
                     running[name] = "running"
+                    healthy_exec_models.add(model.name)
                 continue
             workload = await self._backend.get_workload(name)
             if workload is not None:
@@ -225,7 +231,13 @@ class ContainerOrchestrator:
         for profile_key, profile in PROFILES.items():
             all_models = profile.primary_models + profile.secondary_models
             required = {m.container_name for m in all_models}
-            if required and required.issubset(running) and all(
+            # An exec-managed model is only "here" if its own port answered.
+            exec_ok = all(
+                m.name in healthy_exec_models
+                for m in all_models
+                if m.engine in EXEC_ENGINES
+            )
+            if required and exec_ok and required.issubset(running) and all(
                 running[n] in valid_statuses for n in required
             ):
                 self._active_profile = profile_key
@@ -323,9 +335,14 @@ class ContainerOrchestrator:
 
                 all_models = target_profile.primary_models + target_profile.secondary_models
                 target_names = {m.container_name for m in all_models}
+                target_model_names = {m.name for m in all_models}
 
                 # 1. Stop/pause workloads from current profile (preserve targets)
-                await self._teardown_current(strategy, preserve=target_names)
+                await self._teardown_current(
+                    strategy,
+                    preserve=target_names,
+                    preserve_models=target_model_names,
+                )
 
                 # 2. Verify available VRAM
                 if target_profile.skip_vram_check:
@@ -334,6 +351,7 @@ class ContainerOrchestrator:
                     await self._ensure_vram_available(
                         target_profile.total_vram_required_mb,
                         target_names,
+                        preserve_models=target_model_names,
                     )
 
                 # 3. Start workloads for the target profile
@@ -376,6 +394,7 @@ class ContainerOrchestrator:
         needed_mb: int,
         preserve: set[str],
         wait_seconds: int = 15,
+        preserve_models: set[str] | None = None,
     ) -> None:
         """Verify VRAM budget and, if insufficient, force a full teardown
         and wait up to `wait_seconds` for memory to be released.
@@ -391,7 +410,11 @@ class ContainerOrchestrator:
             "Insufficient VRAM (%d MB free, %d MB required). Forcing deep cleanup...",
             report.total_free_mb, needed_mb,
         )
-        await self._teardown_current(SwapStrategy.STOP_START, preserve=preserve)
+        await self._teardown_current(
+            SwapStrategy.STOP_START,
+            preserve=preserve,
+            preserve_models=preserve_models,
+        )
 
         for _ in range(wait_seconds):
             await asyncio.sleep(1)
@@ -501,14 +524,34 @@ class ContainerOrchestrator:
         self,
         strategy: SwapStrategy,
         preserve: set[str] | None = None,
+        preserve_models: set[str] | None = None,
     ) -> None:
         """Stops or pauses all workloads from the current profile.
 
         Args:
             strategy: How to tear down (stop or pause).
             preserve: Workload names to SKIP (target profile workloads).
+            preserve_models: Model names to SKIP among exec-managed models.
         """
         preserve = preserve or set()
+        preserve_models = preserve_models or set()
+
+        # Every spark_cluster model execs into the SAME container, so a
+        # preserved container name says nothing about which model is serving
+        # inside it: the outgoing model's container is always "preserved"
+        # because the incoming one shares it. Stop exec-managed models by
+        # identity first, or the old serve process survives the swap and holds
+        # both its HTTP port and the distributed master port (29501) against
+        # the incoming model, which then dies with EADDRINUSE.
+        current = PROFILES.get(self._active_profile or "")
+        if current is not None:
+            for model in current.primary_models + current.secondary_models:
+                if model.engine not in EXEC_ENGINES:
+                    continue
+                if model.name in preserve_models:
+                    continue
+                await self._stop_exec_model(model)
+                self._container_states[model.container_name] = ContainerState.STOPPED
 
         for name, state in list(self._container_states.items()):
             if name in preserve:
@@ -999,13 +1042,33 @@ class ContainerOrchestrator:
             )
 
     async def _stop_spark_serve(self, model: ModelDefinition) -> None:
-        """Kills every rank of a Spark cluster model, on all its nodes."""
+        """Kills every rank of a Spark cluster model, on all its nodes.
+
+        Two things make this harder than a `pkill` on the launch tag:
+
+        - The tag set with `exec -a` never reaches the process table.
+          /usr/local/bin/vllm is a shebang script, so the kernel rebuilds argv
+          as "python3 /usr/local/bin/vllm serve ...". `pkill -f <tag>` matched
+          nothing, swallowed the failure and still logged "Stopped".
+        - vLLM renames its tensor-parallel workers to "VLLM::Worker_TP", and
+          those are the processes actually holding the weights. No pattern
+          built from the serve command line reaches them.
+
+        So: match the model id, kill the whole process group, and only then
+        sweep any worker left orphaned — guarded on no other serve process
+        being alive, so a second model on the node is never touched.
+        """
+        pattern = f"vllm serve {model.hf_model_id or model.name}"
         for rank in range(model.cluster_nodes):
-            tag = self._spark_process_tag(model, rank)
             kill_cmd = (
-                f"pkill -TERM -f {shlex.quote(tag)} 2>/dev/null; "
-                f"sleep 2; "
-                f"pkill -KILL -f {shlex.quote(tag)} 2>/dev/null; "
+                f"for pid in $(pgrep -f {shlex.quote(pattern)}); do "
+                f"pgid=$(ps -o pgid= -p \"$pid\" 2>/dev/null | tr -d ' '); "
+                f"[ -n \"$pgid\" ] && kill -TERM -\"$pgid\" 2>/dev/null; "
+                f"done; "
+                f"sleep 5; "
+                f"pkill -KILL -f {shlex.quote(pattern)} 2>/dev/null; "
+                f"pgrep -f 'vllm serve' >/dev/null 2>&1 || "
+                f"pkill -KILL -f 'VLLM::' 2>/dev/null; "
                 f"true\n"
             )
             try:
@@ -1016,7 +1079,9 @@ class ContainerOrchestrator:
                 logger.warning(
                     "Could not stop '%s' rank %d: %s", model.name, rank, exc
                 )
-        logger.info("Stopped Spark cluster model '%s' on all ranks.", model.name)
+        logger.info(
+            "Sent teardown for Spark cluster model '%s' on all ranks.", model.name
+        )
 
     async def _start_ray_vllm(self, model: ModelDefinition) -> None:
         """Starts vllm serve inside the Ray head as a background process."""

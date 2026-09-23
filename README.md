@@ -2,7 +2,7 @@
 
 FastAPI middleware that fronts a two-node NVIDIA DGX Spark (GB10 Blackwell) cluster, serving two large text models and swapping between them on demand.
 
-The catalog is deliberately small: **DeepSeek-V4-Flash** and **Qwen3.5-122B**. Both are too large for one node, so both shard across the pair with tensor parallelism.
+The catalog is deliberately small: **DeepSeek-V4-Flash**, **Qwen3.5-122B** and **Qwen3.8-Flash-Next**. All three are too large for one node, so all three shard across the pair with tensor parallelism.
 
 ---
 
@@ -62,28 +62,31 @@ Consequences worth knowing:
 |---|---|---|---|---|
 | **`deepseek`** ⭐ | DeepSeek-V4-Flash-0731 — 284B total / 13B active MoE, FP4 experts + FP8 dense | Native multi-node, TP=2 (2 processes) | 8020 | 1,048,576 |
 | **`qwen35`** | Qwen3.5-122B-A10B-FP8 — native FP8 | Ray, TP=2 (1 process) | 8021 | 262,144 |
+| **`qwen38`** | Qwen3.8-Flash-Next-NVFP4 — NVFP4 + MXFP8 mixed, hybrid attention/SSM | Native multi-node, TP=2 (2 processes) | 8022 | 262,144 |
 
 `deepseek` is the default at startup.
 
-### Why these two
+### Why these three
 
 DeepSeek-V4-Flash is the reason the cluster exists: 167 GB of weights, ~220 GB of footprint across both nodes, and dspark speculative decoding. Qwen3.5-122B-A10B-FP8 is the second-opinion model — Qwen's own FP8 quantization (not a third-party int4 requant), ~127 GB, comfortable at ~64 GB per node with room for a 256K KV cache.
 
+Qwen3.8-Flash-Next-NVFP4 is the newest of the three: ~106 GB in NVIDIA's mixed NVFP4/MXFP8 quantization, a hybrid attention/SSM architecture with MTP speculative decoding, and — unlike Qwen3.5 — no Ray and no mods at all. It is multimodal upstream; the Gateway only ever sends it text.
+
 Two Qwen3.5 recipes were rejected: `qwen3.5-397b-int4-autoround` is labeled EXPERIMENTAL upstream and its 226 GB leave almost nothing for KV cache within the 256 GB the pair has; `qwen3.5-122b-int4-autoround` is a lossy requant whose only advantage — fitting on one node — is irrelevant here.
 
-### The two models need different cluster modes
+### The models need different cluster modes
 
 This is the sharpest operational edge in the whole setup:
 
-| | DeepSeek | Qwen3.5 |
-|---|---|---|
-| Distribution | vLLM native (`--nnodes/--node-rank`, one `--headless` rank per worker) | Ray (`--distributed-executor-backend ray`, single process) |
-| Requires Ray inside the containers | No | **Yes** |
-| Mod | `instanttensor-hybrid-draft-loader` (patches vLLM's model loader) | `fix-qwen3.5-chat-template` (drops a jinja file in `/workspace`) |
+| | DeepSeek | Qwen3.5 | Qwen3.8-Flash-Next |
+|---|---|---|---|
+| Distribution | vLLM native (`--nnodes/--node-rank`, one `--headless` rank per worker) | Ray (`--distributed-executor-backend ray`, single process) | vLLM native, same as DeepSeek |
+| Requires Ray inside the containers | No | **Yes** | No |
+| Mod | none since 2026-09 (upstream moved it to the built-in `b12x` loader) | `fix-qwen3.5-chat-template` (drops a jinja file in `/workspace`) | none (`mods: []`) |
 
-The two **mods coexist** — one patches Python, the other only copies a file — so a single container launch can serve both models. Ray mode does not, though: DeepSeek ignores a running Ray cluster, but Qwen3.5 hard-fails without one. Launch the containers in Ray mode if you want to swap freely between them.
+Only Qwen3.5 still asks for a mod, and it merely copies a file, so a single container launch can serve all three models. Ray mode does not: DeepSeek and Qwen3.8 ignore a running Ray cluster, but Qwen3.5 hard-fails without one. Launch the containers in Ray mode if you want to swap freely to Qwen3.5 as well.
 
-The Gateway checks this before every Qwen3.5 swap and refuses with a clear message rather than starting a process that would die.
+The Gateway checks this before every Qwen3.5 swap and refuses with a clear message rather than starting a process that would die. Qwen3.8 needs no such check.
 
 ---
 
@@ -267,7 +270,7 @@ Because the shipped catalog holds only `spark_cluster` models, tests that exerci
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/admin/profile/{name}` | Switch profile (`deepseek`, `qwen35`). Add `?force=true` to restart the active one. |
+| `POST` | `/admin/profile/{name}` | Switch profile (`deepseek`, `qwen35`, `qwen38`). Add `?force=true` to restart the active one. |
 | `POST` | `/admin/container/{name}/stop` | Stop a Docker-managed workload |
 | `POST` | `/admin/container/{name}/remove` | Remove a Docker-managed workload |
 
@@ -458,7 +461,15 @@ docker exec blackwell-gateway ssh -i /ssh/id_spark -o BatchMode=yes \
 
 ### Model loading hangs for 20+ minutes
 
-`--load-format instanttensor` without the `instanttensor-hybrid-draft-loader` mod. `run-recipe.sh` applies it from the recipe; a hand-rolled `launch-cluster.sh` invocation must pass `--apply-mod mods/instanttensor-hybrid-draft-loader`.
+`--load-format instanttensor` without the `instanttensor-hybrid-draft-loader` mod. DeepSeek stopped using either as of 2026-09-20 — it now loads with `--load-format b12x`, which is built into the image — so this only applies if you pin the old loader back.
+
+### A relaunch silently keeps the old image
+
+`run-recipe.sh` prints `Cluster containers are already running. Skipping launch.` and **still exits 0**, having exec'd the model into whatever image the running containers already had. A new image only takes effect after `./launch-cluster.sh -t vllm-node-b12x --name vllm_node stop` (and `docker rm -f vllm_node` on both nodes for good measure). Verify with `docker ps --format '{{.Image}}'` rather than trusting the exit code.
+
+### A swap brings back the wrong model
+
+`vllm-cluster.timer` fires every 2 minutes and relaunches the cluster whenever it finds it incomplete — which is exactly what a swap looks like mid-flight. It used to hardcode DeepSeek and would exec it into the container where the incoming model was still loading, leaving the two fighting over the node's memory. It now asks the Gateway which profile is active (`/v1/profiles/active`) and relaunches that one, falling back to DeepSeek only when the Gateway cannot be reached.
 
 ### `vllm serve: error: argument --reasoning-config: Invalid JSON`
 
@@ -481,9 +492,11 @@ docker exec vllm_node bash -c "cat /proc/\$(pgrep -f 'vllm serve' | head -1)/cmd
 
 ## Current State
 
-- **`deepseek`** is operational: weights on both nodes, serving on 8020, ~49 tok/s single-stream, 1,146,734 tokens of KV cache.
+- **`qwen38`** is operational and currently active: 106 GB of NVFP4 weights on both nodes, serving on 8022 at ~10 tok/s single-stream with 262,144 tokens of context (as of 2026-09-20).
+- **`deepseek`** has its weights on both nodes and served on 8020 at ~49 tok/s with 1,146,734 tokens of KV cache, but it was migrated to `--load-format b12x` / `--attention-backend B12X` on 2026-09-20 to match the new upstream recipe and **has not been started once under that configuration**. The image it last ran under is tagged `vllm-node-b12x:pre-qwen38` on both nodes.
 - **`qwen35`** is configured but **not yet operational**: its 127 GB of weights are not downloaded on either node, and the containers currently run in native (non-Ray) mode, so its preflight check will refuse the swap. Space is no longer the blocker it once was — as of 2026-09-10 the head has 545 GB free and the worker 417 GB.
-- **The cluster keep-alive of step 8 is installed and running** (as of 2026-09-10): `vllm-cluster.timer` is enabled on the head and fires every 2 minutes. DeepSeek now does come back on its own after a reboot.
+- **The cluster keep-alive of step 8 is installed and running** (as of 2026-09-10): `vllm-cluster.timer` is enabled on the head and fires every 2 minutes, so a model comes back on its own after a reboot. Since 2026-09-20 it relaunches whichever profile the Gateway reports active, not always DeepSeek.
+- **`hf-download.sh -c` does not copy the weights** under HuggingFace's current cache layout: the big blobs live in a shared `~/hf-cache/hub/blobs/` store and the per-model directory holds only symlinks into it, so the copy moves a few MB, reports `Copy complete`, and leaves the worker with dangling links. Copy that store across by hand (`rsync -a ~/hf-cache/hub/blobs/ <worker>:~/hf-cache/hub/blobs/`) and verify the symlinks resolve on the far side.
 - **The worker still carries legacy Ray debt.** `ray-node-worker.service` is enabled there and fails on every boot, and 157 GB of orphaned HuggingFace cache sit in its `~/.cache/huggingface`. See [NODE2.md](NODE2.md) §5.
 - **The legacy `ray-node-head` container is still running on the head** (`blackwell-vllm:latest`, `ray-node-head.service` enabled), even though no model in the catalog uses the `ray_vllm` engine.
 

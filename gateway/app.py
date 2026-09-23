@@ -328,7 +328,13 @@ def _build_profile_detail(key: str, profile, is_active: bool) -> ProfileDetail:
     from a prior profile is still lingering — the profile-level view is
     what the caller is asking for.
     """
-    label_by_container = {m.container_name: lbl for lbl, m in profile.labels.items()}
+    # Keyed by model, not by container: every spark_cluster model execs into
+    # the same 'vllm_node', so a container-keyed map collapsed all of them onto
+    # whichever label came last and every model reported "code". A model can
+    # also hold several labels at once (chat AND code), so keep them all.
+    labels_by_model: dict[str, list[str]] = {}
+    for lbl, m in profile.labels.items():
+        labels_by_model.setdefault(m.name, []).append(lbl)
 
     slots: list[ModelSlot] = []
     for m in profile.primary_models + profile.secondary_models:
@@ -338,7 +344,7 @@ def _build_profile_detail(key: str, profile, is_active: bool) -> ProfileDetail:
             else ContainerState.STOPPED
         )
         slot = m.to_slot(state)
-        slot.label = label_by_container.get(m.container_name, "")
+        slot.label = ", ".join(sorted(labels_by_model.get(m.name, [])))
         slots.append(slot)
 
     return ProfileDetail(

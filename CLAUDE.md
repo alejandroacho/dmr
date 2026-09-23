@@ -59,11 +59,9 @@ All model definitions and VRAM profiles live in **`gateway/config.py`**. Profile
 
 | Key | Description |
 |---|---|
-| `focus` | GPT-OSS 120B only (single GPU, ~84 GB, MXFP4 CUTLASS sm_121 — requires `vllm-mxfp4-spark:latest` image) |
-| `focus_code` | Qwen3 Coder Next 80B MoE — **default at startup** |
-| `focus_large` | Qwen3.5-122B-A10B GPTQ-Int4 (~72 GB, Gated DeltaNet + MoE arch — requires updated `blackwell-vllm:latest`) |
-| `creative_image` | Qwen3 Coder 30B + FLUX.2 Pro (~77 GB) |
-| `creative_video` | Qwen3 Coder 30B + LTX-Video 2 (~77 GB) |
+| `deepseek` | DeepSeek-V4-Flash-0731, native multi-node TP=2, 1M context — **default at startup** |
+| `qwen35` | Qwen3.5-122B-A10B-FP8, Ray TP=2, 256K context (needs the containers launched in Ray mode) |
+| `qwen38` | Qwen3.8-Flash-Next-NVFP4, native multi-node TP=2, 256K context, no Ray and no mods |
 
 Each `ModelDefinition` carries the Docker image, container name, port, quantization, and vLLM args. `VRAMProfile` groups models and computes total VRAM.
 
