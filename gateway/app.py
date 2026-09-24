@@ -33,6 +33,7 @@ from gateway.config import (
 )
 
 RAY_WATCHDOG_INTERVAL_S: int = int(os.getenv("RAY_WATCHDOG_INTERVAL_S", "30"))
+from gateway import media_node
 from gateway.backends import create_backend
 from gateway.orchestrator import ContainerOrchestrator
 from gateway.proxy import InferenceProxy
@@ -135,6 +136,7 @@ async def lifespan(app: FastAPI):
     logger.info("━━━ Shutting down Smart Gateway ━━━")
     await vram_monitor.stop()
     await inference_proxy.shutdown()
+    await media_node.shutdown()
     await orchestrator.aclose()
     logger.info("━━━ Gateway shut down successfully ━━━")
 
@@ -593,7 +595,7 @@ async def list_models():
     also appear under their label alias (e.g. "chat", "code", "image")
     so agents can use stable identifiers across profile switches.
     """
-    from gateway.config import ALL_MODELS
+    from gateway.config import ALL_MODELS, REMOTE_MEDIA_MODELS
 
     data = [
         {
@@ -605,6 +607,22 @@ async def list_models():
             "quantization": m.quantization,
         }
         for m in ALL_MODELS
+    ]
+
+    # Models on other nodes: always listed, since they need no local VRAM and
+    # are never swapped out. `node` tells agents where the work actually runs.
+    data += [
+        {
+            "id": m.name,
+            "object": "model",
+            "owned_by": "blackwell-gateway",
+            "engine": m.engine,
+            "vram_mb": m.vram_required_mb,
+            "quantization": m.quantization,
+            "node": m.host,
+            "endpoint": "/v1/av/generate",
+        }
+        for m in REMOTE_MEDIA_MODELS
     ]
 
     # Add label aliases from the active profile
@@ -754,6 +772,14 @@ async def _dispatch_to_backend(decision, request: AgentRequest) -> Any:
         request.forwarded_params(),
         stream=request.stream,
     )
+
+
+# ──────────── Media node (node 3) ────────────────
+# Adds POST /v1/av/generate and GET /status/media-node, proxied to the remote
+# MiniMax-H3 node. Self-contained: no local VRAM, profile or container
+# involvement. Attached last so it can see which routes this app already
+# defines and avoid shadowing them (e.g. the LTX /v1/videos/generate above).
+media_node.attach(app)
 
 
 # ──────────── Direct entry point ────────────────

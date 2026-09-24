@@ -121,6 +121,56 @@ focus-code: ## Switch to Focus Code mode (Qwen3-Coder-Next 80B — default)
 focus: ## Switch to Focus mode (GPT-OSS 120B)
 	curl -s -X POST $(GATEWAY)/admin/profile/focus | python3 -m json.tool
 
+
+##@ Media node (node 3) — MiniMax-H3, standalone
+
+.PHONY: download-minimax
+download-minimax: ## Download MiniMax-H3 weights — video + native audio (~63 GB)
+	MODELS_DIR=$(MODELS_DIR) models/minimax-h3/download.sh
+
+.PHONY: download-ace
+download-ace: ## Download ACE-Step 1.5 XL Turbo weights — music (~20 GB)
+	MODELS_DIR=$(MODELS_DIR) models/ace-step-1.5/download.sh
+
+.PHONY: download-hidream
+download-hidream: ## Download HiDream-O1-Image weights — images, both variants (~16 GB)
+	MODELS_DIR=$(MODELS_DIR) models/hidream-o1/download.sh
+
+.PHONY: download-media
+download-media: download-minimax download-ace download-hidream ## Download everything the media node serves (~99 GB)
+
+.PHONY: build-media
+build-media: ## Build the media node images (ComfyUI + CUDA 13, ~15 min first time)
+	docker compose --profile media build media-node media-gateway
+
+.PHONY: media-up
+media-up: ## Start the whole media node (adapter + its Gateway)
+	docker compose --profile media up -d media-node media-gateway
+
+.PHONY: media-down
+media-down: ## Stop the media node
+	docker compose --profile media stop media-gateway media-node
+
+.PHONY: media-logs
+media-logs: ## Follow the media-node inference logs (model loading, sampling)
+	docker logs -f media-node
+
+.PHONY: media-gateway-logs
+media-gateway-logs: ## Follow the media Gateway logs (requests in, timings)
+	docker logs -f media-gateway
+
+.PHONY: media-health
+media-health: ## Adapter health, bypassing the Gateway
+	curl -s http://localhost:8010/health | python3 -m json.tool
+
+.PHONY: media-status
+media-status: ## Gateway health — includes the backend's state and VRAM
+	curl -s $(GATEWAY)/health | python3 -m json.tool
+
+.PHONY: media-models
+media-models: ## Models exposed by the media node
+	curl -s $(GATEWAY)/v1/models | python3 -m json.tool
+
 ##@ Quick setup (new machine from scratch)
 
 .PHONY: setup
