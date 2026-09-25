@@ -16,6 +16,8 @@ networks:
         - subnet: 172.28.0.0/16
 
 volumes:
+  fish_references:
+    driver: local
   model_cache:
     driver: local
   triton_cache:
@@ -48,6 +50,21 @@ x-model-volumes: &model-volumes
   - triton_cache:/root/.triton
 
 services:
+
+  fish-tts:
+    <<: *gpu-common
+    build:
+      context: .
+      dockerfile: Dockerfile.fish
+    image: fish-tts:latest
+    container_name: fish-tts
+    ports:
+      - "8011:8011"
+    volumes:
+      - /home/alejandroacho/Models/fish-s2-pro:/models/fish-s2-pro:ro
+      - fish_references:/opt/fish-speech/references
+    profiles:
+      - tts
 
   # ════════════════════════════════════════════════════
   #  GATEWAY — Intelligent middleware layer
