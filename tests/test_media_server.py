@@ -82,7 +82,6 @@ def _links(graph):
     lambda: _music(),
     lambda: _music(lyrics="la la la", duration=30.0),
     lambda: _image(),
-    lambda: _image(variant="base"),
     lambda: _image(refs=["r1.png", "r2.png"]),
 ])
 def test_every_link_points_at_a_real_node(builder):
@@ -237,90 +236,48 @@ def test_music_duration_reaches_latent_and_conditioning():
 
 
 # ──────────────────────────────────────────────────────
-#  image — HiDream-O1
+#  image — Qwen-Image-2.1
 # ──────────────────────────────────────────────────────
 
-def test_image_uses_custom_sampling_not_ksampler():
-    """HiDream-O1 needs ModelNoiseScale + SamplerCustom + BasicScheduler.
-
-    A plain KSampler graph does not reproduce the official templates.
-    """
-    graph, _, _ = _image()
-
-    assert "KSampler" not in {n["class_type"] for n in graph.values()}
-    assert graph["sample"]["class_type"] == "SamplerCustom"
-    assert graph["noise"]["class_type"] == "ModelNoiseScale"
-    assert graph["sigmas"]["class_type"] == "BasicScheduler"
-    # All-in-one checkpoint: MODEL 0, CLIP 1, VAE 2
-    assert graph["ckpt"]["class_type"] == "CheckpointLoaderSimple"
-    assert graph["positive"]["inputs"]["clip"] == ["ckpt", 1]
-    assert graph["decode"]["inputs"]["vae"] == ["ckpt", 2]
-    # SamplerCustom returns (output, denoised_output); templates take output
-    assert graph["decode"]["inputs"]["samples"] == ["sample", 0]
-
-
-def test_image_dev_variant_defaults():
-    """From image_hidream_o1_dev.json: LCM, 28 steps, cfg 1, noise scale 7.6."""
-    graph, _, _ = _image(variant="dev")
-
-    assert graph["ckpt"]["inputs"]["ckpt_name"] == media_server.IMAGE_CKPT_DEV
-    assert graph["sampler_sel"]["class_type"] == "SamplerLCM"
-    assert graph["sampler_sel"]["inputs"]["noise_clip_std"] == 2.5
-    assert graph["sigmas"]["inputs"]["steps"] == 28
-    assert graph["sample"]["inputs"]["cfg"] == 1.0
-    assert graph["noise"]["inputs"]["noise_scale"] == 7.6
-    # dev has no seam smoothing
-    assert "seam" not in graph
-    assert graph["sample"]["inputs"]["model"] == ["noise", 0]
-
-
-def test_image_base_variant_defaults():
-    """From image_hidream_o1.json: dpmpp_2m_sde_gpu, 40 steps, cfg 5, scale 8."""
-    graph, _, _ = _image(variant="base")
-
-    assert graph["ckpt"]["inputs"]["ckpt_name"] == media_server.IMAGE_CKPT_BASE
-    assert graph["sampler_sel"]["class_type"] == "KSamplerSelect"
-    assert graph["sampler_sel"]["inputs"]["sampler_name"] == "dpmpp_2m_sde_gpu"
-    assert graph["sigmas"]["inputs"]["steps"] == 40
-    assert graph["sample"]["inputs"]["cfg"] == 5.0
-    assert graph["noise"]["inputs"]["noise_scale"] == 8.0
-    # base adds the seam-smoothing patch, and sampling runs off it
-    assert graph["seam"]["class_type"] == "HiDreamO1PatchSeamSmoothing"
-    assert graph["sample"]["inputs"]["model"] == ["seam", 0]
-
-
-def test_image_native_canvas_and_overrides():
-    _, _, req = _image()
+def test_image_qwen_official_workflow():
+    graph, save, req = _image()
+    assert graph["model"]["inputs"]["unet_name"] == media_server.IMAGE_DIT
+    assert graph["clip"]["inputs"]["type"] == "qwen_image"
+    assert graph["encode"]["class_type"] == "TextEncodeQwenImage21"
+    assert graph["sample"]["class_type"] == "KSampler"
+    inputs = graph["sample"]["inputs"]
+    assert (inputs["steps"], inputs["cfg"], inputs["sampler_name"], inputs["scheduler"]) == (25, 1, "euler", "simple")
+    assert inputs["positive"] == ["encode", 0]
+    assert inputs["negative"] == ["encode", 1]
+    assert graph["decode"]["inputs"]["vae"] == ["vae", 0]
+    assert graph[save]["class_type"] == "SaveImage"
     assert (req.width, req.height) == (2048, 2048)
-
-    graph, _, _ = _image(steps=12, cfg_scale=3.0, noise_scale=5.0, width=1024, height=1536)
-    assert graph["sigmas"]["inputs"]["steps"] == 12
-    assert graph["sample"]["inputs"]["cfg"] == 3.0
-    assert graph["noise"]["inputs"]["noise_scale"] == 5.0
-    assert graph["latent"]["inputs"]["width"] == 1024
-    assert graph["latent"]["inputs"]["height"] == 1536
+    assert "vae" not in graph["encode"]["inputs"]
 
 
-def test_image_reference_autogrow_keys_are_one_indexed():
-    """HiDreamO1ReferenceImages uses TemplateNames image_1..image_10 — base 1,
-    unlike H3's zero-based TemplatePrefix."""
+def test_image_sampling_and_size_overrides():
+    graph, _, _ = _image(steps=12, cfg_scale=3, width=1024, height=1536, batch_size=2)
+    assert graph["sample"]["inputs"]["steps"] == 12
+    assert graph["sample"]["inputs"]["cfg"] == 3
+    assert graph["latent"]["inputs"] == {"width": 1024, "height": 1536, "batch_size": 2}
+
+
+def test_image_references_enter_vision_encoder_and_vae():
     graph, _, _ = _image(refs=["a.png", "b.png"])
-    refs = graph["refs"]["inputs"]
-
-    assert graph["refs"]["class_type"] == "HiDreamO1ReferenceImages"
-    assert refs["images.image_1"] == ["load_ref_1", 0]
-    assert refs["images.image_2"] == ["load_ref_2", 0]
-    assert "images.image_0" not in refs
-    # Both conditionings are rewritten, so sampling must read from the ref node
-    assert graph["sample"]["inputs"]["positive"] == ["refs", 0]
-    assert graph["sample"]["inputs"]["negative"] == ["refs", 1]
+    inputs = graph["encode"]["inputs"]
+    assert inputs["vae"] == ["vae", 0]
+    assert inputs["images.image_1"] == ["load_ref_1", 0]
+    assert inputs["images.image_2"] == ["load_ref_2", 0]
+    assert "images.image_0" not in inputs
 
 
-def test_image_without_references_skips_the_node():
-    graph, _, _ = _image()
-    assert "refs" not in graph
-    assert graph["sample"]["inputs"]["positive"] == ["positive", 0]
-    assert graph["sample"]["inputs"]["negative"] == ["negative", 0]
+@pytest.mark.parametrize("legacy", [{"variant": "dev"}, {"noise_scale": 7.6}])
+def test_image_rejects_obsolete_hidream_options(legacy):
+    from pydantic import ValidationError
+    from gateway.media_node import ImageGenerationRequest
+    for schema in (ImageRequest, ImageGenerationRequest):
+        with pytest.raises(ValidationError):
+            schema(prompt="test", **legacy)
 
 
 # ──────────────────────────────────────────────────────
@@ -534,65 +491,36 @@ def test_comfy_call_cap_is_a_separate_knob():
 
 
 # ──────────────────────────────────────────────────────
-#  HiDream-O1 variant availability
+#  Qwen-Image-2.1 availability
 # ──────────────────────────────────────────────────────
 
-def _object_info(checkpoints: list[str]) -> dict:
-    """A minimal /object_info: every required node, and the loaders' combo lists."""
-    info: dict = {n: {} for nodes in media_server.MODALITY_NODES.values() for n in nodes}
+def _object_info() -> dict:
+    info = {n: {} for nodes in media_server.MODALITY_NODES.values() for n in nodes}
     loaders = {
-        "UNETLoader": ("unet_name", [media_server.CKPT_FL2VA, media_server.ACE_DIT]),
-        "CLIPLoader": ("clip_name", [media_server.H3_TEXT_ENCODER,
-                                     media_server.ACE_CLIP_1, media_server.ACE_CLIP_2]),
+        "UNETLoader": ("unet_name", [media_server.CKPT_FL2VA, media_server.ACE_DIT, media_server.IMAGE_DIT]),
+        "CLIPLoader": ("clip_name", [media_server.H3_TEXT_ENCODER, media_server.ACE_CLIP_1,
+                                     media_server.ACE_CLIP_2, media_server.IMAGE_TEXT_ENCODER]),
         "VAELoader": ("vae_name", [media_server.H3_VIDEO_VAE, media_server.H3_AUDIO_VAE,
-                                   media_server.ACE_VAE]),
-        "CheckpointLoaderSimple": ("ckpt_name", checkpoints),
+                                   media_server.ACE_VAE, media_server.IMAGE_VAE]),
     }
     for node, (field, files) in loaders.items():
         info[node] = {"input": {"required": {field: [files]}}}
     return info
 
 
-async def _probe_with(monkeypatch, checkpoints: list[str]):
+@pytest.mark.parametrize("missing", [None, "UNETLoader", "CLIPLoader", "VAELoader", "TextEncodeQwenImage21"])
+async def test_image_requires_all_weights_and_qwen_node(monkeypatch, missing):
+    info = _object_info()
+    if missing == "TextEncodeQwenImage21":
+        del info[missing]
+    elif missing:
+        files = next(iter(info[missing]["input"]["required"].values()))[0]
+        files.pop()  # Remove just Qwen's weight; other modalities remain ready.
     async def fake_get(path, **kwargs):
-        return _object_info(checkpoints)
-
+        return info
     monkeypatch.setattr(media_server, "_comfy_get", fake_get)
     await media_server._probe_comfy()
-
-
-async def test_one_image_variant_is_enough_for_the_modality(monkeypatch):
-    """The download script invites fetching only one checkpoint; that must work."""
-    await _probe_with(monkeypatch, [media_server.IMAGE_CKPT_DEV])
-
-    assert media_server._capabilities["image"] is True
-    assert media_server._image_variants == {"dev": True, "base": False}
-
-
-async def test_missing_variant_is_rejected_before_reaching_comfyui(monkeypatch):
-    """Regression: only the dev checkpoint was checked, so /health advertised
-    image as available and a variant="base" request died inside ComfyUI as an
-    opaque 502 — the exact class of late failure the health probe exists to
-    prevent."""
-    from fastapi import HTTPException
-
-    await _probe_with(monkeypatch, [media_server.IMAGE_CKPT_DEV])
-
-    media_server._require_image_variant("dev")          # present — no raise
-
-    with pytest.raises(HTTPException) as exc:
-        media_server._require_image_variant("base")
-    assert exc.value.status_code == 503
-    assert media_server.IMAGE_CKPT_BASE in str(exc.value.detail)
-    assert "dev" in str(exc.value.detail), "should name what IS available"
-
-
-async def test_image_unavailable_when_no_checkpoint_is_present(monkeypatch):
-    await _probe_with(monkeypatch, [])
-
-    assert media_server._capabilities["image"] is False
-    assert media_server._image_variants == {"dev": False, "base": False}
-    # av and music are unaffected — their weights are still there.
+    assert media_server._capabilities["image"] is (missing is None)
     assert media_server._capabilities["av"] is True
     assert media_server._capabilities["music"] is True
 
@@ -691,3 +619,19 @@ def test_per_container_maxima_match_the_node_schema(av_client):
         over = av_client.post("/generate", json=_av_body(
             **{field: [f"x{n}" for n in range(limit + 1)]}))
         assert over.status_code == 400, f"{field} past {limit} should be rejected"
+
+
+def test_image_endpoint_returns_qwen_model_and_defaults(monkeypatch):
+    from fastapi.testclient import TestClient
+    monkeypatch.setitem(media_server._capabilities, 'image', True)
+    async def fake_run(graph, extensions, request=None):
+        assert graph['sample']['inputs']['steps'] == 25
+        return [{'filename': 'qwen.png'}], [b'png'], 1.0
+    monkeypatch.setattr(media_server, '_run', fake_run)
+    client = TestClient(media_server.app)
+    response = client.post('/generate/image', json={'prompt': 'a lighthouse'})
+    assert response.status_code == 200
+    assert response.json()['model'] == 'qwen-image-2.1'
+    assert response.json()['steps'] == 25
+    response = client.post('/generate/image', json={'prompt': 'edit', 'ref_images': ['x'] * 11})
+    assert response.status_code == 400

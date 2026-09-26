@@ -76,7 +76,7 @@ its own with its own Gateway; it is *not* wired into the text cluster.
 |---|---|---|---|
 | `av` | MiniMax-H3 | `POST /generate` | `/v1/av/generate` |
 | `music` | ACE-Step 1.5 XL Turbo | `POST /generate/music` | `/v1/audio/music` |
-| `image` | HiDream-O1-Image | `POST /generate/image` | `/v1/images/generate` |
+| `image` | Qwen-Image-2.1 | `POST /generate/image` | `/v1/images/generate` |
 
 - **`gateway/media_app.py`** — the entry point on node 3 (`uvicorn
   gateway.media_app:app`). It deliberately does **not** import
@@ -103,7 +103,7 @@ its own with its own Gateway; it is *not* wired into the text cluster.
 - `ModelDefinition.host` marks a model as off-node; `ModelDefinition.base_url`
   resolves to the host when set, else the local container's DNS name.
 - Nothing is profile-swapped. Task mode (`t2va`/`fl2va`/`ref2va`) and image
-  variant (`dev`/`base`) come from the request payload; ComfyUI evicts between
+  sampling settings come from the request payload; ComfyUI evicts between
   model families on its own.
 
 Where the graphs came from — all transcribed, none guessed:
@@ -112,12 +112,11 @@ Where the graphs came from — all transcribed, none guessed:
 |---|---|
 | `av` | `comfy_extras/nodes_minimax_h3.py` node schemas |
 | `music` | ComfyUI `blueprints/Text to Audio (ACE-Step 1.5).json` |
-| `image` | `Comfy-Org/workflow_templates` `image_hidream_o1{,_dev}.json` |
+| `image` | `Comfy-Org/workflow_templates` `image_qwen_image_2_1_{t2i,image_edit}.json` |
 
-HiDream-O1 is worth a warning: it does **not** use `KSampler`. It needs
-`ModelNoiseScale` plus a `SamplerCustom` + `BasicScheduler` pair, and the sampler
-differs per variant (`SamplerLCM` for dev at 28 steps/cfg 1, `dpmpp_2m_sde_gpu`
-for base at 40 steps/cfg 5, which also adds `HiDreamO1PatchSeamSmoothing`).
+Qwen-Image-2.1 uses separate UNET/CLIP/VAE loaders, `TextEncodeQwenImage21`
+and `KSampler` (25 steps, CFG 1, Euler, simple). References enter the text
+encoder node together with the VAE. Output dimensions remain explicit.
 
 Three things that only fail at request time, all already handled — don't regress them:
 
@@ -132,7 +131,7 @@ Three things that only fail at request time, all already handled — don't regre
    H3's ref2va uses `TemplatePrefix`, so **zero-based**:
    `ref_images.ref_image_0`, `ref_videos.ref_video_0`,
    `ref_video_audios.ref_video_audio_0`, `ref_audios.ref_audio_0`.
-   HiDream-O1 uses `TemplateNames`, so **one-based**: `images.image_1`…`image_10`.
+   Qwen-Image-2.1 uses `TemplateNames`, so **one-based**: `images.image_1`…`image_10`.
    Either way it is the container id, then the template's name. ComfyUI re-nests
    those into the dict `execute()` receives (`build_nested_inputs` in
    `comfy_api/latest/_io.py`); the bare `ref_image_0` form arrives as an
@@ -260,12 +259,9 @@ instead of letting the caller pay for an upload that never enters the graph
 schema, whose maxima sum to 18; it is flagged in place rather than loosened,
 since it may come from H3's model card.
 
-**Both HiDream-O1 checkpoints are separate downloads and either may be absent.**
-`_probe_comfy` records per-variant availability in `_image_variants` and the
-modality counts as available if *either* is present; `generate_image` then gates
-on the variant actually requested. Checking only the dev checkpoint let `/health`
-advertise `image` while a `variant="base"` request died inside ComfyUI as an
-opaque 502 — the late failure the probe exists to prevent.
+**Qwen-Image-2.1 needs all three weight files.** `_probe_comfy` checks the
+DiT, text encoder, VAE and Qwen node before advertising image availability.
+Legacy HiDream `variant` and `noise_scale` request fields are rejected.
 
 ### Test dependencies
 

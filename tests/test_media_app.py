@@ -107,7 +107,7 @@ def test_health_ok_when_backend_ready(client):
     assert body["role"] == "media-node"
     assert body["backend"]["ready"] is True
     assert body["models"] == [
-        "minimax-h3-fl2va", "minimax-h3-ref2va", "ace-step-1.5-xl-turbo", "hidream-o1-image",
+        "minimax-h3-fl2va", "minimax-h3-ref2va", "ace-step-1.5-xl-turbo", "qwen-image-2.1",
     ]
     assert body["vram"]["total_used_mb"] == 44173
 
@@ -156,13 +156,13 @@ def test_models_lists_all_modalities_and_aliases(client):
 
     # Nothing is swapped out, so everything the node can serve is always listed
     for expected in ("minimax-h3-fl2va", "minimax-h3-ref2va",
-                     "ace-step-1.5-xl-turbo", "hidream-o1-image"):
+                     "ace-step-1.5-xl-turbo", "qwen-image-2.1"):
         assert expected in ids
 
     by_id = {m["id"]: m for m in data}
     assert by_id["minimax-h3-fl2va"]["endpoint"] == "/v1/av/generate"
     assert by_id["ace-step-1.5-xl-turbo"]["endpoint"] == "/v1/audio/music"
-    assert by_id["hidream-o1-image"]["endpoint"] == "/v1/images/generate"
+    assert by_id["qwen-image-2.1"]["endpoint"] == "/v1/images/generate"
 
     # Every entry must be actionable — an endpoint-less model is undiscoverable
     assert all(m.get("endpoint") for m in data)
@@ -172,7 +172,7 @@ def test_models_lists_all_modalities_and_aliases(client):
         "av": "minimax-h3-fl2va",
         "video": "minimax-h3-fl2va",
         "music": "ace-step-1.5-xl-turbo",
-        "image": "hidream-o1-image",
+        "image": "qwen-image-2.1",
     }
 
 

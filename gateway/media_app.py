@@ -5,7 +5,7 @@ Serves three modalities from one node:
 
     /v1/av/generate      MiniMax-H3             video with native stereo audio
     /v1/audio/music      ACE-Step 1.5 XL Turbo  text-to-music
-    /v1/images/generate  HiDream-O1-Image       text-to-image at 2048px
+    /v1/images/generate  Qwen-Image-2.1       text-to-image at 2048px
 
 Same public API as the main Gateway for media work, minus everything that
 assumes a local text cluster. Deliberately does **not** import
@@ -134,7 +134,7 @@ app = FastAPI(
     title="Blackwell Media Gateway",
     description=(
         "Media-only Gateway for a standalone node: video with native stereo audio "
-        "(MiniMax-H3), music (ACE-Step 1.5 XL Turbo) and images (HiDream-O1). "
+        "(MiniMax-H3), music (ACE-Step 1.5 XL Turbo) and images (Qwen-Image-2.1). "
         "No text models, no VRAM profiles, no container orchestration."
     ),
     version=__version__,
@@ -221,7 +221,7 @@ async def list_models() -> JSONResponse:
         "av": "minimax-h3-fl2va",
         "video": "minimax-h3-fl2va",
         "music": "ace-step-1.5-xl-turbo",
-        "image": "hidream-o1-image",
+        "image": "qwen-image-2.1",
     }
     data += [
         {"id": alias, "object": "model", "owned_by": "blackwell-media-gateway",

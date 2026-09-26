@@ -117,11 +117,12 @@ class MusicGenerationRequest(BaseModel):
 
 
 class ImageGenerationRequest(BaseModel):
-    """HiDream-O1-Image. Sampling defaults come from the variant, not from here."""
+    """Qwen-Image-2.1 generation and reference-image editing."""
+
+    model_config = {"extra": "forbid"}
 
     prompt: str
     negative_prompt: str = ""
-    variant: Literal["dev", "base"] = "dev"
 
     width: int = 2048
     height: int = 2048
@@ -129,8 +130,7 @@ class ImageGenerationRequest(BaseModel):
 
     steps: int | None = None
     cfg_scale: float | None = None
-    noise_scale: float | None = None
-    scheduler: str = "normal"
+    scheduler: str = "simple"
     seed: int | None = None
 
     # 1 image = instruction edit; 2-10 = multi-reference.
@@ -355,11 +355,11 @@ async def generate_music(req: MusicGenerationRequest, request: Request) -> JSONR
 
 @router.post("/v1/images/generate")
 async def generate_image(req: ImageGenerationRequest, request: Request) -> JSONResponse:
-    """Generates images on the media node (HiDream-O1-Image)."""
+    """Generates images on the media node (Qwen-Image-2.1)."""
     payload = req.model_dump(exclude={"response_format"})
 
-    logger.info("image request — %s | %dx%d x%d | refs=%d | agent=%s",
-                req.variant, req.width, req.height, req.batch_size,
+    logger.info("image request — %dx%d x%d | refs=%d | agent=%s",
+                req.width, req.height, req.batch_size,
                 len(req.ref_images), req.agent_id)
 
     result, elapsed = await _dispatch("/generate/image", payload, "image", request)
@@ -441,7 +441,7 @@ def attach(app, alias_legacy: bool | None = None) -> None:
     # Warn about paths the host app already serves. Starlette resolves in
     # registration order, so attaching last means the host's own handler wins —
     # the safe default, but silent. On the main Gateway /v1/images/generate is
-    # FLUX's, so HiDream-O1 would be unreachable there without this notice.
+    # FLUX's, so Qwen-Image-2.1 would be unreachable there without this notice.
     own = {getattr(route, "path", None) for route in app.routes}
     clashes = sorted(p for p in (getattr(r, "path", None) for r in router.routes) if p in own)
     if clashes:

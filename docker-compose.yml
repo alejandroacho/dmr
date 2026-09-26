@@ -26,6 +26,8 @@ volumes:
     driver: local
   media_input:
     driver: local
+  media_user:
+    driver: local
   media_assets:
     driver: local
 
@@ -240,7 +242,7 @@ services:
   #
   #    av     MiniMax-H3 (fl2va + ref2va + encoder + 2 VAEs)   ~63 GB
   #    music  ACE-Step 1.5 XL Turbo (DiT + 2 encoders + VAE)   ~20 GB
-  #    image  HiDream-O1-Image (all-in-one checkpoint)          ~8 GB
+  #    image  Qwen-Image-2.1 (INT8 DiT + encoder + BF16 VAE)
   #
   #  Start:  docker compose --profile media up -d media-node media-gateway
   # ════════════════════════════════════════════════════
@@ -254,11 +256,14 @@ services:
     ports:
       # Published on all interfaces so the adapter can be reached directly too.
       - "8010:8010"
+      # ComfyUI browser interface.
+      - "8188:8188"
     volumes:
       # The whole models dir: extra_model_paths.yaml maps one entry per family.
       - /home/alejandroacho/Models:/models:ro
       - media_output:/opt/ComfyUI/output
       - media_input:/opt/ComfyUI/input
+      - media_user:/opt/ComfyUI/user
       - triton_cache:/root/.triton
     environment:
       - MODEL_NAME=media-node
@@ -332,7 +337,7 @@ services:
       # The one address that must be reachable *by clients*, so it cannot use
       # the compose network name. Set MEDIA_NODE_IP in .env — switching the node
       # from WiFi to its wired 192.168.1.x address is then a one-line change.
-      - MEDIA_PUBLIC_URL=http://${MEDIA_NODE_IP:-192.168.8.147}:8000
+      - MEDIA_PUBLIC_URL=http://${MEDIA_NODE_IP:-192.168.1.86}:8000
       # Saved assets are swept after 24h — so a URL handed to a client stops
       # resolving after a day. Raise it if callers revisit old results.
       - MEDIA_RETENTION_HOURS=24

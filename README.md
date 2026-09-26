@@ -83,8 +83,8 @@ use elsewhere.
 │  │  media-node     :8010   (media_server.py)            │  │
 │  │    builds a ComfyUI graph per request                 │  │
 │  │                    │                                  │  │
-│  │  ComfyUI  :8188 ◀──┘  (loopback only)                │  │
-│  │    MiniMax-H3 · ACE-Step 1.5 · HiDream-O1            │  │
+│  │  ComfyUI  :8188 ◀──┘  (web UI)                       │  │
+│  │    MiniMax-H3 · ACE-Step 1.5 · Qwen-Image-2.1            │  │
 │  │    INT8-convrot, NVFP4 and FP8 ops, all native       │  │
 │  └──────────────────────────────────────────────────────┘  │
 └────────────────────────────────────────────────────────────┘
@@ -97,7 +97,7 @@ switching modality costs a reload but never a redeploy.
 |---|---|---|---|
 | video + audio | MiniMax-H3 (t2va/fl2va/ref2va) | ~63 GB | `/v1/av/generate` |
 | music | ACE-Step 1.5 XL Turbo | ~20 GB | `/v1/audio/music` |
-| image | HiDream-O1-Image (dev + base) | ~16 GB | `/v1/images/generate` |
+| image | Qwen-Image-2.1 (INT8) | DiT + encoder + VAE | `/v1/images/generate` |
 
 `gateway/media_app.py` deliberately does **not** import `ContainerOrchestrator`.
 The main app's startup adopts or recreates VRAM profiles and force-removes
@@ -127,12 +127,20 @@ reuses the encoder and VAEs.
 | `qwen_0.6b_ace15` + `qwen_4b_ace15` | 8.91 GiB | both are required (DualCLIPLoader, type `ace`) |
 | `ace_1.5_vae` | 0.31 GiB | audio VAE (DCAE + vocoder) |
 
-**HiDream-O1-Image** — `Comfy-Org/HiDream-O1-Image`, `just download-hidream`:
+**Qwen-Image-2.1** — [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1), `just download-qwen-image`:
 
-| File | Size | Role |
-|---|---|---|
-| `hidream_o1_image_dev_fp8_scaled` | 7.51 GiB | dev — all-in-one, 28 steps, no CFG |
-| `hidream_o1_image_fp8_scaled` | 7.51 GiB | base — all-in-one, 40 steps, CFG 5 |
+- `diffusion_models/qwen_image_2.1_int8_convrot.safetensors`
+- `text_encoders/qwen3vl_8b_int8_convrot.safetensors`
+- `vae/qwen_image_2.1_vae_bf16.safetensors`
+
+All three files are required. Rebuild with `just build-media` using a current
+ComfyUI revision with `TextEncodeQwenImage21`, then run `just media-up` on the media node.
+The download retains the old HiDream weights; they can be removed separately if unused.
+
+ComfyUI web UI: `http://192.168.1.86:8188/` (published by `media-node`).
+Import `models/qwen-image-2.1/workflow.json` for the official Qwen image workflow.
+Saved workflows and UI settings persist in the `media_user` volume.
+The adapter continues to use `http://127.0.0.1:8188` inside the container.
 
 ### Task modes (video + audio)
 
@@ -163,7 +171,7 @@ with `Failed to find C compiler` — the container still starts and reports heal
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEDIA_NODE_URL` | `http://192.168.8.147:8010` | Adapter address (`http://media-node:8010` in compose) |
+| `MEDIA_NODE_URL` | `http://192.168.1.86:8010` | Adapter address (`http://media-node:8010` in compose) |
 | `MEDIA_NODE_TIMEOUT_S` | `0` | Per-request ceiling; `0` = none (see below) |
 | `GENERATE_TIMEOUT_S` | `0` | *(adapter)* Whole-generation ceiling; `0` = none |
 | `COMFY_HTTP_TIMEOUT_S` | `600` | *(adapter)* Ceiling on one call to ComfyUI |
@@ -547,7 +555,7 @@ curl -X POST http://localhost:8000/v1/videos/generate \
 ### Video + native audio (MiniMax-H3, media node)
 
 > These run against the **media node's own Gateway** (node 3, `:8000`). Substitute
-> its address — e.g. `http://192.168.8.147:8000` — from another machine.
+> its address — e.g. `http://192.168.1.86:8000` — from another machine.
 
 ```bash
 curl -X POST http://localhost:8000/v1/av/generate \
@@ -623,7 +631,7 @@ XL Turbo samples in 8 steps, so a 20s clip takes ~16s including the cold model
 load. Note the two separate CFG knobs: `cfg_scale` (diffusion, default 1.0) and
 `lm_cfg_scale` (the audio-code LM, default 2.0) — both come from the blueprint.
 
-### Images (HiDream-O1)
+### Images (Qwen-Image-2.1)
 
 ```bash
 curl -X POST http://localhost:8000/v1/images/generate \
@@ -631,18 +639,15 @@ curl -X POST http://localhost:8000/v1/images/generate \
   -d '{"prompt": "a noir portrait of a lighthouse keeper, 35mm film"}'
 ```
 
-Response: `{"success": true, "data": {"images": ["<base64 PNG>"], "variant": "dev", ...}}`
+Response: `{"success": true, "data": {"images": ["<base64 PNG>"], "model": "qwen-image-2.1", ...}}`
 
-Two variants, whose sampling settings come from the official templates — you
-normally only pick the variant and leave the rest alone:
-
-| `variant` | Steps | CFG | Sampler | 1024² |
-|---|---|---|---|---|
-| `dev` (default) | 28 | 1.0 | `SamplerLCM` | ~12s |
-| `base` | 40 | 5.0 | `dpmpp_2m_sde_gpu` + seam smoothing | ~30s |
-
-Native canvas is 2048×2048. Reference images enable HiDream-O1's editing mode —
-1 image is an instruction edit, 2–10 is multi-reference:
+Defaults: 25 steps, CFG 1, Euler sampler, `simple` scheduler, 2048×2048 canvas.
+Override `steps`, `cfg_scale`, `scheduler`, `width`, `height` and `batch_size` as needed.
+The old HiDream `variant` and `noise_scale` fields are no longer accepted.
+The `image` alias now resolves to `qwen-image-2.1`.
+Reference images enable editing (up to 10), with reference encoding at 1024px
+and output dimensions controlled by `width`/`height`; matching the reference's
+aspect ratio helps preserve its layout. PNG output preserves generated transparency.
 
 ```bash
 curl -X POST http://localhost:8000/v1/images/generate \
@@ -708,8 +713,8 @@ Server/
 │   │   └── download.sh         # Comfy-Org/MiniMax-H3 (~63 GB)
 │   ├── ace-step-1.5/
 │   │   └── download.sh         # ACE-Step 1.5 XL Turbo (~20 GB)
-│   └── hidream-o1/
-│       └── download.sh         # HiDream-O1-Image (~16 GB)
+│   └── qwen-image-2.1/
+│       └── download.sh         # Qwen-Image-2.1 (DiT + encoder + VAE)
 └── gateway/
     ├── app.py                  # FastAPI application (main entry point)
     ├── config.py               # Central configuration + VRAM profiles
@@ -742,9 +747,9 @@ Server/
 | `LONG_POLLING_TIMEOUT_S` | `600` | Max long polling wait |
 | `MAX_QUEUE_SIZE` | `200` | Max requests queued during swap |
 | `RETRY_AFTER_SECONDS` | `5` | Retry-After header value for 503s |
-| `MEDIA_NODE_HOST` | `192.168.8.147` | Media node (node 3) address |
+| `MEDIA_NODE_HOST` | `192.168.1.86` | Media node (node 3) address |
 | `MEDIA_NODE_PORT` | `8010` | Media node adapter port |
-| `MEDIA_NODE_URL` | `http://192.168.8.147:8010` | Full media node URL used by `media_node.py` |
+| `MEDIA_NODE_URL` | `http://192.168.1.86:8010` | Full media node URL used by `media_node.py` |
 
 ---
 

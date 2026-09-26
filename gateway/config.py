@@ -48,9 +48,8 @@ VRAM_SAFETY_MARGIN_MB: int = int(os.getenv("VRAM_SAFETY_MARGIN_MB", "4096"))
 # this Gateway's VRAM profiles or container swapping.
 # MEDIA_NODE_IP is the single place the node's address is configured (see .env);
 # MEDIA_NODE_HOST still overrides it for the rare case of addressing the adapter
-# and the asset URLs differently. Currently on WiFi — switch MEDIA_NODE_IP to the
-# wired 192.168.1.x address once cabled.
-MEDIA_NODE_IP: str = os.getenv("MEDIA_NODE_IP", "192.168.8.147")
+# and the asset URLs differently. The default is the wired address of the media node.
+MEDIA_NODE_IP: str = os.getenv("MEDIA_NODE_IP", "192.168.1.86")
 MEDIA_NODE_HOST: str = os.getenv("MEDIA_NODE_HOST", MEDIA_NODE_IP)
 MEDIA_NODE_PORT: int = int(os.getenv("MEDIA_NODE_PORT", "8010"))
 
@@ -289,7 +288,7 @@ LTX_VIDEO_2 = ModelDefinition(
 MINIMAX_H3_FL2VA = ModelDefinition(
     name="minimax-h3-fl2va",
     # One image and one container serve all three families (see Dockerfile.media),
-    # so these match ACE-Step's and HiDream's. Purely informational — `host` is
+    # so these match ACE-Step's and Qwen Image's. Purely informational — `host` is
     # set, so this model is proxied to and never orchestrated from here.
     container_image="media-node:latest",
     container_name="media-node",
@@ -334,17 +333,17 @@ ACE_STEP_15_XL_TURBO = ModelDefinition(
     host=MEDIA_NODE_HOST,
 )
 
-HIDREAM_O1_IMAGE = ModelDefinition(
-    name="hidream-o1-image",
+QWEN_IMAGE_21 = ModelDefinition(
+    name="qwen-image-2.1",
     container_image="media-node:latest",
     container_name="media-node",
-    vram_required_mb=8_100,         # all-in-one fp8_scaled checkpoint
+    vram_required_mb=20_000,        # estimated INT8 model + encoder + VAE; runtime varies
     port=MEDIA_NODE_PORT,
-    quantization="fp8_scaled",
+    quantization="int8_convrot",
     tensor_parallel_size=1,
     max_model_len=0,
     kv_cache_dtype="none",
-    model_path="hidream-o1",
+    model_path="qwen-image-2.1",
     engine="comfyui",
     host=MEDIA_NODE_HOST,
 )
@@ -355,7 +354,7 @@ REMOTE_MEDIA_MODELS: list[ModelDefinition] = [
     MINIMAX_H3_FL2VA,
     MINIMAX_H3_REF2VA,
     ACE_STEP_15_XL_TURBO,
-    HIDREAM_O1_IMAGE,
+    QWEN_IMAGE_21,
 ]
 
 # Which Gateway endpoint drives each model.
@@ -363,7 +362,7 @@ MEDIA_MODEL_ENDPOINTS: dict[str, str] = {
     MINIMAX_H3_FL2VA.name: "/v1/av/generate",
     MINIMAX_H3_REF2VA.name: "/v1/av/generate",
     ACE_STEP_15_XL_TURBO.name: "/v1/audio/music",
-    HIDREAM_O1_IMAGE.name: "/v1/images/generate",
+    QWEN_IMAGE_21.name: "/v1/images/generate",
 }
 
 

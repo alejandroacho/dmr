@@ -20,7 +20,7 @@ import gateway.media_node as media_node
 from gateway.config import (
     ACE_STEP_15_XL_TURBO,
     ALL_MODELS,
-    HIDREAM_O1_IMAGE,
+    QWEN_IMAGE_21,
     MEDIA_MODEL_ENDPOINTS,
     MINIMAX_H3_FL2VA,
     MINIMAX_H3_REF2VA,
@@ -103,7 +103,7 @@ def test_media_models_excluded_from_local_lifecycle():
         assert model not in ALL_MODELS
     assert not any(m.is_remote for m in ALL_MODELS)
     assert REMOTE_MEDIA_MODELS == [
-        MINIMAX_H3_FL2VA, MINIMAX_H3_REF2VA, ACE_STEP_15_XL_TURBO, HIDREAM_O1_IMAGE,
+        MINIMAX_H3_FL2VA, MINIMAX_H3_REF2VA, ACE_STEP_15_XL_TURBO, QWEN_IMAGE_21,
     ]
 
 
@@ -474,3 +474,18 @@ def test_connect_failure_is_still_503_not_504():
 
     assert resp.status_code == 503
     assert "unreachable" in resp.json()["detail"]
+
+
+def test_image_route_forwards_qwen_defaults():
+    patcher, session = _patch_node(FakeResponse(200, json_data={
+        "images": ["cG5n"], "model": "qwen-image-2.1",
+    }))
+    with patcher:
+        response = _client().post('/v1/images/generate', json={"prompt": "a lighthouse"})
+    assert response.status_code == 200
+    payload = session.post.call_args.kwargs['json']
+    assert payload['scheduler'] == 'simple'
+    assert 'variant' not in payload
+    assert 'noise_scale' not in payload
+    assert 'response_format' not in payload
+    assert response.json()['data']['model'] == 'qwen-image-2.1'

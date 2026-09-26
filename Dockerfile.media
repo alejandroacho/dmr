@@ -4,7 +4,7 @@
 #  Serves three modalities from one ComfyUI on a single GB10 (SM121):
 #    av     MiniMax-H3             video with native stereo audio
 #    music  ACE-Step 1.5 XL Turbo  text-to-music
-#    image  HiDream-O1-Image       text-to-image at 2048px
+#    image  Qwen-Image-2.1       text-to-image at 2048px
 #
 #  Unlike Dockerfile.comfyui — which pins pytorch:25.01 and has no SM121
 #  kernels, hence its ~12s/step — this builds on CUDA 13 and installs PyTorch
@@ -39,8 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir torch torchvision torchaudio
 
 # ComfyUI — H3 landed in Comfy-Org/ComfyUI#15224 (2026-08-03); ACE-Step 1.5 and
-# HiDream-O1 are also native. Pin via ARG to freeze a known-good commit.
-ARG COMFYUI_REF=master
+# Qwen-Image-2.1 are also native. Pin via ARG to freeze a known-good commit.
+ARG COMFYUI_REF=88ab4a06566454ad89db8f0bedb970d6c08cd1b7
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git /opt/ComfyUI \
     && cd /opt/ComfyUI \
     && git checkout "${COMFYUI_REF}" \
@@ -64,19 +64,21 @@ RUN printf '%s\n' \
     '  diffusion_models: diffusion_models' \
     '  text_encoders: text_encoders' \
     '  vae: vae' \
-    'hidream_o1:' \
-    '  base_path: /models/hidream-o1' \
-    '  checkpoints: checkpoints' \
+    'qwen_image_21:' \
+    '  base_path: /models/qwen-image-2.1' \
+    '  diffusion_models: diffusion_models' \
+    '  text_encoders: text_encoders' \
+    '  vae: vae' \
     > /opt/ComfyUI/extra_model_paths.yaml
 
 COPY inference/media_server.py /opt/adapter/media_server.py
 
-# ComfyUI stays bound to loopback — only the adapter is exposed.
+# ComfyUI UI is published on 8188; the adapter still uses loopback.
 ENV COMFY_URL=http://127.0.0.1:8188 \
     PORT=8010
-EXPOSE 8010
+EXPOSE 8010 8188
 
-# Two processes: ComfyUI on loopback, and the adapter as PID 1. If ComfyUI dies
+# Two processes: ComfyUI, and the adapter as PID 1. If ComfyUI dies
 # the adapter is signalled so the container exits and `restart: unless-stopped`
 # brings the pair back together — otherwise the adapter would keep answering
 # /health with a permanent boot error.
@@ -85,7 +87,7 @@ RUN printf '%s\n' \
     'set -euo pipefail' \
     '# exec below preserves this PID, so $$ is the adapter (PID 1 in a container).' \
     'main_pid=$$' \
-    'python3 /opt/ComfyUI/main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch &' \
+    'python3 /opt/ComfyUI/main.py --listen 0.0.0.0 --port 8188 --disable-auto-launch &' \
     'comfy_pid=$!' \
     '( while kill -0 "$comfy_pid" 2>/dev/null; do sleep 5; done' \
     '  echo "ComfyUI exited — shutting down the adapter" >&2' \

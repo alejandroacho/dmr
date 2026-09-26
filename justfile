@@ -42,12 +42,12 @@ download-minimax:
 download-ace:
     MODELS_DIR={{models_dir}} models/ace-step-1.5/download.sh
 
-# Download HiDream-O1-Image weights — images, both variants (~16 GB)
-download-hidream:
-    MODELS_DIR={{models_dir}} models/hidream-o1/download.sh
+# Download Qwen-Image-2.1 weights — INT8 model + encoder + BF16 VAE
+download-qwen-image:
+    MODELS_DIR={{models_dir}} models/qwen-image-2.1/download.sh
 
-# Download everything the media node serves (~99 GB)
-download-media: download-minimax download-ace download-hidream
+# Download everything the media node serves
+download-media: download-minimax download-ace download-qwen-image
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  DOCKER IMAGE BUILDS
@@ -184,7 +184,7 @@ media-test-image prompt="a noir portrait, dramatic rim light, 35mm film" size="1
         print(json.dumps(r, indent=2)); sys.exit(1)
     d = r['data']
     open('image-test.png','wb').write(base64.b64decode(d['images'][0]))
-    print(f\"Saved image-test.png — {d['variant']} {d['width']}x{d['height']} steps={d['steps']} seed={d['seed']} {d['processing_time_ms']/1000:.1f}s\")
+    print(f\"Saved image-test.png — {d['model']} {d['width']}x{d['height']} steps={d['steps']} seed={d['seed']} {d['processing_time_ms']/1000:.1f}s\")
     "
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

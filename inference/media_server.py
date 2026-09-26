@@ -7,7 +7,7 @@ from it:
 
     av      MiniMax-H3            video with native stereo audio (t2va/fl2va/ref2va)
     music   ACE-Step 1.5 XL Turbo text-to-music, 8 steps
-    image   HiDream-O1-Image      text-to-image at 2048px, optional reference images
+    image   Qwen-Image-2.1      text-to-image at 2048px, optional reference images
 
 One ComfyUI process, one GPU, one lock: requests are serialised, and ComfyUI
 evicts whichever model it needs to. All the graphs below are transcribed from
@@ -15,7 +15,7 @@ authoritative sources rather than guessed —
 
     av     comfy_extras/nodes_minimax_h3.py (node schemas)
     music  ComfyUI blueprints/"Text to Audio (ACE-Step 1.5).json"
-    image  Comfy-Org/workflow_templates image_hidream_o1{,_dev}.json
+    image  Comfy-Org/workflow_templates image_qwen_image_2_1_{t2i,image_edit}.json
 
 — because several of the encodings are not discoverable from `/object_info`
 alone (see the DYNAMICCOMBO and Autogrow notes further down).
@@ -63,9 +63,12 @@ ACE_CLIP_1: str = os.getenv("ACE_CLIP_1", "qwen_0.6b_ace15.safetensors")
 ACE_CLIP_2: str = os.getenv("ACE_CLIP_2", "qwen_4b_ace15.safetensors")
 ACE_VAE: str = os.getenv("ACE_VAE", "ace_1.5_vae.safetensors")
 
-# ── image: HiDream-O1 ── all-in-one checkpoints (model + CLIP + VAE)
-IMAGE_CKPT_DEV: str = os.getenv("IMAGE_CKPT_DEV", "hidream_o1_image_dev_fp8_scaled.safetensors")
-IMAGE_CKPT_BASE: str = os.getenv("IMAGE_CKPT_BASE", "hidream_o1_image_fp8_scaled.safetensors")
+# ── image: Qwen-Image-2.1 ── separate diffusion model, encoder and VAE
+IMAGE_DIT: str = os.getenv("IMAGE_DIT", "qwen_image_2.1_int8_convrot.safetensors")
+IMAGE_TEXT_ENCODER: str = os.getenv("IMAGE_TEXT_ENCODER", "qwen3vl_8b_int8_convrot.safetensors")
+IMAGE_VAE: str = os.getenv("IMAGE_VAE", "qwen_image_2.1_vae_bf16.safetensors")
+IMAGE_STEPS = 25
+IMAGE_CFG = 1.0
 
 # Ceiling on a whole generation. 0 = none, which is the default: a 15s clip at
 # full canvas runs ~55 min in one pass, so the old 1800s cap killed exactly the
@@ -117,16 +120,13 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 MODALITY_NODES: dict[str, tuple[str, ...]] = {
     "av": ("MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo", "MiniMaxH3SigmaShift"),
     "music": ("TextEncodeAceStepAudio1.5", "EmptyAceStep1.5LatentAudio", "ModelSamplingAuraFlow"),
-    "image": ("EmptyHiDreamO1LatentImage", "HiDreamO1ReferenceImages", "SamplerCustom"),
+    "image": ("UNETLoader", "CLIPLoader", "VAELoader", "TextEncodeQwenImage21",
+              "EmptyLatentImage", "KSampler", "VAEDecode", "SaveImage", "LoadImage"),
 }
 
 _session: aiohttp.ClientSession | None = None
 _boot_error: str | None = None
 _capabilities: dict[str, bool] = {"av": False, "music": False, "image": False}
-# Per-variant, because the two HiDream-O1 checkpoints are separate downloads and
-# the download script invites fetching only one. Checking just one of them let
-# /health report image as available while the other variant failed inside ComfyUI.
-_image_variants: dict[str, bool] = {"dev": False, "base": False}
 _files: dict[str, set[str]] = {}
 # The models are large and the GPU is single; overlapping generations would only
 # thrash unified memory, so one runs at a time.
@@ -231,27 +231,21 @@ class MusicRequest(BaseModel):
 
 
 class ImageRequest(BaseModel):
-    """HiDream-O1-Image.
+    """Qwen-Image-2.1 generation and reference-image editing."""
 
-    The two variants use genuinely different sampling, per the official
-    templates: dev is LCM-sampled at 28 steps with no CFG, base is dpmpp_2m_sde
-    at 40 steps with CFG 5 plus a seam-smoothing model patch. Defaults follow
-    whichever variant is selected, so overriding is rarely needed.
-    """
+    model_config = {"extra": "forbid"}
 
     prompt: str
     negative_prompt: str = ""
-    variant: Literal["dev", "base"] = "dev"
 
-    # HiDream-O1's native canvas.
+    # Qwen-Image-2.1's native canvas.
     width: int = Field(default=2048, ge=64, le=4096)
     height: int = Field(default=2048, ge=64, le=4096)
     batch_size: int = Field(default=1, ge=1, le=8)
 
-    steps: int | None = Field(default=None, ge=1, le=150)   # None → variant default
-    cfg_scale: float | None = None  # None → variant default (dev 1.0, base 5.0)
-    noise_scale: float | None = None  # None → variant default (dev 7.6, base 8.0)
-    scheduler: str = "normal"
+    steps: int | None = Field(default=None, ge=1, le=150)   # None → 25
+    cfg_scale: float | None = None  # None → 1.0
+    scheduler: str = "simple"
     seed: int | None = None
 
     # 1 image = instruction edit; 2-10 = multi-reference.
@@ -279,7 +273,7 @@ def _combo_options(info: dict, node: str, field: str) -> set[str]:
 
 async def _probe_comfy() -> None:
     """Waits for ComfyUI, then works out which modalities are actually usable."""
-    global _boot_error, _capabilities, _files, _image_variants
+    global _boot_error, _capabilities, _files
 
     deadline = time.time() + COMFY_BOOT_TIMEOUT_S
     last_exc: Exception | None = None
@@ -304,14 +298,8 @@ async def _probe_comfy() -> None:
                    ("vae", H3_VIDEO_VAE), ("vae", H3_AUDIO_VAE)],
             "music": [("diffusion_models", ACE_DIT), ("text_encoders", ACE_CLIP_1),
                       ("text_encoders", ACE_CLIP_2), ("vae", ACE_VAE)],
-            # Either variant makes the modality usable; generate_image checks
-            # the one actually requested (see _require_image_variant).
-            "image": [],
-        }
-
-        _image_variants = {
-            name: variant["ckpt"] in _files["checkpoints"]
-            for name, variant in IMAGE_VARIANTS.items()
+            "image": [("diffusion_models", IMAGE_DIT), ("text_encoders", IMAGE_TEXT_ENCODER),
+                      ("vae", IMAGE_VAE)],
         }
 
         caps, missing = {}, {}
@@ -319,11 +307,6 @@ async def _probe_comfy() -> None:
             absent_nodes = [n for n in nodes if n not in info]
             absent_files = [f for kind, f in required_files[modality] if f not in _files[kind]]
             caps[modality] = not absent_nodes and not absent_files
-            if modality == "image":
-                # No single required checkpoint — one present variant is enough.
-                caps[modality] = caps[modality] and any(_image_variants.values())
-                absent_files += [v["ckpt"] for n, v in IMAGE_VARIANTS.items()
-                                 if not _image_variants[n]]
             if absent_nodes or absent_files:
                 missing[modality] = {"nodes": absent_nodes, "files": absent_files}
 
@@ -544,87 +527,42 @@ def _build_music_workflow(req: MusicRequest, seed: int) -> tuple[dict, str]:
     return g, "save"
 
 
-# ─────────────────── image: HiDream-O1 ──────────────
-
-# Per-variant sampling, from image_hidream_o1{,_dev}.json.
-IMAGE_VARIANTS: dict[str, dict[str, Any]] = {
-    "dev": {"ckpt": IMAGE_CKPT_DEV, "steps": 28, "cfg": 1.0, "noise_scale": 7.6,
-            "sampler": {"class_type": "SamplerLCM",
-                        "inputs": {"s_noise": 1.0, "s_noise_end": 1.0, "noise_clip_std": 2.5}},
-            "seam_smoothing": False},
-    "base": {"ckpt": IMAGE_CKPT_BASE, "steps": 40, "cfg": 5.0, "noise_scale": 8.0,
-             "sampler": {"class_type": "KSamplerSelect",
-                         "inputs": {"sampler_name": "dpmpp_2m_sde_gpu"}},
-             "seam_smoothing": True},
-}
-
+# ─────────────────── image: Qwen-Image-2.1 ──────────────
 
 def _build_image_workflow(req: ImageRequest, seed: int, ref_images: list[str]) -> tuple[dict, str]:
-    """Transcribed from the official HiDream-O1 templates.
+    """Official Qwen 2.1 workflow, with explicit output size and batch size.
 
-    Note this is not a plain KSampler graph: HiDream-O1 needs ModelNoiseScale and
-    a SamplerCustom + BasicScheduler pair, and the sampler itself differs per
-    variant (LCM for dev, dpmpp_2m_sde_gpu for base).
-
-        CheckpointLoaderSimple ─▶ ModelNoiseScale [─▶ PatchSeamSmoothing] ─┐
-                       │                                                  ▼
-                       ├─▶ CLIPTextEncode ×2 [─▶ HiDreamO1ReferenceImages] ─▶ SamplerCustom
-                       │                              BasicScheduler ─▶ sigmas ┘
-                       └─▶ VAE ────────────────────────────────▶ VAEDecode ─▶ SaveImage
+    Sources: Comfy-Org/workflow_templates image_qwen_image_2_1_{t2i,image_edit}.json.
+    Reference images enter both the vision encoder and VAE through TextEncodeQwenImage21.
     """
-    variant = IMAGE_VARIANTS[req.variant]
-    steps = req.steps if req.steps is not None else variant["steps"]
-    cfg = req.cfg_scale if req.cfg_scale is not None else variant["cfg"]
-    noise_scale = req.noise_scale if req.noise_scale is not None else variant["noise_scale"]
-
     g: dict[str, Any] = {
-        # All-in-one checkpoint: MODEL, CLIP and VAE in one file.
-        "ckpt": {"class_type": "CheckpointLoaderSimple",
-                 "inputs": {"ckpt_name": variant["ckpt"]}},
-        "noise": {"class_type": "ModelNoiseScale",
-                  "inputs": {"model": ["ckpt", 0], "noise_scale": noise_scale}},
-        "positive": {"class_type": "CLIPTextEncode",
-                     "inputs": {"clip": ["ckpt", 1], "text": req.prompt}},
-        "negative": {"class_type": "CLIPTextEncode",
-                     "inputs": {"clip": ["ckpt", 1], "text": req.negative_prompt}},
-        "latent": {"class_type": "EmptyHiDreamO1LatentImage",
-                   "inputs": {"width": req.width, "height": req.height,
-                              "batch_size": req.batch_size}},
-        "sampler_sel": variant["sampler"],
-        "sigmas": {"class_type": "BasicScheduler",
-                   "inputs": {"model": ["noise", 0], "scheduler": req.scheduler,
-                              "steps": steps, "denoise": 1.0}},
+        "model": {"class_type": "UNETLoader",
+                  "inputs": {"unet_name": IMAGE_DIT, "weight_dtype": "default"}},
+        "clip": {"class_type": "CLIPLoader",
+                 "inputs": {"clip_name": IMAGE_TEXT_ENCODER, "type": "qwen_image", "device": "default"}},
+        "vae": {"class_type": "VAELoader", "inputs": {"vae_name": IMAGE_VAE}},
+        "encode": {"class_type": "TextEncodeQwenImage21",
+                   "inputs": {"clip": ["clip", 0], "prompt": req.prompt,
+                              "negative_prompt": req.negative_prompt, "resolution": 1024}},
+        "latent": {"class_type": "EmptyLatentImage",
+                   "inputs": {"width": req.width, "height": req.height, "batch_size": req.batch_size}},
+        "sample": {"class_type": "KSampler",
+                   "inputs": {"model": ["model", 0], "seed": seed,
+                              "steps": req.steps if req.steps is not None else IMAGE_STEPS,
+                              "cfg": req.cfg_scale if req.cfg_scale is not None else IMAGE_CFG,
+                              "sampler_name": "euler", "scheduler": req.scheduler, "denoise": 1.0,
+                              "positive": ["encode", 0], "negative": ["encode", 1],
+                              "latent_image": ["latent", 0]}},
+        "decode": {"class_type": "VAEDecode",
+                   "inputs": {"samples": ["sample", 0], "vae": ["vae", 0]}},
+        "save": {"class_type": "SaveImage",
+                 "inputs": {"images": ["decode", 0], "filename_prefix": "media/image"}},
     }
-
-    model_ref = ["noise", 0]
-    if variant["seam_smoothing"]:
-        g["seam"] = {"class_type": "HiDreamO1PatchSeamSmoothing",
-                     "inputs": {"model": ["noise", 0], "start_percent": 0.8, "end_percent": 1.0,
-                                "pattern": "single_shift", "passes": "ramp_2_4",
-                                "blend": "median", "strength": 1.0}}
-        model_ref = ["seam", 0]
-
-    pos_ref, neg_ref = ["positive", 0], ["negative", 0]
     if ref_images:
-        # Autogrow, but TemplateNames with image_1..image_10 — one-indexed here,
-        # unlike H3's zero-indexed TemplatePrefix.
-        ref_inputs: dict[str, Any] = {"positive": ["positive", 0], "negative": ["negative", 0]}
+        g["encode"]["inputs"]["vae"] = ["vae", 0]
         for i, name in enumerate(ref_images, start=1):
             g[f"load_ref_{i}"] = {"class_type": "LoadImage", "inputs": {"image": name}}
-            ref_inputs[f"images.image_{i}"] = [f"load_ref_{i}", 0]
-        g["refs"] = {"class_type": "HiDreamO1ReferenceImages", "inputs": ref_inputs}
-        pos_ref, neg_ref = ["refs", 0], ["refs", 1]
-
-    g["sample"] = {"class_type": "SamplerCustom",
-                   "inputs": {"model": model_ref, "add_noise": True, "noise_seed": seed,
-                              "cfg": cfg, "positive": pos_ref, "negative": neg_ref,
-                              "sampler": ["sampler_sel", 0], "sigmas": ["sigmas", 0],
-                              "latent_image": ["latent", 0]}}
-    # SamplerCustom returns (output, denoised_output); the templates use output.
-    g["decode"] = {"class_type": "VAEDecode",
-                   "inputs": {"samples": ["sample", 0], "vae": ["ckpt", 2]}}
-    g["save"] = {"class_type": "SaveImage",
-                 "inputs": {"images": ["decode", 0], "filename_prefix": "media/image"}}
+            g["encode"]["inputs"][f"images.image_{i}"] = [f"load_ref_{i}", 0]
     return g, "save"
 
 
@@ -833,22 +771,6 @@ def _require(modality: str) -> None:
         )
 
 
-def _require_image_variant(variant: str) -> None:
-    """The two HiDream-O1 checkpoints are separate downloads — either may be absent.
-
-    Without this the graph reaches ComfyUI and comes back as an opaque 502 from
-    CheckpointLoaderSimple, after the caller was told the modality was available.
-    """
-    if not _image_variants.get(variant):
-        available = [name for name, ok in _image_variants.items() if ok]
-        raise HTTPException(
-            status_code=503,
-            detail=f"image variant '{variant}' unavailable — "
-                   f"{IMAGE_VARIANTS[variant]['ckpt']} is not visible to ComfyUI. "
-                   f"Available: {available or 'none'}",
-        )
-
-
 # ─────────────────── Lifecycle ───────────────────────
 
 @asynccontextmanager
@@ -886,9 +808,9 @@ async def health() -> JSONResponse:
             "av": {"model": "minimax-h3", "modes": ["t2va", "fl2va", "ref2va"],
                    "checkpoints": {"fl2va": CKPT_FL2VA, "ref2va": CKPT_REF2VA}},
             "music": {"model": "ace-step-1.5-xl-turbo", "checkpoint": ACE_DIT},
-            "image": {"model": "hidream-o1-image",
-                      "variants": {k: v["ckpt"] for k, v in IMAGE_VARIANTS.items()},
-                      "variants_available": _image_variants},
+            "image": {"model": "qwen-image-2.1",
+                      "diffusion_model": IMAGE_DIT,
+                      "text_encoder": IMAGE_TEXT_ENCODER, "vae": IMAGE_VAE},
         },
     }
     if _boot_error:
@@ -1002,21 +924,19 @@ async def generate_music(req: MusicRequest, request: Request) -> JSONResponse:
 
 @app.post("/generate/image")
 async def generate_image(req: ImageRequest, request: Request) -> JSONResponse:
-    """HiDream-O1-Image — text to image, optionally with reference images."""
+    """Qwen-Image-2.1 — text to image, optionally with reference images."""
     _require("image")
-    _require_image_variant(req.variant)
 
     if len(req.ref_images) > 10:
-        raise HTTPException(status_code=400, detail="HiDream-O1 accepts at most 10 reference images")
+        raise HTTPException(status_code=400, detail="Qwen-Image-2.1 accepts at most 10 reference images")
 
     seed = req.seed if req.seed is not None else random.randint(0, 2**32 - 1)
     uploaded = [await _upload_asset(a, "image") for a in req.ref_images]
     graph, _ = _build_image_workflow(req, seed, uploaded)
 
-    variant = IMAGE_VARIANTS[req.variant]
-    steps = req.steps if req.steps is not None else variant["steps"]
-    logger.info("image/%s | %dx%d x%d | steps=%d | refs=%d | seed=%d | agent=%s",
-                req.variant, req.width, req.height, req.batch_size,
+    steps = req.steps if req.steps is not None else IMAGE_STEPS
+    logger.info("image | %dx%d x%d | steps=%d | refs=%d | seed=%d | agent=%s",
+                req.width, req.height, req.batch_size,
                 steps, len(uploaded), seed, req.agent_id)
 
     refs, payloads, elapsed = await _run(graph, IMAGE_EXTENSIONS, request)
@@ -1026,7 +946,7 @@ async def generate_image(req: ImageRequest, request: Request) -> JSONResponse:
     return JSONResponse({
         "images": [base64.b64encode(p).decode() for p in payloads],
         "filenames": [r["filename"] for r in refs],
-        "modality": "image", "variant": req.variant,
+        "modality": "image", "model": "qwen-image-2.1",
         "width": req.width, "height": req.height, "batch_size": req.batch_size,
         "reference_images": len(uploaded),
         "seed": seed, "steps": steps,
