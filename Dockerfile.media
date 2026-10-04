@@ -1,0 +1,104 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Media node — ComfyUI + FastAPI adapter
+#
+#  Serves three modalities from one ComfyUI on a single GB10 (SM121):
+#    av     MiniMax-H3             video with native stereo audio
+#    music  ACE-Step 1.5 XL Turbo  text-to-music
+#    image  HiDream-O1-Image       text-to-image at 2048px
+#
+#  Unlike Dockerfile.comfyui — which pins pytorch:25.01 and has no SM121
+#  kernels, hence its ~12s/step — this builds on CUDA 13 and installs PyTorch
+#  from PyPI, whose aarch64 wheels are CUDA 13 builds. Those ship sm_120 cubins,
+#  which run on the GB10's sm_121 by CUDA's forward compatibility within a major
+#  compute capability (verified: bf16/fp16/int8 kernels all execute).
+#
+#  Build:  docker build -f Dockerfile.media -t media-node:latest .
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv \
+        git ffmpeg \
+        libgl1 libglib2.0-0 \
+        curl ca-certificates \
+        # Triton JIT-compiles kernels at request time (H3's NVFP4 encoder and the
+        # int8/convrot ops need it) and shells out to cc, linking a launcher stub
+        # against Python.h. Without these it fails mid-graph with
+        # "Failed to find C compiler" — after the container reports healthy.
+        gcc python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# PyTorch first, so ComfyUI's requirements.txt finds it already satisfied and
+# does not pull a different build. torchaudio is required: comfy_extras/
+# nodes_minimax_h3.py imports it for reference-audio resampling.
+RUN pip install --no-cache-dir torch torchvision torchaudio
+
+# ComfyUI — H3 landed in Comfy-Org/ComfyUI#15224 (2026-08-03); ACE-Step 1.5 and
+# HiDream-O1 are also native. Pin via ARG to freeze a known-good commit.
+ARG COMFYUI_REF=master
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /opt/ComfyUI \
+    && cd /opt/ComfyUI \
+    && git checkout "${COMFYUI_REF}" \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Adapter dependencies (ComfyUI already brings aiohttp).
+RUN pip install --no-cache-dir fastapi "uvicorn[standard]"
+
+# Weights live on the host and are mounted read-only at /models; point ComfyUI's
+# loaders at them instead of copying ~110 GB into the image. One entry per model
+# family, since each ships a different tree — ACE-Step keeps HuggingFace's
+# split_files/ prefix so its download stays resumable in place.
+RUN printf '%s\n' \
+    'minimax_h3:' \
+    '  base_path: /models/minimax-h3' \
+    '  diffusion_models: diffusion_models' \
+    '  text_encoders: text_encoders' \
+    '  vae: vae' \
+    'ace_step_15:' \
+    '  base_path: /models/ace-step-1.5/split_files' \
+    '  diffusion_models: diffusion_models' \
+    '  text_encoders: text_encoders' \
+    '  vae: vae' \
+    'hidream_o1:' \
+    '  base_path: /models/hidream-o1' \
+    '  checkpoints: checkpoints' \
+    > /opt/ComfyUI/extra_model_paths.yaml
+
+COPY inference/media_server.py /opt/adapter/media_server.py
+
+# ComfyUI stays bound to loopback — only the adapter is exposed.
+ENV COMFY_URL=http://127.0.0.1:8188 \
+    PORT=8010
+EXPOSE 8010
+
+# Two processes: ComfyUI on loopback, and the adapter as PID 1. If ComfyUI dies
+# the adapter is signalled so the container exits and `restart: unless-stopped`
+# brings the pair back together — otherwise the adapter would keep answering
+# /health with a permanent boot error.
+RUN printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    '# exec below preserves this PID, so $$ is the adapter (PID 1 in a container).' \
+    'main_pid=$$' \
+    'python3 /opt/ComfyUI/main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch &' \
+    'comfy_pid=$!' \
+    '( while kill -0 "$comfy_pid" 2>/dev/null; do sleep 5; done' \
+    '  echo "ComfyUI exited — shutting down the adapter" >&2' \
+    '  kill -TERM "$main_pid" ) &' \
+    'exec python3 -m uvicorn media_server:app --host 0.0.0.0 --port "${PORT}" --app-dir /opt/adapter' \
+    > /usr/local/bin/entrypoint.sh \
+    && chmod +x /usr/local/bin/entrypoint.sh
+
+# start-period must cover COMFY_BOOT_TIMEOUT_S (600s by default), because
+# /health answers 503 for the whole boot. Any shorter and the container flips to
+# unhealthy while it is still legitimately loading ~63 GB of weights. Raise both
+# together if a family gets slower to load.
+HEALTHCHECK --interval=15s --timeout=10s --start-period=660s --retries=3 \
+    CMD curl -fsS http://localhost:8010/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
