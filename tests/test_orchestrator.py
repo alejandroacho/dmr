@@ -524,3 +524,36 @@ class TestSwapRecheckUnderLock:
 
         assert await orch.switch_profile(TEST_PROFILE_A, force=True) is True
         assert orch._ensure_container_running.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_old_profile_request_waits_for_inflight_change(mock_vram_monitor):
+    orch = _make_orchestrator(mock_vram_monitor)
+    TestSwapRecheckUnderLock._stub_lifecycle(orch)
+    set_vram_free(mock_vram_monitor, 131072)
+    orch._active_profile = orch._registry_key(TEST_PROFILE_A)
+    loading = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def ready(models):
+        if models[0] == TEST_PROFILE_B.primary_models[0]:
+            loading.set()
+            await finish.wait()
+    orch._wait_all_ready = ready
+    changing = asyncio.create_task(orch.switch_profile(TEST_PROFILE_B))
+    await loading.wait()
+    returning = asyncio.create_task(orch.switch_profile(TEST_PROFILE_A))
+    try:
+        await asyncio.sleep(0)
+        assert not returning.done(), 'old profile was reported usable during teardown'
+        finish.set()
+        assert await changing
+        assert await returning
+        assert orch.active_profile == orch._registry_key(TEST_PROFILE_A)
+        assert orch._ensure_container_running.await_count == sum(
+            len(p.primary_models) + len(p.secondary_models)
+            for p in (TEST_PROFILE_A, TEST_PROFILE_B)
+        )
+    finally:
+        finish.set()
+        await asyncio.gather(changing, returning, return_exceptions=True)

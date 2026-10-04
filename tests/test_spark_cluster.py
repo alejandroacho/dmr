@@ -129,10 +129,9 @@ def test_qwen38_cmd_declares_its_mixed_quantization():
     assert cmd[cmd.index("--load-format") + 1] == "b12x"
     assert cmd[cmd.index("--gdn-decode-kernel") + 1] == "b12x"
     assert cmd[cmd.index("--tool-call-parser") + 1] == "qwen3_xml"
-    assert cmd[cmd.index("--max-model-len") + 1] == "262144"
+    assert cmd[cmd.index("--max-model-len") + 1] == "1000000"
 
-    spec = cmd[cmd.index("--speculative-config") + 1]
-    assert '"method":"mtp"' in spec
+    assert "--speculative-config" not in cmd
 
 
 # ──────────────────────────────────────────────────────

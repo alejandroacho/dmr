@@ -18,6 +18,7 @@ from gateway.config import (
     RAY_HEAD_HOST,
     RETRY_LOG_INTERVAL_S,
 )
+from gateway.identity import current_model
 
 logger = logging.getLogger("gateway.proxy")
 
@@ -194,15 +195,19 @@ class InferenceProxy:
                         tps = completion_tokens / (decode_ms / 1000) if decode_ms > 0 else 0
                         ttft_info = f" | TTFT={ttft_ms:.0f}ms" if ttft_ms else ""
                         logger.info(
-                            "Stream completion %.1fms%s — prompt=%d | completion=%d | total=%d tokens | %.1f tok/s (decode)",
-                            elapsed, ttft_info,
+                            "Stream completion %.1fms%s — model=%s | "
+                            "prompt=%d | completion=%d | total=%d tokens | %.1f tok/s (decode)",
+                            elapsed, ttft_info, current_model() or "-",
                             last_usage.get("prompt_tokens", 0),
                             completion_tokens,
                             last_usage.get("total_tokens", 0),
                             tps,
                         )
                     else:
-                        logger.info("Stream completion %.1fms (no usage data)", elapsed)
+                        logger.info(
+                            "Stream completion %.1fms — model=%s (no usage data)",
+                            elapsed, current_model() or "-",
+                        )
                     return  # Success — exit retry loop
 
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:

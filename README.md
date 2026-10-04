@@ -62,7 +62,7 @@ Consequences worth knowing:
 |---|---|---|---|---|
 | **`deepseek`** ⭐ | DeepSeek-V4-Flash-0731 — 284B total / 13B active MoE, FP4 experts + FP8 dense | Native multi-node, TP=2 (2 processes) | 8020 | 1,048,576 |
 | **`qwen35`** | Qwen3.5-122B-A10B-FP8 — native FP8 | Ray, TP=2 (1 process) | 8021 | 262,144 |
-| **`qwen38`** | Qwen3.8-Flash-Next-NVFP4 — NVFP4 + MXFP8 mixed, hybrid attention/SSM | Native multi-node, TP=2 (2 processes) | 8022 | 262,144 |
+| **`qwen38`** | Qwen3.8-Flash-Next-NVFP4 — NVFP4 + MXFP8 mixed, hybrid attention/SSM | Native multi-node, TP=2 (2 processes) | 8022 | 1,000,000 (YaRN ×4) |
 
 `deepseek` is the default at startup.
 
@@ -70,7 +70,7 @@ Consequences worth knowing:
 
 DeepSeek-V4-Flash is the reason the cluster exists: 167 GB of weights, ~220 GB of footprint across both nodes, and dspark speculative decoding. Qwen3.5-122B-A10B-FP8 is the second-opinion model — Qwen's own FP8 quantization (not a third-party int4 requant), ~127 GB, comfortable at ~64 GB per node with room for a 256K KV cache.
 
-Qwen3.8-Flash-Next-NVFP4 is the newest of the three: ~106 GB in NVIDIA's mixed NVFP4/MXFP8 quantization, a hybrid attention/SSM architecture with MTP speculative decoding, and — unlike Qwen3.5 — no Ray and no mods at all. It is multimodal upstream; the Gateway only ever sends it text.
+Qwen3.8-Flash-Next-NVFP4 is the newest of the three: ~106 GB in NVIDIA's mixed NVFP4/MXFP8 quantization, a hybrid attention/SSM architecture with YaRN ×4 for 1M context, and — unlike Qwen3.5 — no Ray and no mods at all. It is multimodal upstream; the Gateway only ever sends it text. MTP is disabled because the installed B12X build keeps its draft at 262K and does not inherit the target YaRN overrides.
 
 Two Qwen3.5 recipes were rejected: `qwen3.5-397b-int4-autoround` is labeled EXPERIMENTAL upstream and its 226 GB leave almost nothing for KV cache within the 256 GB the pair has; `qwen3.5-122b-int4-autoround` is a lossy requant whose only advantage — fitting on one node — is irrelevant here.
 
@@ -505,3 +505,40 @@ docker exec vllm_node bash -c "cat /proc/\$(pgrep -f 'vllm serve' | head -1)/cmd
 ## License
 
 Private — Alejandro Acho. All rights reserved.
+
+
+## Inference concurrency and queue
+
+`POST /v1/chat/completions` admits up to **5 requests** concurrently. Further
+requests wait in FIFO order before starting backend inference. A streaming
+request keeps its slot until its stream finishes or the client disconnects;
+errors and cancellations also release the slot. Queue waiting is separate from
+the backend HTTP timeout (currently 300 seconds).
+
+| Environment variable | Default | Meaning |
+|---|---:|---|
+| `MAX_CONCURRENT_REQUESTS` | `5` | Global active request limit |
+| `INFERENCE_QUEUE_SIZE` | `200` | Maximum waiting requests |
+| `INFERENCE_QUEUE_TIMEOUT_S` | `600` | Maximum time waiting for admission |
+
+Set these in the Compose environment (or `.env`) and recreate the gateway to
+change them. Keep **one Uvicorn worker / one gateway replica**: the queue is
+in process, not distributed or persistent. Queued HTTP connections must stay
+open; client timeouts still apply. Waiting prompts occupy host RAM. A restart
+loses queued requests; clients must retry. Queue full or queue timeout returns
+HTTP 503 with `Retry-After`.
+
+Inspect active and waiting counts without consuming an inference slot:
+
+```bash
+curl -s http://localhost:8000/status/queue | python3 -m json.tool
+```
+
+Responses include `X-Queue-Wait-Ms`. Normal inference requests for another model
+wait for the current group to finish; FIFO prevents later requests for the
+current model from starving an earlier model change. Administrative stop/swap
+operations and recovery are separate from this admission queue.
+
+The concurrency limit applies only through the gateway on port 8000. Direct
+requests to the vLLM ports bypass it. It does not impose a 500K context limit:
+clients must separately budget input plus output tokens.

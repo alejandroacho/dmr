@@ -15,9 +15,9 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from gateway import __version__
 from gateway.config import (
@@ -27,6 +27,9 @@ from gateway.config import (
     GATEWAY_PORT,
     LONG_POLLING_ENABLED,
     LONG_POLLING_TIMEOUT_S,
+    MAX_CONCURRENT_REQUESTS,
+    INFERENCE_QUEUE_SIZE,
+    INFERENCE_QUEUE_TIMEOUT_S,
     PROFILES,
     PROFILE_DEEPSEEK,
     RETRY_AFTER_SECONDS,
@@ -34,6 +37,17 @@ from gateway.config import (
 
 RAY_WATCHDOG_INTERVAL_S: int = int(os.getenv("RAY_WATCHDOG_INTERVAL_S", "30"))
 from gateway.backends import create_backend
+from gateway.admission import (
+    AdmissionQueue, AdmittedStreamingResponse, QueueFull, until_disconnect,
+)
+from gateway.identity import (
+    RequestContextFilter,
+    client_ip,
+    identify,
+    new_request_context,
+    set_agent,
+    set_model,
+)
 from gateway.orchestrator import ContainerOrchestrator
 from gateway.proxy import InferenceProxy
 from gateway.request_buffer import (
@@ -64,6 +78,9 @@ from gateway.vram_monitor import VRAMMonitor
 # `finally` are both single-shot critical sections — the asyncio loop's
 # single-thread guarantee is what serializes them.
 
+# Paths polled by health checks and dashboards — logged at DEBUG only.
+_QUIET_PATHS = frozenset({"/health", "/status/vram", "/status/swap", "/status/profile"})
+
 _active_swap_task: asyncio.Task | None = None
 _active_swap_target: str | None = None
 
@@ -71,10 +88,19 @@ _active_swap_target: str | None = None
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s │ %(name)-28s │ %(levelname)-7s │ %(message)s",
+    format=(
+        "%(asctime)s │ %(rid)-8s │ %(agent)-24.24s │ "
+        "%(name)-28s │ %(levelname)-7s │ %(message)s"
+    ),
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# The filter guarantees `rid`/`agent` exist on every record, including those
+# emitted by uvicorn and by code running outside a request (startup, watchdogs).
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(RequestContextFilter())
+
 logger = logging.getLogger("gateway.app")
+access_logger = logging.getLogger("gateway.access")
 
 # ──────────────────── Singletons ───────────────────────
 
@@ -83,6 +109,9 @@ backend = create_backend()
 orchestrator = ContainerOrchestrator(vram_monitor, backend)
 router_engine = SmartRouter()
 request_buffer = RequestBuffer()
+inference_queue = AdmissionQueue(
+    MAX_CONCURRENT_REQUESTS, INFERENCE_QUEUE_SIZE, INFERENCE_QUEUE_TIMEOUT_S,
+)
 prefix_cache = RadixPrefixCache()
 inference_proxy = InferenceProxy(hostname_resolver=backend.resolve_hostname)
 
@@ -242,6 +271,58 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def access_log(request: Request, call_next):
+    """Identify the caller, tag every log line of the request, and log the hit.
+
+    The body is deliberately not read here — consuming the ASGI receive stream
+    would starve the endpoint. Header-level identity is established up front;
+    `chat_completions` refines it from `agent_id`/`user` once Pydantic has
+    parsed the body, and because the context is a mutable dict the access-log
+    line below still sees the refined name.
+    """
+    ip = client_ip(request.headers, request.client.host if request.client else None)
+    ctx = new_request_context(identify(request.headers, ip), ip)
+    ua = request.headers.get("user-agent", "-")
+    started = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+    except asyncio.CancelledError:
+        # The agent hung up (timeout, Ctrl-C, killed process). This is exactly
+        # when you want to know who it was, and CancelledError is a
+        # BaseException — `except Exception` below would never see it, leaving
+        # an abandoned request with no access-log line at all.
+        elapsed = (time.perf_counter() - started) * 1000
+        access_logger.warning(
+            "%s %s → client disconnected after %.1f ms (ip=%s ua=%s)",
+            request.method, request.url.path, elapsed, ip, ua,
+        )
+        raise
+    except Exception:
+        elapsed = (time.perf_counter() - started) * 1000
+        access_logger.exception(
+            "%s %s → 500 in %.1f ms (ip=%s ua=%s)",
+            request.method, request.url.path, elapsed, ip, ua,
+        )
+        raise
+
+    elapsed = (time.perf_counter() - started) * 1000
+    # Health probes every few seconds would drown the log; keep them at DEBUG.
+    level = logging.DEBUG if request.url.path in _QUIET_PATHS else logging.INFO
+    session = ctx.get("session")
+    model = ctx.get("model")
+    access_logger.log(
+        level,
+        "%s %s → %d in %.1f ms (model=%s ip=%s ua=%s%s)",
+        request.method, request.url.path, response.status_code, elapsed,
+        model or "-", ip, ua,
+        f" sess={session}" if session else "",
+    )
+    response.headers["X-Request-Id"] = ctx["rid"]
+    return response
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MAIN ENDPOINTS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -398,10 +479,52 @@ async def cache_status():
     return prefix_cache.get_stats()
 
 
+@app.get("/status/queue", tags=["System"])
+async def inference_queue_status():
+    return inference_queue.stats()
+
+
 # ──────────── Unified Inference Endpoint ────────
 
 @app.post("/v1/chat/completions", tags=["Inference"])
-async def chat_completions(request: AgentRequest):
+async def chat_completions(request: AgentRequest, http_request: Request):
+    # Resolve labels once so a queued request keeps its intended model.
+    decision = router_engine.route(request, active_profile=orchestrator.active_vram_profile)
+    profile = orchestrator._registry_key(decision.profile)
+    lease = None
+    transferred = False
+    queued_at = time.monotonic()
+
+    async def admitted():
+        nonlocal lease
+        try:
+            lease = await inference_queue.acquire(profile)
+        except QueueFull:
+            raise HTTPException(503, "Inference queue is full", headers={
+                "Retry-After": str(RETRY_AFTER_SECONDS),
+            })
+        except asyncio.TimeoutError:
+            raise HTTPException(503, "Inference queue wait timed out", headers={
+                "Retry-After": str(RETRY_AFTER_SECONDS),
+            })
+        waited_ms = (time.monotonic() - queued_at) * 1000
+        result = await _chat_completions(request, decision)
+        if hasattr(result, "headers"):
+            result.headers["X-Queue-Wait-Ms"] = f"{waited_ms:.1f}"
+        return result
+
+    try:
+        response = await until_disconnect(http_request, admitted)
+        if isinstance(response, AdmittedStreamingResponse):
+            response.lease = lease
+            transferred = True
+        return response
+    finally:
+        if lease is not None and not transferred:
+            lease.release()
+
+
+async def _chat_completions(request: AgentRequest, decision):
     """
     Unified endpoint compatible with OpenAI Chat Completions.
     The Gateway automatically detects whether the request is for text,
@@ -409,10 +532,23 @@ async def chat_completions(request: AgentRequest):
     """
     start_time = time.time()
 
-    logger.info("Request model='%s' agent=%s stream=%s", request.model, request.agent_id, request.stream)
+    # Body-declared identity composes with the header guess: `agent_id` is
+    # ours (OpenClaw sets it via params.extra_body), `user` is the
+    # OpenAI-standard end-user field, kept in model_extra.
+    extra = request.model_extra or {}
+    set_agent(
+        request.agent_id or extra.get("user"),
+        session=request.session_id or extra.get("conversation_id"),
+    )
 
     # 1. Routing (pass active profile so labels resolve without swap)
-    decision = router_engine.route(request, active_profile=orchestrator.active_vram_profile)
+    set_model(decision.target_model.name, orchestrator._registry_key(decision.profile))
+
+    logger.info(
+        "Request model='%s' → '%s' (media=%s) stream=%s priority=%d messages=%d",
+        request.model, decision.target_model.name, decision.media_type.value,
+        request.stream, request.priority, len(request.messages),
+    )
 
     # 2. Compute prefix if there are system messages
     if request.messages:
@@ -423,7 +559,7 @@ async def chat_completions(request: AgentRequest):
     target_key = orchestrator._registry_key(decision.profile)
     model_ready = orchestrator.is_model_ready(decision.target_model.container_name)
 
-    if current_profile != target_key or not model_ready:
+    if current_profile != target_key or not model_ready or orchestrator.is_swapping:
         decision.requires_swap = True
 
         if current_profile == target_key and not model_ready:
@@ -502,7 +638,7 @@ async def chat_completions(request: AgentRequest):
     # always hands back an async iterator here — the image/video wrapper that
     # used to follow was unreachable and has been removed.
     if request.stream:
-        return StreamingResponse(
+        return AdmittedStreamingResponse(
             result,
             media_type="text/event-stream",
             headers={"X-Processing-Time-Ms": f"{elapsed:.1f}"},

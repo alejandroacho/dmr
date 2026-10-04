@@ -113,6 +113,20 @@ def _register_test_catalog():
 # ─── Patch docker.DockerClient BEFORE importing gateway modules ──
 
 @pytest.fixture(autouse=True)
+def _block_real_subprocesses(monkeypatch):
+    """Unit tests must never execute SSH against the live Spark worker.
+
+    Docker mocks do not cover the separate SSH orchestration path. Tests
+    exercising subprocess behavior may explicitly install their own mock.
+    """
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Real subprocess execution is forbidden in unit tests")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", forbidden)
+
+
+@pytest.fixture(autouse=True)
 def _mock_docker(monkeypatch):
     """Prevents DockerBackend from connecting to a real Docker daemon."""
     mock_client = MagicMock()

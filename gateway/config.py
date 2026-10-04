@@ -116,6 +116,11 @@ RETRY_LOG_INTERVAL_S: int = int(os.getenv("RETRY_LOG_INTERVAL_S", "10"))
 # Maximum queued requests during a swap
 MAX_QUEUE_SIZE: int = int(os.getenv("MAX_QUEUE_SIZE", "200"))
 
+# Inference admission, independent of the buffer used during model swaps.
+MAX_CONCURRENT_REQUESTS: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", "5"))
+INFERENCE_QUEUE_SIZE: int = int(os.getenv("INFERENCE_QUEUE_SIZE", "200"))
+INFERENCE_QUEUE_TIMEOUT_S: float = float(os.getenv("INFERENCE_QUEUE_TIMEOUT_S", "600"))
+
 # Long Polling mode vs immediate 503
 LONG_POLLING_ENABLED: bool = os.getenv("LONG_POLLING_ENABLED", "true").lower() == "true"
 
@@ -323,7 +328,7 @@ QWEN38_FLASH_NEXT = ModelDefinition(
     # already serves DeepSeek and Qwen3.5.
     container_image="vllm-node-b12x:latest",
     container_name=SPARK_CLUSTER_CONTAINER,
-    # ~106 GB of NVFP4 weights plus a 256K KV cache at 0.7 utilization,
+    # ~106 GB of NVFP4 weights plus a 1M-context KV cache at 0.7 utilization,
     # sharded across both nodes. Not visible to local NVML (skip_vram_check).
     vram_required_mb=150_000,
     port=8022,
@@ -331,7 +336,7 @@ QWEN38_FLASH_NEXT = ModelDefinition(
     # explicitly here, unlike the native FP8/FP4 checkpoints above.
     quantization="modelopt_mixed",
     tensor_parallel_size=2,
-    max_model_len=262144,
+    max_model_len=1_000_000,
     kv_cache_dtype="fp8",
     hf_model_id="local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
     engine="spark_cluster",
@@ -344,6 +349,7 @@ QWEN38_FLASH_NEXT = ModelDefinition(
     # launch-cluster.sh exports these inside its launch script rather than via
     # `docker run -e`, so the exec'd serve process must set them itself.
     extra_env={
+        "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
         "CUTE_DSL_ARCH": "sm_121a",
         "SAFETENSORS_FAST_GPU": "1",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
@@ -357,6 +363,19 @@ QWEN38_FLASH_NEXT = ModelDefinition(
         "VLLM_ROCE_ALLREDUCE_MAX_SIZE": "2MB",
     },
     extra_args={
+        # Pinned: `main` moved on 2026-10-02 to a re-export (6909a5b, "step-5500
+        # QAD") whose config.json drops `ple_embedding_dtype`. This b12x build
+        # then defaults the PLE tables to bf16 and dies loading the packed NVFP4
+        # shards ("shape mismatch for PLE shard 10 weight: expected
+        # (2500012, 160), got (2500012, 80)"). Bump only with a newer image.
+        "--revision": "7c4f1bc1a2d6847e0cbc01ac6b823f00251de8dd",
+        # Official Qwen YaRN extension from 262,144 to 1,000,000 tokens.
+        "--hf-overrides": (
+            '{"text_config":{"rope_parameters":{"mrope_interleaved":true,'
+            '"mrope_section":[11,11,10],"rope_type":"yarn",'
+            '"rope_theta":10000000,"partial_rotary_factor":0.25,'
+            '"factor":4.0,"original_max_position_embeddings":262144}}}'
+        ),
         "--host": "0.0.0.0",
         "--pipeline-parallel-size": 1,
         "--dtype": "bfloat16",
@@ -379,9 +398,8 @@ QWEN38_FLASH_NEXT = ModelDefinition(
         "--enable-auto-tool-choice": True,
         "--tool-call-parser": "qwen3_xml",
         "--reasoning-parser": "qwen3",
-        "--speculative-config": (
-            '{"method":"mtp","num_speculative_tokens":4}'
-        ),
+        # This B12X build leaves the MTP draft at 262K (and drops the
+        # target YaRN overrides), so use ordinary decoding for 1M context.
         "--compilation-config": (
             '{"pass_config":{"fuse_act_quant":true}}'
         ),

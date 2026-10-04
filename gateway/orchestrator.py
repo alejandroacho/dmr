@@ -303,11 +303,9 @@ class ContainerOrchestrator:
         registry_key = self._registry_key(target_profile)
         profile_key = registry_key  # used in logs below
 
-        if self._active_profile == registry_key and not force:
-            logger.info("Profile '%s' already active, skipping.", profile_key)
-            return True
-
         async with self._swap_lock:
+            # The old profile name remains set while another swap tears it
+            # down. Even an apparently matching profile must wait for the lock.
             # Re-check now that we hold the mutex: while queueing behind another
             # swap, that swap may have already brought this very profile up.
             # Without this, the second waiter tears it all down and reloads the

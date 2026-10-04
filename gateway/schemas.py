@@ -125,6 +125,10 @@ class AgentRequest(BaseModel):
         default=None,
         description="Unique agent identifier (1-9)",
     )
+    session_id: str | None = Field(
+        default=None,
+        description="Caller-side conversation id, for correlating a request series",
+    )
     priority: int = Field(
         default=5,
         ge=1,
@@ -134,7 +138,13 @@ class AgentRequest(BaseModel):
 
     # Gateway-internal: meaningless to the inference backend, so never forwarded.
     _GATEWAY_ONLY = frozenset(
-        {"model", "media_type", "media_params", "agent_id", "priority"}
+        {
+            "model", "media_type", "media_params", "priority",
+            # Caller identity: for the access log only. vLLM validates its
+            # request model strictly, so an unknown field is a 400, not a
+            # shrug — these must never reach it.
+            "agent_id", "session_id", "conversation_id",
+        }
     )
 
     def forwarded_params(self) -> dict[str, Any]:
@@ -144,7 +154,13 @@ class AgentRequest(BaseModel):
         instead of receiving explicit nulls.
         """
         params = self.model_dump(exclude_none=True, exclude=set(self._GATEWAY_ONLY))
-        params.update(self.model_extra or {})
+        # `exclude` only reaches declared fields, so gateway-only keys that
+        # arrived as extras (a client sending `conversation_id`, say) would
+        # otherwise sail straight through to the backend.
+        params.update({
+            k: v for k, v in (self.model_extra or {}).items()
+            if k not in self._GATEWAY_ONLY
+        })
         return params
 
 

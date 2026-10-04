@@ -763,3 +763,103 @@ def test_profile_detail_reports_every_label_per_model():
 
     assert len(detail.models) == 1
     assert detail.models[0].label == "chat, code"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stream', [False, True])
+async def test_sixth_inference_waits_until_backend_finishes(client, monkeypatch, stream):
+    import gateway.app as m
+    from gateway.admission import AdmissionQueue
+
+    monkeypatch.setattr(m, 'inference_queue', AdmissionQueue(5, 10, 2))
+    m.orchestrator._active_profile = 'deepseek'
+    m.orchestrator._container_states['vllm_node'] = ContainerState.READY
+    finish = asyncio.Event()
+    five_started = asyncio.Event()
+    started = []
+
+    async def dispatch(decision, request):
+        async def body():
+            started.append(request.agent_id)
+            if len(started) == 5:
+                five_started.set()
+            await finish.wait()
+            yield b'data: [DONE]\n\n'
+        if stream:
+            return body()
+        started.append(request.agent_id)
+        if len(started) == 5:
+            five_started.set()
+        await finish.wait()
+        return {'object': 'chat.completion', 'choices': []}
+
+    monkeypatch.setattr(m, '_dispatch_to_backend', dispatch)
+    tasks = [asyncio.create_task(client.post('/v1/chat/completions', json={
+        'model': 'deepseek-v4-flash', 'agent_id': str(i), 'stream': stream,
+        'messages': [{'role': 'user', 'content': 'hi'}],
+    })) for i in range(6)]
+    try:
+        await asyncio.wait_for(five_started.wait(), 2)
+        async with asyncio.timeout(2):
+            while m.inference_queue.stats()['queued'] != 1:
+                await asyncio.sleep(0)
+        status = (await client.get('/status/queue')).json()
+        assert status['active'] == 5
+        assert status['queued'] == 1
+        assert len(started) == 5
+        finish.set()
+        responses = await asyncio.wait_for(asyncio.gather(*tasks), 2)
+        assert all(r.status_code == 200 for r in responses)
+        assert all('x-queue-wait-ms' in r.headers for r in responses)
+        assert len(started) == 6
+        assert m.inference_queue.active == 0
+    finally:
+        finish.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_backend_error_releases_admission(client, monkeypatch):
+    import gateway.app as m
+    from gateway.admission import AdmissionQueue
+    monkeypatch.setattr(m, 'inference_queue', AdmissionQueue(1, 1, 1))
+    m.orchestrator._active_profile = 'deepseek'
+    m.orchestrator._container_states['vllm_node'] = ContainerState.READY
+    monkeypatch.setattr(m, '_dispatch_to_backend', AsyncMock(side_effect=RuntimeError('failed')))
+    response = await client.post('/v1/chat/completions', json={
+        'model': 'deepseek-v4-flash', 'messages': [{'role': 'user', 'content': 'hi'}],
+    })
+    assert response.status_code == 502
+    assert m.inference_queue.active == 0
+
+
+@pytest.mark.asyncio
+async def test_matching_profile_still_waits_for_inflight_swap(client, monkeypatch):
+    import gateway.app as m
+    m.orchestrator._active_profile = 'deepseek'
+    m.orchestrator._container_states['vllm_node'] = ContainerState.READY
+    m.orchestrator._swap_in_progress = True
+    finish = asyncio.Event()
+    async def swap():
+        await finish.wait()
+        return True
+    swap_task = asyncio.create_task(swap())
+    create = MagicMock(return_value=swap_task)
+    dispatch = AsyncMock(return_value={'object': 'chat.completion', 'choices': []})
+    monkeypatch.setattr(m, '_get_or_create_swap_task', create)
+    monkeypatch.setattr(m, '_dispatch_to_backend', dispatch)
+    request_task = asyncio.create_task(client.post('/v1/chat/completions', json={
+        'model': 'deepseek-v4-flash', 'messages': [{'role': 'user', 'content': 'hi'}],
+    }))
+    try:
+        async with asyncio.timeout(1):
+            while not create.called:
+                await asyncio.sleep(0)
+        dispatch.assert_not_awaited()
+        finish.set()
+        assert (await request_task).status_code == 200
+    finally:
+        finish.set()
+        await asyncio.gather(request_task, swap_task, return_exceptions=True)

@@ -60,9 +60,18 @@ services:
       - LONG_POLLING_ENABLED=true
       - LONG_POLLING_TIMEOUT_S=600
       - MAX_QUEUE_SIZE=200
+      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-5}
+      - INFERENCE_QUEUE_SIZE=${INFERENCE_QUEUE_SIZE:-200}
+      - INFERENCE_QUEUE_TIMEOUT_S=${INFERENCE_QUEUE_TIMEOUT_S:-600}
       - RETRY_AFTER_SECONDS=5
       - RETRY_LOG_INTERVAL_S=10
       - RAY_WATCHDOG_INTERVAL_S=30
+      # ── Caller identification (access log) ──
+      # Header an agent can use to name itself.
+      - AGENT_ID_HEADER=x-agent-id
+      # Optional "apikey:name,apikey:name" map. Unmapped keys are logged as a
+      # sha256 fingerprint, never in clear. Read from .env so no key lives here.
+      - AGENT_API_KEYS=${AGENT_API_KEYS:-}
       # ── Spark cluster models (engine=spark_cluster) ──
       - RAY_HEAD_HOST=192.168.200.12
       - SPARK_CLUSTER_CONTAINER=vllm_node
